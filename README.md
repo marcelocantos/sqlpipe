@@ -79,8 +79,8 @@ example including change event handling.
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-make test     # build and run tests (43 test cases)
-make example  # build and run the loopback demo
+mk test     # build and run tests (43 test cases)
+mk example  # build and run the loopback demo
 ```
 
 If you use an agentic coding tool (Claude Code, Cursor, Copilot, etc.), include

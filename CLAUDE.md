@@ -6,15 +6,16 @@ Streaming replication protocol for SQLite. Two-file library: `sqlpipe.h`
 ## Build
 
 ```sh
-make test     # build and run all tests (43 cases)
-make example  # build and run examples/loopback.cpp
-make clean    # remove build/
+mk test     # build and run all tests (43 cases)
+mk example  # build and run examples/loopback.cpp
+mk clean    # remove build/
 ```
 
-Requires C++20. Never pass `-j` to make; `MAKEFLAGS` handles parallelism.
+Requires C++20. Uses [mk](https://github.com/marcelocantos/mk) as the build
+system (`mkfile`).
 
 SQLite must be compiled with `-DSQLITE_ENABLE_SESSION
--DSQLITE_ENABLE_PREUPDATE_HOOK` (the Makefile sets these).
+-DSQLITE_ENABLE_PREUPDATE_HOOK` (the mkfile sets these).
 
 ## Dependencies
 
@@ -78,7 +79,7 @@ sqlpipe.cpp         Implementation (all internals)
 tests/              doctest test files
 examples/           loopback.cpp demo
 vendor/             Third-party dependencies
-Makefile            Build system
+mkfile              Build system (mk)
 ```
 
 ## Tests
