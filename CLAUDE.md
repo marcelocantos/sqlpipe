@@ -65,6 +65,18 @@ vendor/             Third-party dependencies
 Makefile            Build system
 ```
 
+## Tests
+
+28 test cases across 5 files (all use doctest):
+
+- `test_protocol.cpp` — Serialization round-trips for all 9 message types
+- `test_master.cpp` — Master state, flush behaviour, hello/catchup handling
+- `test_replica.cpp` — Replica state transitions
+- `test_integration.cpp` — End-to-end: live streaming, catchup, multi-table
+- `test_resync.cpp` — Schema mismatch, log pruning, resync change events
+
+Add new tests to the file matching the component under test.
+
 ## Conventions
 
 - Use `SPDLOG_INFO`/`SPDLOG_WARN`/`SPDLOG_ERROR` macros (not `spdlog::info`).

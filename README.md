@@ -79,53 +79,60 @@ make example  # build and run the loopback demo
 
 ## Protocol overview
 
+**Catchup** (schema match, replica behind, log covers the gap):
+
 ```
 Replica                              Master
    |                                    |
    |-- HelloMsg(seq, sv) ------------->|
    |                                    |
-   |<-- HelloMsg(seq, sv) -------------|  (schema match, replica behind)
+   |<-- HelloMsg(seq, sv) -------------|
    |<-- CatchupBeginMsg --------------|
    |<-- ChangesetMsg ... -------------|
+   |    (AckMsg after each) --------->|
    |<-- CatchupEndMsg ----------------|
-   |-- AckMsg ----------------------->|
    |                                    |
    |         [LIVE STREAMING]           |
    |<-- ChangesetMsg -----------------|  (master.flush())
    |-- AckMsg ----------------------->|
 ```
 
-On schema mismatch or when the changeset log doesn't cover the gap, the master
-triggers a full resync instead.
+**Resync** (schema mismatch or log doesn't cover the gap):
+
+```
+Replica                              Master
+   |                                    |
+   |-- HelloMsg(seq, sv) ------------->|
+   |                                    |
+   |<-- ResyncBeginMsg(sv, DDL) ------|
+   |<-- ResyncTableMsg ... -----------|  (one per table)
+   |<-- ResyncEndMsg(seq) ------------|
+   |-- AckMsg ----------------------->|
+   |                                    |
+   |         [LIVE STREAMING]           |
+```
 
 ## API
 
 ### Master
 
 ```cpp
+struct MasterConfig {
+    std::size_t max_log_entries = 10000;  // 0 = unlimited
+};
+
 class Master {
 public:
     explicit Master(sqlite3* db, MasterConfig config = {});
     std::vector<Message> flush();
     std::vector<Message> handle_message(const Message& msg);
+    std::vector<Message> generate_resync();
     Seq current_seq() const;
+    SchemaVersion schema_version() const;
 };
 ```
 
 ### Replica
-
-```cpp
-class Replica {
-public:
-    explicit Replica(sqlite3* db, ReplicaConfig config = {});
-    Message hello() const;
-    std::vector<Message> handle_message(const Message& msg);
-    Seq current_seq() const;
-    State state() const;  // Init, Handshake, Catchup, Resync, Live, Error
-};
-```
-
-### ReplicaConfig
 
 ```cpp
 struct ReplicaConfig {
@@ -134,7 +141,37 @@ struct ReplicaConfig {
     std::function<void()> on_resync_begin = nullptr;
     std::function<void()> on_resync_end   = nullptr;
 };
+
+class Replica {
+public:
+    explicit Replica(sqlite3* db, ReplicaConfig config = {});
+    Message hello() const;
+    std::vector<Message> handle_message(const Message& msg);
+    Seq current_seq() const;
+    SchemaVersion schema_version() const;
+    State state() const;  // Init, Handshake, Catchup, Resync, Live, Error
+};
 ```
+
+## Error handling
+
+All operations may throw `sqlpipe::Error`, which carries an `ErrorCode` and a
+human-readable message:
+
+```cpp
+try {
+    auto msgs = master.flush();
+} catch (const sqlpipe::Error& e) {
+    // e.code()  — ErrorCode enum
+    // e.what()  — descriptive string
+}
+```
+
+Error codes: `SqliteError`, `ProtocolError`, `SequenceGap`, `SchemaMismatch`,
+`InvalidState`, `ResyncRequired`. See `sqlpipe.h` for details.
+
+The replica also returns `ErrorMsg` messages when it receives unexpected
+protocol messages — these should be forwarded to the master over the transport.
 
 ## License
 
