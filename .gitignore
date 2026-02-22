@@ -1,5 +1,6 @@
 build/
 .mk/
+.claude/
 .cache/
 *.o
 *.a
