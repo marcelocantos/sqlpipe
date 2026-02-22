@@ -60,12 +60,16 @@ for (auto& m : resp) replica.handle_message(m);
 // Make changes on the master, then flush.
 sqlite3_exec(master_db, "INSERT INTO t VALUES (1, 'hello')", 0, 0, 0);
 auto msgs = master.flush();
-for (auto& m : msgs) replica.handle_message(m);
+for (auto& m : msgs) {
+    auto result = replica.handle_message(m);
+    // result.messages — AckMsg to send back to master
+    // result.changes  — per-row ChangeEvents (table, op, old/new values)
+}
 // replica_db now has the row.
 ```
 
 See [`examples/loopback.cpp`](examples/loopback.cpp) for a complete working
-example including change event callbacks.
+example including change event handling.
 
 ## Building
 
@@ -139,17 +143,19 @@ public:
 
 ```cpp
 struct ReplicaConfig {
-    ChangeCallback   on_change       = nullptr;  // per-row, post-apply
-    ConflictCallback on_conflict     = nullptr;  // per-conflict during apply
-    std::function<void()> on_resync_begin = nullptr;
-    std::function<void()> on_resync_end   = nullptr;
+    ConflictCallback on_conflict = nullptr;  // default: Abort
+};
+
+struct HandleResult {
+    std::vector<Message>     messages;  // protocol responses to send back
+    std::vector<ChangeEvent> changes;   // row-level changes applied this call
 };
 
 class Replica {
 public:
     explicit Replica(sqlite3* db, ReplicaConfig config = {});
     Message hello() const;
-    std::vector<Message> handle_message(const Message& msg);
+    HandleResult handle_message(const Message& msg);
     Seq current_seq() const;
     SchemaVersion schema_version() const;
     State state() const;  // Init, Handshake, Catchup, Resync, Live, Error

@@ -150,9 +150,8 @@ Value to_value(sqlite3_value* val);
 /// Convert an SQLite op code (SQLITE_INSERT/UPDATE/DELETE) to OpType.
 OpType sqlite_op_to_optype(int sqlite_op);
 
-/// Iterate a changeset and invoke the callback for each row change.
-/// Returns true if all callbacks returned true, false if one returned false.
-bool iterate_changeset(const Changeset& data, const ChangeCallback& cb);
+/// Collect all row-level changes from a changeset into a vector.
+std::vector<ChangeEvent> collect_events(const Changeset& data);
 
 /// Build a ChangeEvent from a changeset iterator at its current position.
 ChangeEvent extract_event(sqlite3_changeset_iter* iter);
@@ -606,8 +605,9 @@ ChangeEvent extract_event(sqlite3_changeset_iter* iter) {
     return event;
 }
 
-bool iterate_changeset(const Changeset& data, const ChangeCallback& cb) {
-    if (!cb || data.empty()) return true;
+std::vector<ChangeEvent> collect_events(const Changeset& data) {
+    std::vector<ChangeEvent> events;
+    if (data.empty()) return events;
 
     sqlite3_changeset_iter* iter = nullptr;
     int rc = sqlite3changeset_start(
@@ -619,15 +619,11 @@ bool iterate_changeset(const Changeset& data, const ChangeCallback& cb) {
     }
 
     while (sqlite3changeset_next(iter) == SQLITE_ROW) {
-        auto event = extract_event(iter);
-        if (!cb(event)) {
-            sqlite3changeset_finalize(iter);
-            return false;
-        }
+        events.push_back(extract_event(iter));
     }
 
     sqlite3changeset_finalize(iter);
-    return true;
+    return events;
 }
 
 } // namespace sqlpipe::detail
@@ -963,16 +959,14 @@ struct Replica::Impl {
         SPDLOG_INFO("replica initialized at seq={}", seq);
     }
 
-    void apply_changeset(const Changeset& data, Seq new_seq) {
-        // Apply the changeset, then emit per-row change events. The change
-        // events fire after application so callbacks see committed state.
+    std::vector<ChangeEvent> apply_changeset(const Changeset& data, Seq new_seq) {
+        // Apply the changeset, then collect per-row change events. Events
+        // are collected after application so the database reflects the new state.
         int rc = sqlite3changeset_apply(
             db,
             static_cast<int>(data.size()),
             const_cast<void*>(static_cast<const void*>(data.data())),
-            // Filter callback: accept all tables.
             nullptr,
-            // Conflict callback.
             [](void* ctx, int conflict_type, sqlite3_changeset_iter* iter)
                 -> int {
                 auto* cfg = static_cast<ReplicaConfig*>(ctx);
@@ -1007,19 +1001,14 @@ struct Replica::Impl {
                         std::string("changeset_apply: ") + sqlite3_errmsg(db));
         }
 
-        // Emit change events post-apply.
-        detail::iterate_changeset(data, config.on_change);
+        auto events = detail::collect_events(data);
 
-        // Update sequence number.
         seq = new_seq;
         detail::write_seq(db, seq);
+        return events;
     }
 
     void begin_resync(const ResyncBeginMsg& msg) {
-        if (config.on_resync_begin) {
-            config.on_resync_begin();
-        }
-
         // Wipe all user tables so the master's schema can be applied cleanly.
         // This handles both schema changes and table additions/removals.
         auto tables = detail::get_tracked_tables(db);
@@ -1032,8 +1021,8 @@ struct Replica::Impl {
         SPDLOG_INFO("resync: schema applied, sv={}", msg.schema_version);
     }
 
-    void apply_resync_table(const ResyncTableMsg& msg) {
-        if (msg.data.empty()) return;
+    std::vector<ChangeEvent> apply_resync_table(const ResyncTableMsg& msg) {
+        if (msg.data.empty()) return {};
 
         int rc = sqlite3changeset_apply(
             db,
@@ -1051,21 +1040,14 @@ struct Replica::Impl {
                         std::string("resync table apply: ") + sqlite3_errmsg(db));
         }
 
-        // Emit change events for resync data too.
-        detail::iterate_changeset(msg.data, config.on_change);
-
         SPDLOG_DEBUG("resync: applied table '{}'", msg.table_name);
+        return detail::collect_events(msg.data);
     }
 
     void end_resync(const ResyncEndMsg& msg) {
         seq = msg.seq;
         detail::write_seq(db, seq);
         state = Replica::State::Live;
-
-        if (config.on_resync_end) {
-            config.on_resync_end();
-        }
-
         SPDLOG_INFO("resync complete, now at seq={}", seq);
     }
 };
@@ -1089,22 +1071,21 @@ Message Replica::hello() const {
                     detail::compute_schema_fingerprint(impl_->db)};
 }
 
-std::vector<Message> Replica::handle_message(const Message& msg) {
-    return std::visit([&](const auto& m) -> std::vector<Message> {
+HandleResult Replica::handle_message(const Message& msg) {
+    return std::visit([&](const auto& m) -> HandleResult {
         using T = std::decay_t<decltype(m)>;
 
         if constexpr (std::is_same_v<T, HelloMsg>) {
             if (impl_->state != State::Handshake) {
                 impl_->state = State::Error;
-                return {ErrorMsg{ErrorCode::InvalidState,
-                    "received HelloMsg in unexpected state"}};
+                return {{ErrorMsg{ErrorCode::InvalidState,
+                    "received HelloMsg in unexpected state"}}, {}};
             }
             if (m.protocol_version != kProtocolVersion) {
                 impl_->state = State::Error;
-                return {ErrorMsg{ErrorCode::ProtocolError,
-                    "unsupported protocol version"}};
+                return {{ErrorMsg{ErrorCode::ProtocolError,
+                    "unsupported protocol version"}}, {}};
             }
-            // Master responded; wait for CatchupBegin/CatchupEnd/ResyncBegin.
             return {};
         }
         else if constexpr (std::is_same_v<T, CatchupBeginMsg>) {
@@ -1117,12 +1098,12 @@ std::vector<Message> Replica::handle_message(const Message& msg) {
             if (impl_->state != State::Catchup &&
                 impl_->state != State::Live) {
                 impl_->state = State::Error;
-                return {ErrorMsg{ErrorCode::InvalidState,
-                    "received ChangesetMsg in unexpected state"}};
+                return {{ErrorMsg{ErrorCode::InvalidState,
+                    "received ChangesetMsg in unexpected state"}}, {}};
             }
-            impl_->apply_changeset(m.data, m.seq);
+            auto events = impl_->apply_changeset(m.data, m.seq);
             SPDLOG_DEBUG("applied changeset seq={}", m.seq);
-            return {AckMsg{m.seq}};
+            return {{AckMsg{m.seq}}, std::move(events)};
         }
         else if constexpr (std::is_same_v<T, CatchupEndMsg>) {
             impl_->state = State::Live;
@@ -1138,20 +1119,20 @@ std::vector<Message> Replica::handle_message(const Message& msg) {
         else if constexpr (std::is_same_v<T, ResyncTableMsg>) {
             if (impl_->state != State::Resync) {
                 impl_->state = State::Error;
-                return {ErrorMsg{ErrorCode::InvalidState,
-                    "received ResyncTableMsg outside resync"}};
+                return {{ErrorMsg{ErrorCode::InvalidState,
+                    "received ResyncTableMsg outside resync"}}, {}};
             }
-            impl_->apply_resync_table(m);
-            return {};
+            auto events = impl_->apply_resync_table(m);
+            return {{}, std::move(events)};
         }
         else if constexpr (std::is_same_v<T, ResyncEndMsg>) {
             if (impl_->state != State::Resync) {
                 impl_->state = State::Error;
-                return {ErrorMsg{ErrorCode::InvalidState,
-                    "received ResyncEndMsg outside resync"}};
+                return {{ErrorMsg{ErrorCode::InvalidState,
+                    "received ResyncEndMsg outside resync"}}, {}};
             }
             impl_->end_resync(m);
-            return {AckMsg{m.seq}};
+            return {{AckMsg{m.seq}}, {}};
         }
         else if constexpr (std::is_same_v<T, ErrorMsg>) {
             impl_->state = State::Error;
@@ -1159,8 +1140,8 @@ std::vector<Message> Replica::handle_message(const Message& msg) {
             return {};
         }
         else {
-            return {ErrorMsg{ErrorCode::InvalidState,
-                "unexpected message type from master"}};
+            return {{ErrorMsg{ErrorCode::InvalidState,
+                "unexpected message type from master"}}, {}};
         }
     }, msg);
 }

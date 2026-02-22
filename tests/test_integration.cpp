@@ -45,15 +45,16 @@ struct DB {
     }
 };
 
-/// Deliver all messages from src to handler, collecting responses.
-std::vector<Message> deliver(const std::vector<Message>& msgs,
-                             auto& handler) {
-    std::vector<Message> responses;
+HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
+    HandleResult result;
     for (const auto& m : msgs) {
         auto resp = handler.handle_message(m);
-        responses.insert(responses.end(), resp.begin(), resp.end());
+        result.messages.insert(result.messages.end(),
+                               resp.messages.begin(), resp.messages.end());
+        result.changes.insert(result.changes.end(),
+                              resp.changes.begin(), resp.changes.end());
     }
-    return responses;
+    return result;
 }
 
 } // namespace
@@ -64,20 +65,13 @@ TEST_CASE("integration: fresh start, live streaming") {
     master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
     replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
 
-    std::vector<ChangeEvent> events;
-    ReplicaConfig rcfg;
-    rcfg.on_change = [&](const ChangeEvent& e) {
-        events.push_back(e);
-        return true;
-    };
-
     Master master(master_db.db);
-    Replica replica(replica_db.db, rcfg);
+    Replica replica(replica_db.db);
 
     // Handshake.
     auto hello = replica.hello();
     auto master_resp = master.handle_message(hello);
-    auto replica_resp = deliver(master_resp, replica);
+    deliver(master_resp, replica);
 
     CHECK(replica.state() == Replica::State::Live);
     CHECK(replica.current_seq() == 0);
@@ -88,10 +82,10 @@ TEST_CASE("integration: fresh start, live streaming") {
     REQUIRE(changeset_msgs.size() == 1);
 
     // Deliver to replica.
-    auto acks = deliver(changeset_msgs, replica);
-    REQUIRE(acks.size() == 1);
-    CHECK(std::holds_alternative<AckMsg>(acks[0]));
-    CHECK(std::get<AckMsg>(acks[0]).seq == 1);
+    auto result = deliver(changeset_msgs, replica);
+    REQUIRE(result.messages.size() == 1);
+    CHECK(std::holds_alternative<AckMsg>(result.messages[0]));
+    CHECK(std::get<AckMsg>(result.messages[0]).seq == 1);
 
     // Verify replica has the data.
     CHECK(replica_db.count("t1") == 1);
@@ -99,9 +93,9 @@ TEST_CASE("integration: fresh start, live streaming") {
     CHECK(replica.current_seq() == 1);
 
     // Verify change events.
-    REQUIRE(events.size() == 1);
-    CHECK(events[0].table == "t1");
-    CHECK(events[0].op == OpType::Insert);
+    REQUIRE(result.changes.size() == 1);
+    CHECK(result.changes[0].table == "t1");
+    CHECK(result.changes[0].op == OpType::Insert);
 }
 
 TEST_CASE("integration: catchup after disconnect") {
@@ -127,7 +121,7 @@ TEST_CASE("integration: catchup after disconnect") {
     auto master_resp = master.handle_message(hello);
 
     // Deliver all master messages to replica.
-    auto acks = deliver(master_resp, replica);
+    auto result = deliver(master_resp, replica);
 
     CHECK(replica.state() == Replica::State::Live);
     CHECK(replica.current_seq() == 3);
@@ -140,15 +134,8 @@ TEST_CASE("integration: update and delete replication") {
     master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
     replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
 
-    std::vector<ChangeEvent> events;
-    ReplicaConfig rcfg;
-    rcfg.on_change = [&](const ChangeEvent& e) {
-        events.push_back(e);
-        return true;
-    };
-
     Master master(master_db.db);
-    Replica replica(replica_db.db, rcfg);
+    Replica replica(replica_db.db);
 
     // Handshake.
     auto hello = replica.hello();
@@ -159,22 +146,20 @@ TEST_CASE("integration: update and delete replication") {
     deliver(master.flush(), replica);
 
     // Update.
-    events.clear();
     master_db.exec("UPDATE t1 SET val='world' WHERE id=1");
-    deliver(master.flush(), replica);
+    auto result = deliver(master.flush(), replica);
 
     CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=1") == "world");
-    REQUIRE(events.size() == 1);
-    CHECK(events[0].op == OpType::Update);
+    REQUIRE(result.changes.size() == 1);
+    CHECK(result.changes[0].op == OpType::Update);
 
     // Delete.
-    events.clear();
     master_db.exec("DELETE FROM t1 WHERE id=1");
-    deliver(master.flush(), replica);
+    result = deliver(master.flush(), replica);
 
     CHECK(replica_db.count("t1") == 0);
-    REQUIRE(events.size() == 1);
-    CHECK(events[0].op == OpType::Delete);
+    REQUIRE(result.changes.size() == 1);
+    CHECK(result.changes[0].op == OpType::Delete);
 }
 
 TEST_CASE("integration: multiple tables") {

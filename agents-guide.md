@@ -36,20 +36,19 @@ unlimited).
 ### Replica (receiving side)
 
 ```cpp
-Replica replica(db, config);                 // does NOT own db
-auto hello = replica.hello();                // send to master first
-auto resp = replica.handle_message(incoming);// process master msgs
+Replica replica(db, config);                   // does NOT own db
+auto hello = replica.hello();                  // send to master first
+HandleResult r = replica.handle_message(incoming);
+// r.messages — protocol responses (AckMsg, ErrorMsg) to send back
+// r.changes  — per-row ChangeEvents applied this call
 replica.current_seq();
 replica.schema_version();
 replica.state();  // Init → Handshake → Catchup/Resync → Live (or Error)
 ```
 
-`ReplicaConfig` callbacks:
-- `on_change` — `bool(const ChangeEvent&)`, per-row, post-apply. Return false
-  to stop.
+`ReplicaConfig`:
 - `on_conflict` — `ConflictAction(ConflictType, const ChangeEvent&)`. Default:
   Abort.
-- `on_resync_begin` / `on_resync_end` — `void()`, lifecycle hooks.
 
 ### Typical loop
 
@@ -58,21 +57,23 @@ replica.state();  // Init → Handshake → Catchup/Resync → Live (or Error)
 auto hello = replica.hello();          // → send to master
 auto resp = master.handle_message(hello);
 for (auto& m : resp) {
-    auto acks = replica.handle_message(m);
-    // → send acks back to master
+    auto result = replica.handle_message(m);
+    // result.messages → send back to master
 }
 
 // 2. Live streaming
 sqlite3_exec(db, "INSERT ...", ...);
 auto msgs = master.flush();            // → send to replica
 for (auto& m : msgs) {
-    auto acks = replica.handle_message(m);
-    // → send acks back to master
+    auto result = replica.handle_message(m);
+    // result.messages → send back to master
+    // result.changes  → business-level row changes
 }
 ```
 
 ### Key types
 
+- `HandleResult` — `.messages` (protocol responses), `.changes` (row events)
 - `Message` — variant of: `HelloMsg`, `CatchupBeginMsg`, `ChangesetMsg`,
   `CatchupEndMsg`, `ResyncBeginMsg`, `ResyncTableMsg`, `ResyncEndMsg`,
   `AckMsg`, `ErrorMsg`
@@ -90,12 +91,13 @@ for (auto& m : msgs) {
 
 ## Gotchas
 
-- Library is transport-agnostic: `handle_message` in, `vector<Message>` out.
+- Library is transport-agnostic: `handle_message` in, `HandleResult` out.
   You provide the transport.
 - Both `Master` and `Replica` do **not** own the `sqlite3*` handle. Keep it
   open for their lifetime.
-- Replica returns `AckMsg` after each `ChangesetMsg` — forward these to the
-  master.
-- Replica may return `ErrorMsg` — forward to the master.
+- Replica returns `AckMsg` in `result.messages` after each `ChangesetMsg` —
+  forward to the master.
+- Replica may return `ErrorMsg` in `result.messages` — forward to the master.
+- Row-level changes are in `result.changes`, not a callback.
 - Catchup/resync happen automatically during handshake based on sequence gap
   and schema fingerprint.

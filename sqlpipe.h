@@ -49,10 +49,6 @@ struct ChangeEvent {
     std::vector<Value> new_values;  // populated for INSERT, UPDATE
 };
 
-/// Callback for replica change events.
-/// Called once per row change, after application. Return false to stop iteration.
-using ChangeCallback = std::function<bool(const ChangeEvent&)>;
-
 /// Conflict resolution action returned by ConflictCallback.
 enum class ConflictAction : std::uint8_t {
     Omit,      ///< Skip this change; the conflicting row is left as-is.
@@ -246,16 +242,15 @@ private:
 namespace sqlpipe {
 
 struct ReplicaConfig {
-    /// Called for each row-level change after a changeset is applied.
-    ChangeCallback on_change = nullptr;
-
     /// Called when a conflict occurs during changeset application.
     /// Default (nullptr): ConflictAction::Abort.
     ConflictCallback on_conflict = nullptr;
+};
 
-    /// Notifications for resync lifecycle.
-    std::function<void()> on_resync_begin = nullptr;
-    std::function<void()> on_resync_end   = nullptr;
+/// Return type for Replica::handle_message.
+struct HandleResult {
+    std::vector<Message>     messages;  ///< Protocol responses to send back.
+    std::vector<ChangeEvent> changes;   ///< Row-level changes applied this call.
 };
 
 /// The receiving side of the replication protocol.
@@ -276,7 +271,7 @@ public:
     Message hello() const;
 
     /// Process an incoming message from the master.
-    std::vector<Message> handle_message(const Message& msg);
+    HandleResult handle_message(const Message& msg);
 
     Seq current_seq() const;
     SchemaVersion schema_version() const;

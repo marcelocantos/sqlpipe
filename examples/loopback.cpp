@@ -12,11 +12,27 @@
 
 using namespace sqlpipe;
 
-static void deliver(const std::vector<Message>& msgs, auto& handler) {
+static HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
+    HandleResult result;
     for (const auto& m : msgs) {
         auto resp = handler.handle_message(m);
-        // In a real system, you'd send resp back over the wire.
-        (void)resp;
+        result.messages.insert(result.messages.end(),
+                               resp.messages.begin(), resp.messages.end());
+        result.changes.insert(result.changes.end(),
+                              resp.changes.begin(), resp.changes.end());
+    }
+    return result;
+}
+
+static void print_events(const std::vector<ChangeEvent>& changes) {
+    for (const auto& e : changes) {
+        const char* op_str = "?";
+        switch (e.op) {
+        case OpType::Insert: op_str = "INSERT"; break;
+        case OpType::Update: op_str = "UPDATE"; break;
+        case OpType::Delete: op_str = "DELETE"; break;
+        }
+        std::printf("  [event] %s on %s\n", op_str, e.table.c_str());
     }
 }
 
@@ -35,21 +51,8 @@ int main() {
     sqlite3_exec(master_db, schema, nullptr, nullptr, nullptr);
     sqlite3_exec(replica_db, schema, nullptr, nullptr, nullptr);
 
-    // Set up replica with change event logging.
-    ReplicaConfig rcfg;
-    rcfg.on_change = [](const ChangeEvent& e) {
-        const char* op_str = "?";
-        switch (e.op) {
-        case OpType::Insert: op_str = "INSERT"; break;
-        case OpType::Update: op_str = "UPDATE"; break;
-        case OpType::Delete: op_str = "DELETE"; break;
-        }
-        std::printf("  [event] %s on %s\n", op_str, e.table.c_str());
-        return true;
-    };
-
     Master master(master_db);
-    Replica replica(replica_db, rcfg);
+    Replica replica(replica_db);
 
     // 1. Handshake.
     std::printf("=== Handshake ===\n");
@@ -66,8 +69,8 @@ int main() {
         "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com');"
         "INSERT INTO users VALUES (2, 'Bob', 'bob@example.com');",
         nullptr, nullptr, nullptr);
-    auto msgs = master.flush();
-    deliver(msgs, replica);
+    auto result = deliver(master.flush(), replica);
+    print_events(result.changes);
     std::printf("Master seq=%lld, Replica seq=%lld\n\n",
                 static_cast<long long>(master.current_seq()),
                 static_cast<long long>(replica.current_seq()));
@@ -77,16 +80,16 @@ int main() {
     sqlite3_exec(master_db,
         "UPDATE users SET email='alice@newmail.com' WHERE id=1",
         nullptr, nullptr, nullptr);
-    msgs = master.flush();
-    deliver(msgs, replica);
+    result = deliver(master.flush(), replica);
+    print_events(result.changes);
 
     // 4. Delete a row.
     std::printf("=== Delete row ===\n");
     sqlite3_exec(master_db,
         "DELETE FROM users WHERE id=2",
         nullptr, nullptr, nullptr);
-    msgs = master.flush();
-    deliver(msgs, replica);
+    result = deliver(master.flush(), replica);
+    print_events(result.changes);
 
     std::printf("\nFinal master seq=%lld, replica seq=%lld\n",
                 static_cast<long long>(master.current_seq()),
