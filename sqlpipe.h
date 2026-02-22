@@ -53,20 +53,20 @@ struct ChangeEvent {
 /// Called once per row change, after application. Return false to stop iteration.
 using ChangeCallback = std::function<bool(const ChangeEvent&)>;
 
-/// Conflict resolution action.
+/// Conflict resolution action returned by ConflictCallback.
 enum class ConflictAction : std::uint8_t {
-    Omit,
-    Replace,
-    Abort,
+    Omit,      ///< Skip this change; the conflicting row is left as-is.
+    Replace,   ///< Overwrite the conflicting row with the incoming change.
+    Abort,     ///< Abort the entire changeset application.
 };
 
 /// Conflict type reported during changeset application.
 enum class ConflictType : std::uint8_t {
-    Data,
-    NotFound,
-    Conflict,
-    Constraint,
-    ForeignKey,
+    Data,        ///< A directly conflicting change (different values for same row).
+    NotFound,    ///< The row to update/delete was not found on the replica.
+    Conflict,    ///< A row with the same PK already exists (on INSERT).
+    Constraint,  ///< A constraint (UNIQUE, NOT NULL, CHECK) would be violated.
+    ForeignKey,  ///< A foreign key constraint would be violated.
 };
 
 /// Callback for conflict resolution on the replica side.
@@ -81,12 +81,12 @@ namespace sqlpipe {
 /// Error codes returned by sqlpipe operations.
 enum class ErrorCode : int {
     Ok = 0,
-    SqliteError,
-    ProtocolError,
-    SequenceGap,
-    SchemaMismatch,
-    InvalidState,
-    ResyncRequired,
+    SqliteError,      ///< An underlying SQLite call failed.
+    ProtocolError,    ///< Malformed or unexpected message.
+    SequenceGap,      ///< Received a sequence number that doesn't follow.
+    SchemaMismatch,   ///< Master and replica schemas differ.
+    InvalidState,     ///< Operation not valid in the current state.
+    ResyncRequired,   ///< Log doesn't cover the gap; full resync needed.
 };
 
 /// Exception thrown by sqlpipe operations.
@@ -110,45 +110,54 @@ inline constexpr std::uint32_t kProtocolVersion = 1;
 
 // ── Message types ───────────────────────────────────────────────────
 
+/// Sent by both sides during handshake to exchange state.
 struct HelloMsg {
-    std::uint32_t protocol_version;
-    Seq           seq;
-    SchemaVersion schema_version;
+    std::uint32_t protocol_version;  ///< Must match kProtocolVersion.
+    Seq           seq;               ///< Sender's current sequence number.
+    SchemaVersion schema_version;    ///< Sender's schema fingerprint.
 };
 
+/// Sent by master to announce a catchup sequence of changesets.
 struct CatchupBeginMsg {
-    Seq from_seq;  // inclusive
-    Seq to_seq;    // inclusive
+    Seq from_seq;  ///< First sequence number in the catchup range (inclusive).
+    Seq to_seq;    ///< Last sequence number in the catchup range (inclusive).
 };
 
+/// A single changeset (one flush() worth of changes).
 struct ChangesetMsg {
-    Seq       seq;
-    Changeset data;
+    Seq       seq;   ///< Sequence number assigned by the master.
+    Changeset data;  ///< Raw SQLite changeset blob.
 };
 
+/// Marks the end of a catchup sequence. Replica transitions to Live.
 struct CatchupEndMsg {};
 
+/// Initiates a full resync. Replica drops and recreates all tables.
 struct ResyncBeginMsg {
-    SchemaVersion schema_version;
-    std::string   schema_sql;
+    SchemaVersion schema_version;  ///< Master's schema fingerprint.
+    std::string   schema_sql;      ///< CREATE TABLE statements to apply.
 };
 
+/// Carries all rows for one table during a full resync.
 struct ResyncTableMsg {
-    std::string table_name;
-    Changeset   data;
+    std::string table_name;  ///< Name of the table being synced.
+    Changeset   data;        ///< Changeset containing all rows as INSERTs.
 };
 
+/// Marks the end of a full resync. Replica transitions to Live.
 struct ResyncEndMsg {
-    Seq seq;
+    Seq seq;  ///< Master's current sequence number.
 };
 
+/// Acknowledgement sent by the replica after applying a changeset.
 struct AckMsg {
-    Seq seq;
+    Seq seq;  ///< The sequence number that was applied.
 };
 
+/// Protocol-level error. Receiving side should transition to Error state.
 struct ErrorMsg {
-    ErrorCode   code;
-    std::string detail;
+    ErrorCode   code;    ///< Machine-readable error category.
+    std::string detail;  ///< Human-readable description.
 };
 
 using Message = std::variant<
@@ -272,13 +281,14 @@ public:
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 
+    /// Replica connection lifecycle state.
     enum class State : std::uint8_t {
-        Init,
-        Handshake,
-        Catchup,
-        Resync,
-        Live,
-        Error,
+        Init,       ///< Created but hello() not yet called.
+        Handshake,  ///< hello() sent, awaiting master's response.
+        Catchup,    ///< Receiving missed changesets from the log.
+        Resync,     ///< Receiving a full database snapshot.
+        Live,       ///< Streaming; ready for real-time changesets.
+        Error,      ///< A protocol or application error occurred.
     };
 
     State state() const;

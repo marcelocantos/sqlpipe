@@ -757,7 +757,10 @@ struct Master::Impl {
         auto schema_sql = detail::get_schema_sql(db);
         msgs.push_back(ResyncBeginMsg{sv, schema_sql});
 
-        // Attach an empty in-memory DB with the same schema to diff against.
+        // To produce a changeset containing all rows in a table, we attach an
+        // empty in-memory database with the same schema and use session_diff
+        // to compare main.<table> against the empty copy. The result is a
+        // changeset with an INSERT for every row.
         detail::exec(db, "ATTACH ':memory:' AS _sqlpipe_empty");
 
         for (const auto& table : tracked_tables) {
@@ -817,6 +820,13 @@ struct Master::Impl {
         return msgs;
     }
 
+    // Hello handler decision tree:
+    //   1. Protocol version mismatch → error
+    //   2. Schema fingerprint mismatch → full resync
+    //   3. Replica already up to date → HelloMsg + CatchupEndMsg (enter Live)
+    //   4. Replica ahead of master → error (shouldn't happen)
+    //   5. Replica behind, log covers gap → catchup
+    //   6. Replica behind, log pruned past needed seq → full resync
     std::vector<Message> handle_hello(const HelloMsg& hello) {
         if (hello.protocol_version != kProtocolVersion) {
             return {ErrorMsg{ErrorCode::ProtocolError,
@@ -883,7 +893,8 @@ Master::Master(Master&&) noexcept = default;
 Master& Master::operator=(Master&&) noexcept = default;
 
 std::vector<Message> Master::flush() {
-    // Check if schema changed; re-scan tables if so.
+    // If DDL ran since last flush, the tracked table set may have changed.
+    // Re-scan and recreate the session so it attaches to the right tables.
     auto sv = detail::compute_schema_fingerprint(impl_->db);
     if (sv != impl_->cached_sv) {
         impl_->cached_sv = sv;
@@ -953,7 +964,8 @@ struct Replica::Impl {
     }
 
     void apply_changeset(const Changeset& data, Seq new_seq) {
-        // Apply via SQLite session extension.
+        // Apply the changeset, then emit per-row change events. The change
+        // events fire after application so callbacks see committed state.
         int rc = sqlite3changeset_apply(
             db,
             static_cast<int>(data.size()),
@@ -1008,13 +1020,13 @@ struct Replica::Impl {
             config.on_resync_begin();
         }
 
-        // Drop all user tables and recreate from master schema.
+        // Wipe all user tables so the master's schema can be applied cleanly.
+        // This handles both schema changes and table additions/removals.
         auto tables = detail::get_tracked_tables(db);
         for (const auto& t : tables) {
             detail::exec(db, ("DROP TABLE IF EXISTS \"" + t + "\"").c_str());
         }
 
-        // Also drop any tables that the master has but we don't.
         detail::exec(db, msg.schema_sql.c_str());
 
         SPDLOG_INFO("resync: schema applied, sv={}", msg.schema_version);
