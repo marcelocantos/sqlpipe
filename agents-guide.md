@@ -11,8 +11,8 @@ Add `sqlpipe.h` and `sqlpipe.cpp` to your project. Compile with:
 -std=c++20 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK
 ```
 
-Requires SQLite 3 and [spdlog](https://github.com/gabime/spdlog) (header-only)
-on the include path. All tables must have explicit `PRIMARY KEY`s.
+Requires SQLite 3 on the include path. All tables must have explicit `PRIMARY
+KEY`s.
 
 ## API
 

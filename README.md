@@ -29,7 +29,6 @@ serial, shared memory, etc.).
 - C++20 compiler
 - SQLite 3 compiled with `-DSQLITE_ENABLE_SESSION
   -DSQLITE_ENABLE_PREUPDATE_HOOK`
-- [spdlog](https://github.com/gabime/spdlog) (header-only)
 
 All tables must have explicit `PRIMARY KEY`s (required by SQLite's session
 extension).
