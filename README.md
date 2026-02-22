@@ -77,6 +77,10 @@ make test     # build and run tests (28 test cases)
 make example  # build and run the loopback demo
 ```
 
+If you use an agentic coding tool (Claude Code, Cursor, Copilot, etc.), include
+[`agents-guide.md`](agents-guide.md) in your project context for a condensed
+API reference.
+
 ## Protocol overview
 
 **Catchup** (schema match, replica behind, log covers the gap):
