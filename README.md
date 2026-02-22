@@ -7,19 +7,22 @@ Streaming replication protocol for SQLite.
 sqlpipe is a C++ library that keeps two SQLite databases in sync over any
 transport layer. A **Master** component tracks changes and produces compact
 binary changesets; a **Replica** component applies them, emitting per-row change
-events to client code as they arrive.
+events to client code as they arrive. A **Peer** component wraps both behind a
+symmetric API for bidirectional replication with table-level ownership.
 
 The library is transport-agnostic: it defines a message-in / message-out API.
-You decide how messages travel between master and replica (TCP, WebSocket,
-serial, shared memory, etc.).
+You decide how messages travel between peers (TCP, WebSocket, serial, shared
+memory, etc.).
 
 ## Features
 
+- **Bidirectional replication** via the Peer API — each side owns a disjoint
+  set of tables, with server-authoritative ownership negotiation
 - **Incremental replication** via SQLite's session extension (compact binary
   changesets)
 - **Catchup on reconnect** from a configurable log of recent changesets
 - **Full resync** when the log doesn't cover the gap or schemas diverge
-- **Per-row change events** (insert/update/delete) on the replica side
+- **Per-row change events** (insert/update/delete) on the receiving side
 - **Conflict callbacks** for custom resolution logic
 - **Schema fingerprinting** to detect and handle schema mismatches
 - **Single header + source** (`sqlpipe.h` / `sqlpipe.cpp`) for easy integration
@@ -76,7 +79,7 @@ example including change event handling.
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-make test     # build and run tests (28 test cases)
+make test     # build and run tests (43 test cases)
 make example  # build and run the loopback demo
 ```
 
@@ -162,6 +165,76 @@ public:
 };
 ```
 
+### Peer (bidirectional)
+
+```cpp
+struct PeerConfig {
+    std::set<std::string> owned_tables;       // tables this side masters
+    ApproveOwnershipCallback approve_ownership; // non-null = server side
+    ConflictCallback on_conflict = nullptr;
+    std::size_t max_log_entries = 10000;
+};
+
+struct PeerHandleResult {
+    std::vector<PeerMessage>  messages;  // responses to send back
+    std::vector<ChangeEvent>  changes;   // row-level changes applied
+};
+
+class Peer {
+public:
+    explicit Peer(sqlite3* db, PeerConfig config = {});
+    std::vector<PeerMessage> start();   // client initiates handshake
+    std::vector<PeerMessage> flush();   // after writing owned tables
+    PeerHandleResult handle_message(const PeerMessage& msg);
+    State state() const;  // Init, Negotiating, Syncing, Live, Error
+    const std::set<std::string>& owned_tables() const;
+    const std::set<std::string>& remote_tables() const;
+};
+```
+
+Each peer internally wraps a Master (for its owned tables) and a Replica (for
+the remote peer's tables). The client calls `start()` to request ownership; the
+server validates via `approve_ownership` (or auto-approves if null). The server
+owns the complement of whatever the client claims.
+
+```cpp
+// Client (e.g. mobile app) owns "drafts", server owns the rest.
+PeerConfig client_cfg;
+client_cfg.owned_tables = {"drafts"};
+Peer client(client_db, client_cfg);
+
+PeerConfig server_cfg;
+server_cfg.approve_ownership = [](const std::set<std::string>& t) {
+    return t == std::set<std::string>{"drafts"};
+};
+Peer server(server_db, server_cfg);
+
+auto msgs = client.start();
+// Exchange msgs between client and server until both reach Live.
+// Then: client.flush() after writes to "drafts",
+//       server.flush() after writes to other tables.
+```
+
+**Bidirectional handshake:**
+
+```
+Client                                  Server
+  |                                       |
+  | start() → PeerMsg{AsReplica,          |
+  |   HelloMsg{owned={"drafts"}}}         |
+  | ─────────────────────────────────────>|
+  |                                       | approve_ownership({"drafts"}) ✓
+  |                                       |
+  |<───────────────────────────────────── | PeerMsg{AsMaster, HelloMsg}
+  |<───────────────────────────────────── | PeerMsg{AsMaster, CatchupEndMsg}
+  |<───────────────────────────────────── | PeerMsg{AsReplica, HelloMsg}
+  |                                       |
+  | ─────────────────────────────────────>| PeerMsg{AsMaster, HelloMsg}
+  | ─────────────────────────────────────>| PeerMsg{AsMaster, CatchupEndMsg}
+  |                                       |
+  |         [BOTH LIVE]                   |
+```
+
 ## Error handling
 
 All operations may throw `sqlpipe::Error`, which carries an `ErrorCode` and a
@@ -177,7 +250,8 @@ try {
 ```
 
 Error codes: `SqliteError`, `ProtocolError`, `SequenceGap`, `SchemaMismatch`,
-`InvalidState`, `ResyncRequired`. See `sqlpipe.h` for details.
+`InvalidState`, `ResyncRequired`, `OwnershipRejected`. See `sqlpipe.h` for
+details.
 
 The replica also returns `ErrorMsg` messages when it receives unexpected
 protocol messages — these should be forwarded to the master over the transport.

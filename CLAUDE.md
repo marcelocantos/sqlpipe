@@ -6,7 +6,7 @@ Streaming replication protocol for SQLite. Two-file library: `sqlpipe.h`
 ## Build
 
 ```sh
-make test     # build and run all tests (28 cases)
+make test     # build and run all tests (43 cases)
 make example  # build and run examples/loopback.cpp
 make clean    # remove build/
 ```
@@ -26,10 +26,19 @@ SQLite must be compiled with `-DSQLITE_ENABLE_SESSION
 
 ### Protocol
 
-Master-replica replication over an abstract message transport. The library is
-message-in / message-out; callers provide the transport.
+Two modes of operation:
 
-Three modes:
+**Unidirectional** (Master/Replica): Master-replica replication over an abstract
+message transport. The library is message-in / message-out; callers provide the
+transport.
+
+**Bidirectional** (Peer): Wraps Master + Replica behind a symmetric API. Each
+side owns a disjoint set of tables. A `PeerMessage` wraps `Message` with a
+`SenderRole` tag (`AsMaster`/`AsReplica`) for routing. Client requests ownership
+in its HelloMsg; server validates via a callback. Wire format:
+`[4B LE length][1B sender_role][1B tag][payload]`.
+
+Three sync modes:
 1. **Live streaming** — Master calls `flush()` after each write transaction;
    replica applies the resulting `ChangesetMsg`.
 2. **Catchup** — Replica reconnects behind; master replays missed changesets
@@ -44,10 +53,17 @@ Three modes:
   pragma changes on every DDL, even if the logical schema is unchanged.
 - **Session extension**: `sqlite3session_create/attach/changeset` for change
   tracking. `sqlite3changeset_apply` on the replica side.
-- **Pimpl**: Both `Master` and `Replica` use `struct Impl` behind
+- **Pimpl**: `Master`, `Replica`, and `Peer` use `struct Impl` behind
   `std::unique_ptr` to keep the header dependency-free.
 - **Internal tables**: `_sqlpipe_meta` (key-value, stores seq) and
   `_sqlpipe_log` (seq + changeset blob, master only). Excluded from tracking.
+  In Peer mode, Master and Replica use separate meta keys (`master_seq` /
+  `replica_seq`) to avoid collision.
+- **Table filtering**: `MasterConfig::table_filter` and
+  `ReplicaConfig::table_filter` (`std::optional<std::set<std::string>>`)
+  restrict which tables are tracked. `nullopt` = all tables, empty set = none.
+  `compute_schema_fingerprint`, `get_tracked_tables`, and `get_schema_sql`
+  accept an optional `const std::set<std::string>* filter` parameter.
 
 ### Wire format
 
@@ -67,13 +83,16 @@ Makefile            Build system
 
 ## Tests
 
-28 test cases across 5 files (all use doctest):
+43 test cases across 6 files (all use doctest):
 
-- `test_protocol.cpp` — Serialization round-trips for all 9 message types
+- `test_protocol.cpp` — Serialization round-trips for all message types
+  including PeerMessage
 - `test_master.cpp` — Master state, flush behaviour, hello/catchup handling
 - `test_replica.cpp` — Replica state transitions
 - `test_integration.cpp` — End-to-end: live streaming, catchup, multi-table
 - `test_resync.cpp` — Schema mismatch, log pruning, resync change events
+- `test_peer.cpp` — Peer handshake, ownership negotiation, bidirectional
+  streaming, catchup after reconnect
 
 Add new tests to the file matching the component under test.
 

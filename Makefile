@@ -19,7 +19,8 @@ LIB_CXX_SRCS := sqlpipe.cpp
 
 TEST_SRCS := tests/doctest_main.cpp tests/test_protocol.cpp \
              tests/test_master.cpp tests/test_replica.cpp \
-             tests/test_integration.cpp tests/test_resync.cpp
+             tests/test_integration.cpp tests/test_resync.cpp \
+             tests/test_peer.cpp
 
 EXAMPLE_SRCS := examples/loopback.cpp
 

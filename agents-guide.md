@@ -50,7 +50,39 @@ replica.state();  // Init → Handshake → Catchup/Resync → Live (or Error)
 - `on_conflict` — `ConflictAction(ConflictType, const ChangeEvent&)`. Default:
   Abort.
 
-### Typical loop
+### Peer (bidirectional)
+
+```cpp
+PeerConfig cfg;
+cfg.owned_tables = {"drafts"};           // tables this side masters
+Peer client(db, cfg);                    // does NOT own db
+
+auto msgs = client.start();              // initiate handshake (client only)
+PeerHandleResult r = client.handle_message(incoming);
+// r.messages — PeerMessages to send back
+// r.changes  — per-row ChangeEvents applied
+auto fmsgs = client.flush();             // after writing owned tables
+client.state();    // Init → Negotiating → Syncing → Live (or Error)
+client.owned_tables();                   // tables we master
+client.remote_tables();                  // tables we replicate
+```
+
+`PeerConfig`:
+- `owned_tables` — tables this side wants to own (client sends in hello)
+- `approve_ownership` — server-side callback; non-null marks this peer as
+  server. `nullptr` = auto-approve.
+- `on_conflict` — forwarded to internal Replica
+- `max_log_entries` — forwarded to internal Master
+
+`PeerMessage` wraps `Message` with `SenderRole` (`AsMaster`/`AsReplica`) for
+routing. Wire format: `[4B LE length][1B sender_role][1B tag][payload]`.
+`serialize(PeerMessage)` / `deserialize_peer(buf)`.
+
+Server creates Peer without `owned_tables` — it owns whatever the client
+doesn't claim. Client calls `start()`; server receives messages via
+`handle_message()`.
+
+### Typical loop (unidirectional)
 
 ```cpp
 // 1. Handshake
@@ -71,6 +103,31 @@ for (auto& m : msgs) {
 }
 ```
 
+### Typical loop (bidirectional)
+
+```cpp
+// Setup
+PeerConfig client_cfg;
+client_cfg.owned_tables = {"drafts"};
+Peer client(client_db, client_cfg);
+
+PeerConfig server_cfg;
+server_cfg.approve_ownership = [](auto& t) { return true; };
+Peer server(server_db, server_cfg);
+
+// Handshake — exchange messages until both Live
+auto msgs = client.start();
+// ... deliver msgs to server, deliver responses to client, repeat ...
+
+// Live — each side flushes its owned tables
+sqlite3_exec(client_db, "INSERT INTO drafts ...", ...);
+auto peer_msgs = client.flush();          // → send to server
+for (auto& m : peer_msgs) {
+    auto r = server.handle_message(m);
+    // r.messages → send back    r.changes → row events
+}
+```
+
 ### Key types
 
 - `HandleResult` — `.messages` (protocol responses), `.changes` (row events)
@@ -81,13 +138,17 @@ for (auto& m : msgs) {
   `.old_values`, `.new_values`
 - `Value` — variant: `monostate` (NULL), `int64_t`, `double`, `string`,
   `vector<uint8_t>` (BLOB)
+- `PeerMessage` — `.sender_role` (`AsMaster`/`AsReplica`), `.payload` (Message)
+- `PeerHandleResult` — `.messages` (PeerMessages), `.changes` (row events)
 - `serialize(msg)` / `deserialize(buf)` — wire format:
   `[4B LE length][1B tag][payload]`
+- `serialize(PeerMessage)` / `deserialize_peer(buf)` — wire format:
+  `[4B LE length][1B role][1B tag][payload]`
 
 ### Error codes
 
 `SqliteError`, `ProtocolError`, `SequenceGap`, `SchemaMismatch`,
-`InvalidState`, `ResyncRequired`.
+`InvalidState`, `ResyncRequired`, `OwnershipRejected`.
 
 ## Gotchas
 

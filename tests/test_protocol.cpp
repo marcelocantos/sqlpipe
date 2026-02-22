@@ -88,3 +88,59 @@ TEST_CASE("deserialize rejects truncated buffer") {
     std::vector<std::uint8_t> buf = {0x00, 0x00};
     CHECK_THROWS_AS(deserialize(buf), Error);
 }
+
+TEST_CASE("HelloMsg with owned_tables round-trip") {
+    HelloMsg orig;
+    orig.protocol_version = kProtocolVersion;
+    orig.seq = 10;
+    orig.schema_version = 42;
+    orig.owned_tables = {"drafts", "local_prefs", "settings"};
+
+    auto buf = serialize(Message{orig});
+    auto msg = deserialize(buf);
+    auto& m = std::get<HelloMsg>(msg);
+    CHECK(m.protocol_version == kProtocolVersion);
+    CHECK(m.seq == 10);
+    CHECK(m.schema_version == 42);
+    REQUIRE(m.owned_tables.size() == 3);
+    CHECK(m.owned_tables.count("drafts") == 1);
+    CHECK(m.owned_tables.count("local_prefs") == 1);
+    CHECK(m.owned_tables.count("settings") == 1);
+}
+
+TEST_CASE("HelloMsg without owned_tables backward compat") {
+    // Serialize with empty owned_tables, verify identical to old format.
+    HelloMsg orig;
+    orig.protocol_version = kProtocolVersion;
+    orig.seq = 5;
+    orig.schema_version = 7;
+    // owned_tables is empty by default.
+
+    auto buf = serialize(Message{orig});
+    // Old format: 4 len + 1 tag + 4 version + 8 seq + 4 sv = 21 bytes.
+    CHECK(buf.size() == 21);
+
+    auto msg = deserialize(buf);
+    auto& m = std::get<HelloMsg>(msg);
+    CHECK(m.owned_tables.empty());
+}
+
+TEST_CASE("PeerMessage round-trip (AsMaster)") {
+    PeerMessage orig{SenderRole::AsMaster,
+                     ChangesetMsg{42, {0x01, 0x02, 0x03}}};
+    auto buf = serialize(orig);
+    auto decoded = deserialize_peer(buf);
+    CHECK(decoded.sender_role == SenderRole::AsMaster);
+    auto& cs = std::get<ChangesetMsg>(decoded.payload);
+    CHECK(cs.seq == 42);
+    CHECK(cs.data == Changeset{0x01, 0x02, 0x03});
+}
+
+TEST_CASE("PeerMessage round-trip (AsReplica)") {
+    PeerMessage orig{SenderRole::AsReplica, AckMsg{99}};
+    auto buf = serialize(orig);
+    auto decoded = deserialize_peer(buf);
+    CHECK(decoded.sender_role == SenderRole::AsReplica);
+    auto& ack = std::get<AckMsg>(decoded.payload);
+    CHECK(ack.seq == 99);
+}

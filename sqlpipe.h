@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <set>
 #include <span>
 #include <sqlite3.h>
 #include <stdexcept>
@@ -81,8 +83,9 @@ enum class ErrorCode : int {
     ProtocolError,    ///< Malformed or unexpected message.
     SequenceGap,      ///< Received a sequence number that doesn't follow.
     SchemaMismatch,   ///< Master and replica schemas differ.
-    InvalidState,     ///< Operation not valid in the current state.
-    ResyncRequired,   ///< Log doesn't cover the gap; full resync needed.
+    InvalidState,       ///< Operation not valid in the current state.
+    ResyncRequired,     ///< Log doesn't cover the gap; full resync needed.
+    OwnershipRejected,  ///< Peer ownership request was rejected by the server.
 };
 
 /// Exception thrown by sqlpipe operations.
@@ -111,6 +114,7 @@ struct HelloMsg {
     std::uint32_t protocol_version;  ///< Must match kProtocolVersion.
     Seq           seq;               ///< Sender's current sequence number.
     SchemaVersion schema_version;    ///< Sender's schema fingerprint.
+    std::set<std::string> owned_tables;  ///< Tables the sender wants to own (Peer mode).
 };
 
 /// Sent by master to announce a catchup sequence of changesets.
@@ -200,6 +204,13 @@ struct MasterConfig {
     /// Maximum number of changesets to retain in the log for catchup.
     /// Older entries are pruned. 0 = unlimited.
     std::size_t max_log_entries = 10000;
+
+    /// If set, only track these tables. nullopt = track all.
+    /// An empty set means track nothing.
+    std::optional<std::set<std::string>> table_filter;
+
+    /// Meta-table key for storing the sequence number.
+    std::string seq_key = "seq";
 };
 
 /// The sending side of the replication protocol.
@@ -245,6 +256,13 @@ struct ReplicaConfig {
     /// Called when a conflict occurs during changeset application.
     /// Default (nullptr): ConflictAction::Abort.
     ConflictCallback on_conflict = nullptr;
+
+    /// If set, only manage these tables during resync (drop/recreate).
+    /// nullopt = all tracked tables (default). Empty set = nothing.
+    std::optional<std::set<std::string>> table_filter;
+
+    /// Meta-table key for storing the sequence number.
+    std::string seq_key = "seq";
 };
 
 /// Return type for Replica::handle_message.
@@ -292,5 +310,107 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+} // namespace sqlpipe
+
+// ── peer.h ──────────────────────────────────────────────────────
+namespace sqlpipe {
+
+/// Server-side callback to approve or reject a client's ownership request.
+/// Receives the set of tables the client wants to own.
+/// Returns true to approve, false to reject.
+using ApproveOwnershipCallback = std::function<bool(
+    const std::set<std::string>& requested_tables)>;
+
+struct PeerConfig {
+    /// Tables this peer wants to own (client-side: sent in hello).
+    /// Ignored on the server side (computed as complement of client's).
+    std::set<std::string> owned_tables;
+
+    /// Server-side ownership validation callback.
+    /// Non-null indicates this peer is the server.
+    /// nullptr = auto-approve any request.
+    ApproveOwnershipCallback approve_ownership = nullptr;
+
+    /// Conflict callback for the internal Replica.
+    ConflictCallback on_conflict = nullptr;
+
+    /// Max log entries for the internal Master.
+    std::size_t max_log_entries = 10000;
+};
+
+/// Identifies whether the sender was acting as master or replica.
+enum class SenderRole : std::uint8_t {
+    AsMaster  = 0,  ///< Sender is acting as master (replicating owned tables).
+    AsReplica = 1,  ///< Sender is acting as replica (acks/hellos for other side).
+};
+
+/// A protocol message with a directional tag for peer-to-peer routing.
+struct PeerMessage {
+    SenderRole sender_role;
+    Message    payload;
+};
+
+/// Return type for Peer::handle_message.
+struct PeerHandleResult {
+    std::vector<PeerMessage>  messages;  ///< Protocol responses to send back.
+    std::vector<ChangeEvent>  changes;   ///< Row-level changes applied.
+};
+
+/// Bidirectional replication peer.
+///
+/// Wraps a Master (for owned tables) and a Replica (for the remote peer's
+/// tables) behind a symmetric API.
+///
+/// Does NOT own the sqlite3* handle.
+class Peer {
+public:
+    explicit Peer(sqlite3* db, PeerConfig config = {});
+    ~Peer();
+
+    Peer(const Peer&) = delete;
+    Peer& operator=(const Peer&) = delete;
+    Peer(Peer&&) noexcept;
+    Peer& operator=(Peer&&) noexcept;
+
+    /// Initiate the handshake (client only).
+    /// Returns PeerMessages to send to the remote peer.
+    std::vector<PeerMessage> start();
+
+    /// Flush local changes on owned tables.
+    /// Returns PeerMessages to send to the remote peer.
+    std::vector<PeerMessage> flush();
+
+    /// Process an incoming PeerMessage from the remote peer.
+    PeerHandleResult handle_message(const PeerMessage& msg);
+
+    /// Peer lifecycle state.
+    enum class State : std::uint8_t {
+        Init,        ///< Created, not yet started.
+        Negotiating, ///< Ownership negotiation in progress.
+        Syncing,     ///< Handshake/catchup/resync in progress.
+        Live,        ///< Both directions are live.
+        Error,       ///< A protocol or application error occurred.
+    };
+
+    State state() const;
+
+    /// The tables this peer owns (mastering).
+    const std::set<std::string>& owned_tables() const;
+
+    /// The tables the remote peer owns (replicating).
+    const std::set<std::string>& remote_tables() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// Serialize a PeerMessage to a length-prefixed byte buffer.
+/// Format: [4B LE length][1B sender_role][1B tag][payload...]
+std::vector<std::uint8_t> serialize(const PeerMessage& msg);
+
+/// Deserialize a byte buffer into a PeerMessage.
+PeerMessage deserialize_peer(std::span<const std::uint8_t> buf);
 
 } // namespace sqlpipe

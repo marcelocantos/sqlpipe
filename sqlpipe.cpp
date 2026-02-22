@@ -117,24 +117,30 @@ void ensure_meta_table(sqlite3* db);
 void ensure_log_table(sqlite3* db);
 
 /// Read the current sequence number from _sqlpipe_meta.
-Seq read_seq(sqlite3* db);
+Seq read_seq(sqlite3* db, const std::string& key = "seq");
 
 /// Write the sequence number to _sqlpipe_meta.
-void write_seq(sqlite3* db, Seq seq);
+void write_seq(sqlite3* db, Seq seq, const std::string& key = "seq");
 
 /// Read PRAGMA schema_version.
 SchemaVersion read_schema_version(sqlite3* db);
 
 /// Compute a fingerprint of the user table definitions (excludes internal tables).
 /// Uses FNV-1a over the sorted CREATE TABLE SQL.
-SchemaVersion compute_schema_fingerprint(sqlite3* db);
+/// If filter is non-null and non-empty, only include tables in the filter.
+SchemaVersion compute_schema_fingerprint(
+    sqlite3* db, const std::set<std::string>* filter = nullptr);
 
 /// Get all user table names (excludes _sqlpipe_* and sqlite_* tables).
 /// Only includes tables with explicit PRIMARY KEYs.
-std::vector<std::string> get_tracked_tables(sqlite3* db);
+/// If filter is non-null and non-empty, only include tables in the filter.
+std::vector<std::string> get_tracked_tables(
+    sqlite3* db, const std::set<std::string>* filter = nullptr);
 
 /// Get the CREATE TABLE SQL for all tracked user tables.
-std::string get_schema_sql(sqlite3* db);
+/// If filter is non-null and non-empty, only include tables in the filter.
+std::string get_schema_sql(
+    sqlite3* db, const std::set<std::string>* filter = nullptr);
 
 /// Get the CREATE TABLE SQL for a single table.
 std::string get_table_create_sql(sqlite3* db, const std::string& table);
@@ -281,6 +287,12 @@ std::vector<std::uint8_t> serialize(const Message& msg) {
             put_u32(buf, m.protocol_version);
             put_i64(buf, m.seq);
             put_i32(buf, m.schema_version);
+            if (!m.owned_tables.empty()) {
+                put_u32(buf, static_cast<std::uint32_t>(m.owned_tables.size()));
+                for (const auto& t : m.owned_tables) {
+                    put_string(buf, t);
+                }
+            }
         }
         else if constexpr (std::is_same_v<T, CatchupBeginMsg>) {
             put_u8(buf, static_cast<std::uint8_t>(MessageTag::CatchupBegin));
@@ -349,6 +361,12 @@ Message deserialize(std::span<const std::uint8_t> buf) {
         m.protocol_version = r.read_u32();
         m.seq = r.read_i64();
         m.schema_version = r.read_i32();
+        if (!r.at_end()) {
+            auto count = r.read_u32();
+            for (std::uint32_t i = 0; i < count; ++i) {
+                m.owned_tables.insert(r.read_string());
+            }
+        }
         return m;
     }
     case MessageTag::CatchupBegin: {
@@ -428,8 +446,11 @@ void ensure_log_table(sqlite3* db) {
         ")");
 }
 
-Seq read_seq(sqlite3* db) {
-    auto stmt = prepare(db, "SELECT value FROM _sqlpipe_meta WHERE key='seq'");
+Seq read_seq(sqlite3* db, const std::string& key) {
+    auto stmt = prepare(db,
+        "SELECT value FROM _sqlpipe_meta WHERE key=?");
+    sqlite3_bind_text(stmt.get(), 1, key.c_str(),
+                      static_cast<int>(key.size()), SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt.get());
     if (rc == SQLITE_ROW) {
         return sqlite3_column_int64(stmt.get(), 0);
@@ -437,10 +458,12 @@ Seq read_seq(sqlite3* db) {
     return 0;
 }
 
-void write_seq(sqlite3* db, Seq seq) {
+void write_seq(sqlite3* db, Seq seq, const std::string& key) {
     auto stmt = prepare(db,
-        "INSERT OR REPLACE INTO _sqlpipe_meta (key, value) VALUES ('seq', ?)");
-    sqlite3_bind_int64(stmt.get(), 1, seq);
+        "INSERT OR REPLACE INTO _sqlpipe_meta (key, value) VALUES (?, ?)");
+    sqlite3_bind_text(stmt.get(), 1, key.c_str(),
+                      static_cast<int>(key.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 2, seq);
     step_done(db, stmt.get());
 }
 
@@ -453,8 +476,9 @@ SchemaVersion read_schema_version(sqlite3* db) {
     return 0;
 }
 
-SchemaVersion compute_schema_fingerprint(sqlite3* db) {
-    auto sql = get_schema_sql(db);
+SchemaVersion compute_schema_fingerprint(
+        sqlite3* db, const std::set<std::string>* filter) {
+    auto sql = get_schema_sql(db, filter);
     // FNV-1a 32-bit.
     std::uint32_t hash = 2166136261u;
     for (char c : sql) {
@@ -464,7 +488,8 @@ SchemaVersion compute_schema_fingerprint(sqlite3* db) {
     return static_cast<SchemaVersion>(hash);
 }
 
-std::vector<std::string> get_tracked_tables(sqlite3* db) {
+std::vector<std::string> get_tracked_tables(
+        sqlite3* db, const std::set<std::string>* filter) {
     // Get tables with explicit PRIMARY KEYs, excluding internal tables.
     // A table has an explicit PK if table_info shows a pk > 0 column.
     auto stmt = prepare(db,
@@ -478,6 +503,11 @@ std::vector<std::string> get_tracked_tables(sqlite3* db) {
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         std::string name(reinterpret_cast<const char*>(
             sqlite3_column_text(stmt.get(), 0)));
+
+        // Skip tables not in the filter (if provided).
+        if (filter && filter->find(name) == filter->end()) {
+            continue;
+        }
 
         // Check if table has an explicit PK.
         std::string pragma = "PRAGMA table_info('" + name + "')";
@@ -500,8 +530,9 @@ std::vector<std::string> get_tracked_tables(sqlite3* db) {
     return tables;
 }
 
-std::string get_schema_sql(sqlite3* db) {
-    auto tables = get_tracked_tables(db);
+std::string get_schema_sql(
+        sqlite3* db, const std::set<std::string>* filter) {
+    auto tables = get_tracked_tables(db, filter);
     std::string sql;
     for (const auto& t : tables) {
         if (!sql.empty()) sql += ";\n";
@@ -639,18 +670,22 @@ struct Master::Impl {
     Seq                      seq = 0;
     SchemaVersion            cached_sv = 0;
 
+    const std::set<std::string>* filter() const {
+        return config.table_filter ? &*config.table_filter : nullptr;
+    }
+
     void init() {
         detail::ensure_meta_table(db);
         detail::ensure_log_table(db);
-        seq = detail::read_seq(db);
-        cached_sv = detail::compute_schema_fingerprint(db);
+        seq = detail::read_seq(db, config.seq_key);
+        cached_sv = detail::compute_schema_fingerprint(db, filter());
         scan_tables();
         recreate_session();
         SPDLOG_INFO("master initialized at seq={}", seq);
     }
 
     void scan_tables() {
-        tracked_tables = detail::get_tracked_tables(db);
+        tracked_tables = detail::get_tracked_tables(db, filter());
         SPDLOG_INFO("tracking {} tables", tracked_tables.size());
     }
 
@@ -749,8 +784,8 @@ struct Master::Impl {
     std::vector<Message> generate_resync() {
         std::vector<Message> msgs;
 
-        auto sv = detail::compute_schema_fingerprint(db);
-        auto schema_sql = detail::get_schema_sql(db);
+        auto sv = detail::compute_schema_fingerprint(db, filter());
+        auto schema_sql = detail::get_schema_sql(db, filter());
         msgs.push_back(ResyncBeginMsg{sv, schema_sql});
 
         // To produce a changeset containing all rows in a table, we attach an
@@ -830,7 +865,7 @@ struct Master::Impl {
                 std::to_string(hello.protocol_version)}};
         }
 
-        auto my_sv = detail::compute_schema_fingerprint(db);
+        auto my_sv = detail::compute_schema_fingerprint(db, filter());
 
         // Schema mismatch → full resync.
         if (hello.schema_version != my_sv) {
@@ -891,7 +926,7 @@ Master& Master::operator=(Master&&) noexcept = default;
 std::vector<Message> Master::flush() {
     // If DDL ran since last flush, the tracked table set may have changed.
     // Re-scan and recreate the session so it attaches to the right tables.
-    auto sv = detail::compute_schema_fingerprint(impl_->db);
+    auto sv = detail::compute_schema_fingerprint(impl_->db, impl_->filter());
     if (sv != impl_->cached_sv) {
         impl_->cached_sv = sv;
         impl_->scan_tables();
@@ -904,7 +939,7 @@ std::vector<Message> Master::flush() {
     impl_->recreate_session();
 
     impl_->seq++;
-    detail::write_seq(impl_->db, impl_->seq);
+    detail::write_seq(impl_->db, impl_->seq, impl_->config.seq_key);
     impl_->store_changeset(impl_->seq, cs);
     impl_->prune_log();
 
@@ -934,7 +969,7 @@ std::vector<Message> Master::handle_message(const Message& msg) {
 Seq Master::current_seq() const { return impl_->seq; }
 
 SchemaVersion Master::schema_version() const {
-    return detail::compute_schema_fingerprint(impl_->db);
+    return detail::compute_schema_fingerprint(impl_->db, impl_->filter());
 }
 
 std::vector<Message> Master::generate_resync() {
@@ -955,7 +990,7 @@ struct Replica::Impl {
 
     void init() {
         detail::ensure_meta_table(db);
-        seq = detail::read_seq(db);
+        seq = detail::read_seq(db, config.seq_key);
         SPDLOG_INFO("replica initialized at seq={}", seq);
     }
 
@@ -1004,15 +1039,19 @@ struct Replica::Impl {
         auto events = detail::collect_events(data);
 
         seq = new_seq;
-        detail::write_seq(db, seq);
+        detail::write_seq(db, seq, config.seq_key);
         return events;
     }
 
     void begin_resync(const ResyncBeginMsg& msg) {
-        // Wipe all user tables so the master's schema can be applied cleanly.
-        // This handles both schema changes and table additions/removals.
+        // Wipe tables so the master's schema can be applied cleanly.
+        // If table_filter is set (Peer mode), only drop tables we replicate.
         auto tables = detail::get_tracked_tables(db);
         for (const auto& t : tables) {
+            if (config.table_filter &&
+                config.table_filter->find(t) == config.table_filter->end()) {
+                continue;
+            }
             detail::exec(db, ("DROP TABLE IF EXISTS \"" + t + "\"").c_str());
         }
 
@@ -1046,7 +1085,7 @@ struct Replica::Impl {
 
     void end_resync(const ResyncEndMsg& msg) {
         seq = msg.seq;
-        detail::write_seq(db, seq);
+        detail::write_seq(db, seq, config.seq_key);
         state = Replica::State::Live;
         SPDLOG_INFO("resync complete, now at seq={}", seq);
     }
@@ -1067,8 +1106,10 @@ Replica& Replica::operator=(Replica&&) noexcept = default;
 
 Message Replica::hello() const {
     impl_->state = State::Handshake;
+    const auto* f = impl_->config.table_filter
+        ? &*impl_->config.table_filter : nullptr;
     return HelloMsg{kProtocolVersion, impl_->seq,
-                    detail::compute_schema_fingerprint(impl_->db)};
+                    detail::compute_schema_fingerprint(impl_->db, f)};
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
@@ -1149,9 +1190,336 @@ HandleResult Replica::handle_message(const Message& msg) {
 Seq Replica::current_seq() const { return impl_->seq; }
 
 SchemaVersion Replica::schema_version() const {
-    return detail::compute_schema_fingerprint(impl_->db);
+    const auto* f = impl_->config.table_filter
+        ? &*impl_->config.table_filter : nullptr;
+    return detail::compute_schema_fingerprint(impl_->db, f);
 }
 
 Replica::State Replica::state() const { return impl_->state; }
+
+} // namespace sqlpipe
+
+// ── peer_protocol.cpp ───────────────────────────────────────────
+
+namespace sqlpipe {
+
+std::vector<std::uint8_t> serialize(const PeerMessage& msg) {
+    auto inner = serialize(msg.payload);  // [4B len][tag][payload]
+
+    // Read inner length from bytes 0..3.
+    std::uint32_t inner_len =
+        static_cast<std::uint32_t>(inner[0]) |
+        (static_cast<std::uint32_t>(inner[1]) << 8) |
+        (static_cast<std::uint32_t>(inner[2]) << 16) |
+        (static_cast<std::uint32_t>(inner[3]) << 24);
+
+    // New total = inner_len + 1 (for sender_role byte).
+    std::uint32_t total = inner_len + 1;
+
+    std::vector<std::uint8_t> buf;
+    buf.reserve(4 + 1 + inner_len);
+
+    // Length prefix.
+    buf.push_back(static_cast<std::uint8_t>(total));
+    buf.push_back(static_cast<std::uint8_t>(total >> 8));
+    buf.push_back(static_cast<std::uint8_t>(total >> 16));
+    buf.push_back(static_cast<std::uint8_t>(total >> 24));
+
+    // Sender role.
+    buf.push_back(static_cast<std::uint8_t>(msg.sender_role));
+
+    // Tag + payload (skip the inner's 4-byte length prefix).
+    buf.insert(buf.end(), inner.begin() + 4, inner.end());
+
+    return buf;
+}
+
+PeerMessage deserialize_peer(std::span<const std::uint8_t> buf) {
+    if (buf.size() < 6) {
+        throw Error(ErrorCode::ProtocolError, "peer message too short");
+    }
+
+    // Read total length (bytes 0..3).
+    std::uint32_t total =
+        static_cast<std::uint32_t>(buf[0]) |
+        (static_cast<std::uint32_t>(buf[1]) << 8) |
+        (static_cast<std::uint32_t>(buf[2]) << 16) |
+        (static_cast<std::uint32_t>(buf[3]) << 24);
+
+    auto role = static_cast<SenderRole>(buf[4]);
+    if (role != SenderRole::AsMaster && role != SenderRole::AsReplica) {
+        throw Error(ErrorCode::ProtocolError,
+                    "invalid sender role: " +
+                    std::to_string(static_cast<int>(buf[4])));
+    }
+
+    // Reconstruct inner Message buffer: [4B len][tag+payload].
+    std::uint32_t msg_len = total - 1;
+    std::vector<std::uint8_t> msg_buf;
+    msg_buf.reserve(4 + msg_len);
+    msg_buf.push_back(static_cast<std::uint8_t>(msg_len));
+    msg_buf.push_back(static_cast<std::uint8_t>(msg_len >> 8));
+    msg_buf.push_back(static_cast<std::uint8_t>(msg_len >> 16));
+    msg_buf.push_back(static_cast<std::uint8_t>(msg_len >> 24));
+    msg_buf.insert(msg_buf.end(), buf.begin() + 5, buf.end());
+
+    return PeerMessage{role, deserialize(msg_buf)};
+}
+
+} // namespace sqlpipe
+
+// ── peer.cpp ────────────────────────────────────────────────────
+
+namespace sqlpipe {
+
+struct Peer::Impl {
+    sqlite3*    db;
+    PeerConfig  config;
+    Peer::State state = Peer::State::Init;
+
+    std::set<std::string> my_tables;
+    std::set<std::string> their_tables;
+
+    std::unique_ptr<Master>  master;
+    std::unique_ptr<Replica> replica;
+
+    bool master_handshake_done = false;
+    bool replica_handshake_done = false;
+
+    bool is_server() const {
+        return config.approve_ownership != nullptr;
+    }
+
+    void create_master() {
+        MasterConfig mc;
+        mc.max_log_entries = config.max_log_entries;
+        mc.table_filter = my_tables;
+        mc.seq_key = "master_seq";
+        master = std::make_unique<Master>(db, mc);
+    }
+
+    void create_replica() {
+        ReplicaConfig rc;
+        rc.on_conflict = config.on_conflict;
+        rc.table_filter = their_tables;
+        rc.seq_key = "replica_seq";
+        replica = std::make_unique<Replica>(db, rc);
+    }
+
+    void check_live() {
+        if (master_handshake_done && replica_handshake_done) {
+            state = Peer::State::Live;
+            SPDLOG_INFO("peer is live: owning {} tables, replicating {} tables",
+                        my_tables.size(), their_tables.size());
+        }
+    }
+
+    std::set<std::string> complement_tables(
+            const std::set<std::string>& subset) {
+        auto all = detail::get_tracked_tables(db);
+        std::set<std::string> result;
+        for (auto& t : all) {
+            if (subset.find(t) == subset.end()) {
+                result.insert(std::move(t));
+            }
+        }
+        return result;
+    }
+
+    PeerHandleResult handle_as_replica(const PeerMessage& msg) {
+        PeerHandleResult result;
+
+        // First AsReplica HelloMsg triggers ownership negotiation.
+        if (auto* hello = std::get_if<HelloMsg>(&msg.payload)) {
+            if (state == Peer::State::Init ||
+                (state == Peer::State::Negotiating && !master)) {
+                // Ownership negotiation.
+                if (hello->owned_tables.empty()) {
+                    state = Peer::State::Error;
+                    result.messages.push_back(PeerMessage{
+                        SenderRole::AsMaster,
+                        ErrorMsg{ErrorCode::ProtocolError,
+                                 "peer hello must include owned_tables"}});
+                    return result;
+                }
+
+                if (config.approve_ownership) {
+                    if (!config.approve_ownership(hello->owned_tables)) {
+                        state = Peer::State::Error;
+                        result.messages.push_back(PeerMessage{
+                            SenderRole::AsMaster,
+                            ErrorMsg{ErrorCode::OwnershipRejected,
+                                     "ownership request rejected"}});
+                        return result;
+                    }
+                }
+
+                // Accept: their tables = what they claimed, ours = complement.
+                their_tables = hello->owned_tables;
+                my_tables = complement_tables(their_tables);
+                state = Peer::State::Syncing;
+
+                create_master();
+                create_replica();
+
+                // Patch hello's schema_version to match our Master's so
+                // the Master doesn't trigger a spurious resync.
+                HelloMsg patched = *hello;
+                patched.schema_version = master->schema_version();
+                patched.owned_tables = {};
+
+                auto master_resp = master->handle_message(patched);
+                for (auto& m : master_resp) {
+                    // Detect master handshake completion.
+                    if (std::holds_alternative<CatchupEndMsg>(m) ||
+                        std::holds_alternative<ResyncEndMsg>(m)) {
+                        master_handshake_done = true;
+                    }
+                    result.messages.push_back(
+                        PeerMessage{SenderRole::AsMaster, std::move(m)});
+                }
+
+                // Also initiate our Replica's hello (to sync their tables).
+                auto our_hello = replica->hello();
+                auto& h = std::get<HelloMsg>(our_hello);
+                h.owned_tables = my_tables;
+                result.messages.push_back(
+                    PeerMessage{SenderRole::AsReplica, std::move(our_hello)});
+
+                check_live();
+                return result;
+            }
+        }
+
+        // Subsequent AsReplica messages (AckMsg, etc.) → forward to Master.
+        if (!master) {
+            result.messages.push_back(PeerMessage{
+                SenderRole::AsMaster,
+                ErrorMsg{ErrorCode::InvalidState,
+                         "master not initialized"}});
+            return result;
+        }
+
+        auto master_resp = master->handle_message(msg.payload);
+        for (auto& m : master_resp) {
+            if (std::holds_alternative<CatchupEndMsg>(m) ||
+                std::holds_alternative<ResyncEndMsg>(m)) {
+                master_handshake_done = true;
+            }
+            result.messages.push_back(
+                PeerMessage{SenderRole::AsMaster, std::move(m)});
+        }
+
+        check_live();
+        return result;
+    }
+
+    PeerHandleResult handle_as_master(const PeerMessage& msg) {
+        PeerHandleResult result;
+
+        if (!replica) {
+            result.messages.push_back(PeerMessage{
+                SenderRole::AsReplica,
+                ErrorMsg{ErrorCode::InvalidState,
+                         "replica not initialized"}});
+            return result;
+        }
+
+        // If this is a HelloMsg, patch schema_version and transition state.
+        Message forwarded = msg.payload;
+        if (auto* hello = std::get_if<HelloMsg>(&forwarded)) {
+            if (state == Peer::State::Negotiating) {
+                state = Peer::State::Syncing;
+            }
+            hello->schema_version = replica->schema_version();
+            hello->owned_tables = {};
+        }
+
+        auto hr = replica->handle_message(forwarded);
+
+        for (auto& m : hr.messages) {
+            result.messages.push_back(
+                PeerMessage{SenderRole::AsReplica, std::move(m)});
+        }
+        result.changes = std::move(hr.changes);
+
+        // Check if replica just went live.
+        if (replica->state() == Replica::State::Live) {
+            replica_handshake_done = true;
+            check_live();
+        }
+
+        return result;
+    }
+};
+
+// ── Peer public API ─────────────────────────────────────────────────
+
+Peer::Peer(sqlite3* db, PeerConfig config)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->db = db;
+    impl_->config = std::move(config);
+    detail::ensure_meta_table(db);
+    SPDLOG_INFO("peer created ({})",
+                impl_->is_server() ? "server" : "client");
+}
+
+Peer::~Peer() = default;
+Peer::Peer(Peer&&) noexcept = default;
+Peer& Peer::operator=(Peer&&) noexcept = default;
+
+std::vector<PeerMessage> Peer::start() {
+    if (impl_->state != State::Init) {
+        throw Error(ErrorCode::InvalidState, "start() already called");
+    }
+    if (impl_->is_server()) {
+        throw Error(ErrorCode::InvalidState,
+                    "server peer must not call start()");
+    }
+
+    impl_->state = State::Negotiating;
+    impl_->my_tables = impl_->config.owned_tables;
+    impl_->their_tables = impl_->complement_tables(impl_->my_tables);
+
+    impl_->create_master();
+    impl_->create_replica();
+
+    auto hello = impl_->replica->hello();
+    auto& h = std::get<HelloMsg>(hello);
+    h.owned_tables = impl_->my_tables;
+
+    return {PeerMessage{SenderRole::AsReplica, std::move(hello)}};
+}
+
+std::vector<PeerMessage> Peer::flush() {
+    if (!impl_->master) return {};
+    if (impl_->state != State::Live && impl_->state != State::Syncing) return {};
+
+    auto msgs = impl_->master->flush();
+    std::vector<PeerMessage> result;
+    result.reserve(msgs.size());
+    for (auto& m : msgs) {
+        result.push_back(PeerMessage{SenderRole::AsMaster, std::move(m)});
+    }
+    return result;
+}
+
+PeerHandleResult Peer::handle_message(const PeerMessage& msg) {
+    if (msg.sender_role == SenderRole::AsReplica) {
+        return impl_->handle_as_replica(msg);
+    } else {
+        return impl_->handle_as_master(msg);
+    }
+}
+
+Peer::State Peer::state() const { return impl_->state; }
+
+const std::set<std::string>& Peer::owned_tables() const {
+    return impl_->my_tables;
+}
+
+const std::set<std::string>& Peer::remote_tables() const {
+    return impl_->their_tables;
+}
 
 } // namespace sqlpipe
