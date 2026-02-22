@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install mk
+        run: |
+          MK_VERSION="0.5.0"
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   ASSET="mk-${MK_VERSION}-linux-amd64.tar.gz" ;;
+            Linux-ARM64) ASSET="mk-${MK_VERSION}-linux-arm64.tar.gz" ;;
+            macOS-ARM64) ASSET="mk-${MK_VERSION}-darwin-arm64.tar.gz" ;;
+            *) echo "Unsupported: ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          curl -fsSL "https://github.com/marcelocantos/mk/releases/download/v${MK_VERSION}/${ASSET}" \
+            | tar xz -C /usr/local/bin mk
+
+      - name: Build and test
+        run: mk test
