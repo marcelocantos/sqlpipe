@@ -7,6 +7,7 @@
 #include <cstring>
 #include <map>
 #include <spdlog/spdlog.h>
+#include <lz4.h>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -257,7 +258,35 @@ void put_string(std::vector<std::uint8_t>& buf, const std::string& s) {
 }
 
 void put_changeset(std::vector<std::uint8_t>& buf, const Changeset& cs) {
-    put_bytes(buf, cs.data(), static_cast<std::uint32_t>(cs.size()));
+    constexpr std::size_t kCompressionThreshold = 64;
+    if (cs.size() < kCompressionThreshold) {
+        // Uncompressed: [u32 total] [0x00] [raw_data]
+        put_u32(buf, static_cast<std::uint32_t>(cs.size() + 1));
+        put_u8(buf, 0x00);
+        buf.insert(buf.end(), cs.begin(), cs.end());
+    } else {
+        int src_size = static_cast<int>(cs.size());
+        int max_dst = LZ4_compressBound(src_size);
+        std::vector<std::uint8_t> tmp(max_dst);
+        int compressed_size = LZ4_compress_default(
+            reinterpret_cast<const char*>(cs.data()),
+            reinterpret_cast<char*>(tmp.data()),
+            src_size, max_dst);
+        if (compressed_size > 0 &&
+            compressed_size < static_cast<int>(cs.size())) {
+            // LZ4: [u32 total] [0x01] [u32 original_len] [compressed_data]
+            put_u32(buf, static_cast<std::uint32_t>(1 + 4 + compressed_size));
+            put_u8(buf, 0x01);
+            put_u32(buf, static_cast<std::uint32_t>(cs.size()));
+            buf.insert(buf.end(), tmp.begin(),
+                       tmp.begin() + compressed_size);
+        } else {
+            // Fallback: uncompressed
+            put_u32(buf, static_cast<std::uint32_t>(cs.size() + 1));
+            put_u8(buf, 0x00);
+            buf.insert(buf.end(), cs.begin(), cs.end());
+        }
+    }
 }
 
 // ── Reader for deserialization ──────────────────────────────────────
@@ -310,10 +339,36 @@ public:
 
     Changeset read_changeset() {
         auto len = read_u32();
+        if (len == 0) return {};
         check(len);
-        Changeset cs(data_ + pos_, data_ + pos_ + len);
-        pos_ += len;
-        return cs;
+        auto type = read_u8();
+        auto payload_len = len - 1;
+        if (type == 0x00) {
+            // Uncompressed
+            Changeset cs(data_ + pos_, data_ + pos_ + payload_len);
+            pos_ += payload_len;
+            return cs;
+        } else if (type == 0x01) {
+            // LZ4
+            auto original_len = read_u32();
+            auto compressed_len = payload_len - 4;
+            check(compressed_len);
+            Changeset cs(original_len);
+            int result = LZ4_decompress_safe(
+                reinterpret_cast<const char*>(data_ + pos_),
+                reinterpret_cast<char*>(cs.data()),
+                static_cast<int>(compressed_len),
+                static_cast<int>(original_len));
+            if (result < 0) {
+                throw Error(ErrorCode::ProtocolError,
+                            "LZ4 decompression failed");
+            }
+            pos_ += compressed_len;
+            return cs;
+        } else {
+            throw Error(ErrorCode::ProtocolError,
+                        "unknown changeset compression type");
+        }
     }
 
     bool at_end() const { return pos_ >= size_; }

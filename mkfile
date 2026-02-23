@@ -15,7 +15,7 @@ test_srcs = $[wildcard tests/*.cpp]
 test_objs = $[patsubst %.cpp,build/%.o,$test_srcs]
 
 # ── Default target ───────────────────────────────────────────────────
-build/libsqlpipe.a: build/sqlite3.o build/sqlpipe.o
+build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlpipe.o
     $ar rcs $target $inputs
 
 # ── Tasks ────────────────────────────────────────────────────────────
@@ -38,6 +38,9 @@ build/loopback: build/examples/loopback.o build/libsqlpipe.a
 # ── Compilation rules ────────────────────────────────────────────────
 build/sqlite3.o: $vendor/src/sqlite3.c
     $cc $cflags -c $input -o $target
+
+build/lz4.o: $vendor/src/lz4.c
+    $cc $cflags -I$vendor/include -c $input -o $target
 
 build/sqlpipe.o: sqlpipe.cpp
     $cxx $cxxflags $incflags -c $input -o $target

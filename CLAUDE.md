@@ -6,7 +6,7 @@ Streaming replication protocol for SQLite. Two-file library: `sqlpipe.h`
 ## Build
 
 ```sh
-mk test     # build and run all tests (53 cases)
+mk test     # build and run all tests (55 cases)
 mk example  # build and run examples/loopback.cpp
 mk clean    # remove build/
 ```
@@ -20,6 +20,7 @@ SQLite must be compiled with `-DSQLITE_ENABLE_SESSION
 ## Dependencies
 
 - **SQLite3** — vendored in `vendor/src/sqlite3.c` + `vendor/include/sqlite3.h`
+- **LZ4** — vendored in `vendor/src/lz4.c` + `vendor/include/lz4.h` (changeset compression)
 - **spdlog** — git submodule at `vendor/github.com/gabime/spdlog` (header-only)
 - **doctest** — vendored in `vendor/include/doctest.h` (test only)
 
@@ -81,7 +82,9 @@ Two sync modes:
 ### Wire format
 
 `[4-byte LE length][1-byte tag][payload...]` — see `MessageTag` enum and
-`serialize`/`deserialize` in `sqlpipe.cpp`.
+`serialize`/`deserialize` in `sqlpipe.cpp`. Changeset blobs within messages
+use a compression framing: `[u32 len][u8 type][data...]` where type `0x00` =
+uncompressed, `0x01` = LZ4. Blobs < 64 bytes are stored uncompressed.
 
 ### Diff sync protocol
 
@@ -117,10 +120,10 @@ mkfile              Build system (mk)
 
 ## Tests
 
-54 test cases across 7 files (all use doctest):
+55 test cases across 7 files (all use doctest):
 
 - `test_protocol.cpp` — Serialization round-trips for all message types
-  including PeerMessage and new diff protocol messages
+  including PeerMessage, diff protocol messages, and LZ4 compression paths
 - `test_master.cpp` — Master state, flush behaviour, handshake state machine
 - `test_replica.cpp` — Replica state transitions, subscribe/unsubscribe
 - `test_integration.cpp` — End-to-end: live streaming, diff sync, multi-table,

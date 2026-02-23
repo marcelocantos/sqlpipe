@@ -25,6 +25,22 @@ TEST_CASE("ChangesetMsg round-trip") {
     CHECK(m.data == data);
 }
 
+TEST_CASE("ChangesetMsg round-trip (large, LZ4 path)") {
+    // Build a changeset > 64 bytes with repetitive data that compresses well.
+    Changeset data(256);
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] = static_cast<std::uint8_t>(i % 7);
+    ChangesetMsg orig{99, data};
+    auto buf = serialize(Message{orig});
+    auto msg = deserialize(buf);
+    auto& m = std::get<ChangesetMsg>(msg);
+    CHECK(m.seq == 99);
+    CHECK(m.data == data);
+    // The serialized form should be smaller than 4 (len prefix) + 1 (tag) +
+    // 8 (seq) + 4 (blob len) + 1 (type) + 256 (raw) = 274 bytes.
+    CHECK(buf.size() < 274);
+}
+
 TEST_CASE("AckMsg round-trip") {
     AckMsg orig{55};
     auto buf = serialize(Message{orig});

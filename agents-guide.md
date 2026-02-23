@@ -150,7 +150,9 @@ for (auto& m : peer_msgs) {
 - `PeerMessage` — `.sender_role` (`AsMaster`/`AsReplica`), `.payload` (Message)
 - `PeerHandleResult` — `.messages` (PeerMessages), `.changes` (row events)
 - `serialize(msg)` / `deserialize(buf)` — wire format:
-  `[4B LE length][1B tag][payload]`
+  `[4B LE length][1B tag][payload]`. Changeset blobs within payloads use
+  compression framing: `[u32 len][u8 type][data]` where type `0x00` =
+  uncompressed, `0x01` = LZ4. Blobs < 64 bytes are stored uncompressed.
 - `serialize(PeerMessage)` / `deserialize_peer(buf)` — wire format:
   `[4B LE length][1B role][1B tag][payload]`
 

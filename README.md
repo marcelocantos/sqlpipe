@@ -26,6 +26,8 @@ memory, etc.).
   result sets automatically when incoming changes affect relevant tables
 - **Per-row change events** (insert/update/delete) on the receiving side
 - **Conflict callbacks** for custom resolution logic
+- **LZ4 changeset compression** — changeset blobs are automatically compressed
+  with LZ4 for reduced bandwidth (transparent, with uncompressed fallback)
 - **Schema fingerprinting** to detect schema mismatches
 - **Single header + source** (`sqlpipe.h` / `sqlpipe.cpp`) for easy integration
 
@@ -79,7 +81,7 @@ example including the handshake and change event handling.
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-mk test     # build and run tests (54 test cases)
+mk test     # build and run tests (55 test cases)
 mk example  # build and run the loopback demo
 ```
 
@@ -263,5 +265,6 @@ Apache 2.0. See [LICENSE](LICENSE) for details.
 
 Third-party dependencies:
 - **SQLite** - public domain
+- **LZ4** - BSD 2-Clause
 - **spdlog** - MIT
 - **doctest** - MIT

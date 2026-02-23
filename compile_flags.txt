@@ -1,0 +1,9 @@
+-std=c++20
+-Wall
+-Wextra
+-Wpedantic
+-DSQLITE_ENABLE_SESSION
+-DSQLITE_ENABLE_PREUPDATE_HOOK
+-I.
+-Ivendor/include
+-Ivendor/github.com/gabime/spdlog/include

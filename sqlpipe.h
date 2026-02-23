@@ -117,7 +117,7 @@ private:
 // ── protocol.h ──────────────────────────────────────────────────
 namespace sqlpipe {
 
-inline constexpr std::uint32_t kProtocolVersion = 2;
+inline constexpr std::uint32_t kProtocolVersion = 3;
 
 // ── Message types ───────────────────────────────────────────────────
 
