@@ -81,7 +81,7 @@ example including the handshake and change event handling.
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-mk test     # build and run tests (55 test cases)
+mk test     # build and run tests (57 test cases)
 mk example  # build and run the loopback demo
 ```
 
@@ -156,6 +156,7 @@ public:
     HandleResult handle_message(const Message& msg);
     QueryResult subscribe(const std::string& sql);  // register a query
     void unsubscribe(SubscriptionId id);             // remove a subscription
+    void reset();                                    // return to Init; preserves subscriptions
     Seq current_seq() const;
     SchemaVersion schema_version() const;
     State state() const;  // Init, Handshake, DiffBuckets, DiffRows, Live, Error
@@ -185,6 +186,7 @@ public:
     State state() const;  // Init, Negotiating, Diffing, Live, Error
     const std::set<std::string>& owned_tables() const;
     const std::set<std::string>& remote_tables() const;
+    void reset();  // return to Init for reconnection; preserves table ownership
 };
 ```
 

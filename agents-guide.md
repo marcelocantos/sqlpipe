@@ -51,6 +51,7 @@ auto qr = replica.subscribe("SELECT * FROM t1 ORDER BY id");
 // qr.id, qr.columns, qr.rows — current result
 // After handle_message, check r.subscriptions for updated results
 replica.unsubscribe(qr.id);
+replica.reset();              // return to Init; subscriptions preserved
 ```
 
 `ReplicaConfig`:
@@ -74,6 +75,7 @@ auto fmsgs = client.flush();             // after writing owned tables
 client.state();    // Init → Negotiating → Diffing → Live (or Error)
 client.owned_tables();                   // tables we master
 client.remote_tables();                  // tables we replicate
+client.reset();                          // return to Init for reconnect
 ```
 
 `PeerConfig`:

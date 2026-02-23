@@ -345,6 +345,10 @@ public:
     /// Remove a subscription.
     void unsubscribe(SubscriptionId id);
 
+    /// Reset to Init state for reconnection. Subscriptions are preserved;
+    /// they will re-evaluate after the next handshake applies changes.
+    void reset();
+
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 
@@ -434,6 +438,10 @@ public:
 
     /// Process an incoming PeerMessage from the remote peer.
     PeerHandleResult handle_message(const PeerMessage& msg);
+
+    /// Reset to Init state for reconnection. Call start() again to
+    /// re-handshake. Table ownership is preserved from the previous session.
+    void reset();
 
     /// Peer lifecycle state.
     enum class State : std::uint8_t {

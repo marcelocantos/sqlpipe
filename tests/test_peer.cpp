@@ -409,3 +409,60 @@ TEST_CASE("peer: diff sync after reconnect") {
         CHECK(client_db.query_val("SELECT val FROM t2 WHERE id=2") == "c");
     }
 }
+
+TEST_CASE("peer: reset and reconnect") {
+    DB client_db, server_db;
+    const char* schema =
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);"
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)";
+    client_db.exec(schema);
+    server_db.exec(schema);
+
+    PeerConfig client_cfg;
+    client_cfg.owned_tables = {"t1"};
+    Peer client(client_db.db, client_cfg);
+
+    PeerConfig server_cfg;
+    server_cfg.approve_ownership = [](const std::set<std::string>&) {
+        return true;
+    };
+    Peer server(server_db.db, server_cfg);
+
+    // First session.
+    auto initial = client.start();
+    exchange(client, server, initial);
+    CHECK(client.state() == Peer::State::Live);
+
+    client_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    auto resp = deliver(client.flush(), server);
+    deliver(resp.messages, client);
+
+    // Simulate disconnect: reset both peers.
+    client.reset();
+    server.reset();
+    CHECK(client.state() == Peer::State::Init);
+    CHECK(server.state() == Peer::State::Init);
+
+    // Server adds data while "disconnected" (via raw Master).
+    {
+        MasterConfig mc;
+        mc.table_filter = std::set<std::string>{"t2"};
+        mc.seq_key = "master_seq";
+        Master m(server_db.db, mc);
+        server_db.exec("INSERT INTO t2 VALUES (1, 'b')");
+        m.flush();
+    }
+
+    // Reconnect via reset peers.
+    initial = client.start();
+    exchange(client, server, initial);
+    CHECK(client.state() == Peer::State::Live);
+    CHECK(server.state() == Peer::State::Live);
+
+    // Client should have the new t2 row via diff sync.
+    CHECK(client_db.count("t2") == 1);
+    CHECK(client_db.query_val("SELECT val FROM t2 WHERE id=1") == "b");
+
+    // Server should still have the t1 row.
+    CHECK(server_db.count("t1") == 1);
+}

@@ -359,3 +359,44 @@ TEST_CASE("subscription: suppressed when result unchanged") {
     REQUIRE(result.subscriptions.size() == 1);
     CHECK(std::get<std::string>(result.subscriptions[0].rows[0][0]) == "goodbye");
 }
+
+TEST_CASE("integration: replica reset preserves subscriptions") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+
+    handshake(master, replica);
+    CHECK(replica.state() == Replica::State::Live);
+
+    // Subscribe and deliver a row.
+    auto sub = replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
+    CHECK(sub.rows.empty());
+
+    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    auto result = deliver(master.flush(), replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].id == sub.id);
+
+    // Simulate disconnect: reset replica and re-handshake.
+    replica.reset();
+    CHECK(replica.state() == Replica::State::Init);
+
+    // Master adds a row while "disconnected".
+    master_db.exec("INSERT INTO t1 VALUES (2, 'world')");
+    master.flush();
+
+    // Re-handshake — diff sync discovers the new row.
+    handshake(master, replica);
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 2);
+
+    // Subscription survived the reset — verify by triggering a new change.
+    master_db.exec("INSERT INTO t1 VALUES (3, 'again')");
+    result = deliver(master.flush(), replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].id == sub.id);
+    CHECK(result.subscriptions[0].rows.size() == 3);
+}

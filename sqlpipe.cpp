@@ -2007,6 +2007,12 @@ void Replica::unsubscribe(SubscriptionId id) {
     }
 }
 
+void Replica::reset() {
+    impl_->state = State::Init;
+    impl_->seq = detail::read_seq(impl_->db, impl_->config.seq_key);
+    SPDLOG_INFO("replica reset to Init at seq={}", impl_->seq);
+}
+
 Seq Replica::current_seq() const { return impl_->seq; }
 
 SchemaVersion Replica::schema_version() const {
@@ -2326,6 +2332,15 @@ PeerHandleResult Peer::handle_message(const PeerMessage& msg) {
     } else {
         return impl_->handle_as_master(msg);
     }
+}
+
+void Peer::reset() {
+    impl_->state = State::Init;
+    impl_->master.reset();
+    impl_->replica.reset();
+    impl_->master_handshake_done = false;
+    impl_->replica_handshake_done = false;
+    SPDLOG_INFO("peer reset to Init");
 }
 
 Peer::State Peer::state() const { return impl_->state; }
