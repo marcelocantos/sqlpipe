@@ -45,19 +45,16 @@ struct DB {
     }
 };
 
-// Perform a full handshake (including diff exchange) between master and replica.
+// Full handshake including diff exchange.
 void handshake(Master& master, Replica& replica) {
-    // replica → HelloMsg → master
     auto hello = replica.hello();
     auto resp = master.handle_message(hello);
-    // master → HelloMsg → replica → BucketHashesMsg
     HandleResult r;
     for (const auto& m : resp) {
         auto result = replica.handle_message(m);
         r.messages.insert(r.messages.end(),
                           result.messages.begin(), result.messages.end());
     }
-    // replica → BucketHashesMsg → master → NeedBucketsMsg (possibly + DiffReadyMsg)
     for (const auto& m : r.messages) {
         auto result = master.handle_message(m);
         HandleResult r2;
@@ -66,7 +63,6 @@ void handshake(Master& master, Replica& replica) {
             r2.messages.insert(r2.messages.end(),
                                result2.messages.begin(), result2.messages.end());
         }
-        // If NeedBucketsMsg had ranges, replica sends RowHashesMsg → master → DiffReadyMsg.
         for (const auto& m3 : r2.messages) {
             auto result3 = master.handle_message(m3);
             for (const auto& m4 : result3) {
@@ -90,118 +86,135 @@ HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
 
 } // namespace
 
-TEST_CASE("integration: fresh start, live streaming") {
-    // Both databases start empty with the same schema.
+TEST_CASE("diff sync: schema mismatch produces ErrorMsg") {
     DB master_db, replica_db;
     master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
-    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    // Replica has a DIFFERENT schema (extra column) → fingerprint mismatch.
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT, extra TEXT)");
 
     Master master(master_db.db);
     Replica replica(replica_db.db);
 
-    handshake(master, replica);
-    CHECK(replica.state() == Replica::State::Live);
+    auto hello = replica.hello();
+    auto master_resp = master.handle_message(hello);
 
-    // Master inserts a row.
-    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
-    auto changeset_msgs = master.flush();
-    REQUIRE(changeset_msgs.size() == 1);
-
-    // Deliver to replica.
-    auto result = deliver(changeset_msgs, replica);
-    REQUIRE(result.messages.size() == 1);
-    CHECK(std::holds_alternative<AckMsg>(result.messages[0]));
-    CHECK(std::get<AckMsg>(result.messages[0]).seq == 1);
-
-    // Verify replica has the data.
-    CHECK(replica_db.count("t1") == 1);
-    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=1") == "hello");
-    CHECK(replica.current_seq() == 1);
-
-    // Verify change events.
-    REQUIRE(result.changes.size() == 1);
-    CHECK(result.changes[0].table == "t1");
-    CHECK(result.changes[0].op == OpType::Insert);
+    // Master should detect schema mismatch and send ErrorMsg.
+    REQUIRE(master_resp.size() == 1);
+    CHECK(std::holds_alternative<ErrorMsg>(master_resp[0]));
+    CHECK(std::get<ErrorMsg>(master_resp[0]).code == ErrorCode::SchemaMismatch);
 }
 
-TEST_CASE("integration: diff sync after disconnect") {
+TEST_CASE("diff sync: populated master vs empty replica") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    master.flush();
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    master.flush();
+
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 2);
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=1") == "a");
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=2") == "b");
+}
+
+TEST_CASE("diff sync: empty master vs populated replica (deletes all)") {
     DB master_db, replica_db;
     master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
     replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
 
     Master master(master_db.db);
 
-    // Master accumulates some changes while replica is disconnected.
+    // Replica has data that master doesn't — diff should delete on replica.
+    replica_db.exec("INSERT INTO t1 VALUES (1, 'stale')");
+    replica_db.exec("INSERT INTO t1 VALUES (2, 'old')");
+
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 0);
+}
+
+TEST_CASE("diff sync: both populated with overlap") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    // Master has rows 1, 2, 3.
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
-    master.flush();
     master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
-    master.flush();
     master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
+
+    Master master(master_db.db);
     master.flush();
 
-    CHECK(master.current_seq() == 3);
+    // Replica has rows 2 (stale), 3 (current), 4 (extra).
+    replica_db.exec("INSERT INTO t1 VALUES (2, 'OLD')");
+    replica_db.exec("INSERT INTO t1 VALUES (3, 'c')");
+    replica_db.exec("INSERT INTO t1 VALUES (4, 'extra')");
 
-    // Now replica connects — diff sync will discover the missing rows.
     Replica replica(replica_db.db);
     handshake(master, replica);
 
     CHECK(replica.state() == Replica::State::Live);
     CHECK(replica_db.count("t1") == 3);
-    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=2") == "b");
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=1") == "a");   // inserted
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=2") == "b");   // updated
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=3") == "c");   // unchanged
+    // Row 4 should be deleted.
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=4") == "");
 }
 
-TEST_CASE("integration: update and delete replication") {
+TEST_CASE("diff sync: already in sync") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    // Same data on both sides.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    replica_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    replica_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+
+    Master master(master_db.db);
+    master.flush();
+
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 2);
+}
+
+TEST_CASE("diff sync: then live streaming continues") {
     DB master_db, replica_db;
     master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
     replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
 
     Master master(master_db.db);
-    Replica replica(replica_db.db);
+    master_db.exec("INSERT INTO t1 VALUES (1, 'before')");
+    master.flush();
 
+    Replica replica(replica_db.db);
     handshake(master, replica);
 
-    // Insert.
-    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
-    deliver(master.flush(), replica);
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 1);
 
-    // Update.
-    master_db.exec("UPDATE t1 SET val='world' WHERE id=1");
-    auto result = deliver(master.flush(), replica);
+    // Now do live streaming.
+    master_db.exec("INSERT INTO t1 VALUES (2, 'after')");
+    auto msgs = master.flush();
+    auto result = deliver(msgs, replica);
 
-    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=1") == "world");
-    REQUIRE(result.changes.size() == 1);
-    CHECK(result.changes[0].op == OpType::Update);
-
-    // Delete.
-    master_db.exec("DELETE FROM t1 WHERE id=1");
-    result = deliver(master.flush(), replica);
-
-    CHECK(replica_db.count("t1") == 0);
-    REQUIRE(result.changes.size() == 1);
-    CHECK(result.changes[0].op == OpType::Delete);
-}
-
-TEST_CASE("integration: multiple tables") {
-    DB master_db, replica_db;
-    master_db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
-    master_db.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, item TEXT)");
-    replica_db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
-    replica_db.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, item TEXT)");
-
-    Master master(master_db.db);
-    Replica replica(replica_db.db);
-
-    handshake(master, replica);
-
-    // Insert into both tables in same transaction.
-    master_db.exec("BEGIN");
-    master_db.exec("INSERT INTO users VALUES (1, 'Alice')");
-    master_db.exec("INSERT INTO orders VALUES (1, 1, 'widget')");
-    master_db.exec("COMMIT");
-    deliver(master.flush(), replica);
-
-    CHECK(replica_db.count("users") == 1);
-    CHECK(replica_db.count("orders") == 1);
-    CHECK(replica_db.query_val("SELECT name FROM users WHERE id=1") == "Alice");
-    CHECK(replica_db.query_val("SELECT item FROM orders WHERE id=1") == "widget");
+    CHECK(replica_db.count("t1") == 2);
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=2") == "after");
+    REQUIRE(!result.changes.empty());
+    CHECK(result.changes[0].op == OpType::Insert);
 }

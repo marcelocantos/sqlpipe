@@ -83,47 +83,72 @@ TEST_CASE("master: flush after no-op change returns empty") {
     CHECK(msgs.empty());
 }
 
-TEST_CASE("master: handle_hello up-to-date") {
+TEST_CASE("master: handle_hello returns HelloMsg") {
     DB d;
     d.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
     Master m(d.db);
-    d.exec("INSERT INTO t1 VALUES (1, 'a')");
-    m.flush();
 
     auto sv = m.schema_version();
-    auto msgs = m.handle_message(HelloMsg{kProtocolVersion, 1, sv});
+    auto msgs = m.handle_message(HelloMsg{kProtocolVersion, sv, {}});
 
-    // Should get HelloMsg + CatchupEndMsg.
-    REQUIRE(msgs.size() == 2);
+    // Should get HelloMsg back.
+    REQUIRE(msgs.size() == 1);
     CHECK(std::holds_alternative<HelloMsg>(msgs[0]));
-    CHECK(std::holds_alternative<CatchupEndMsg>(msgs[1]));
+    auto& reply = std::get<HelloMsg>(msgs[0]);
+    CHECK(reply.schema_version == sv);
 }
 
-TEST_CASE("master: handle_hello with catchup") {
+TEST_CASE("master: schema mismatch returns ErrorMsg") {
     DB d;
     d.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
     Master m(d.db);
 
+    // Send a hello with wrong schema version.
+    auto msgs = m.handle_message(HelloMsg{kProtocolVersion, 99999, {}});
+
+    REQUIRE(msgs.size() == 1);
+    CHECK(std::holds_alternative<ErrorMsg>(msgs[0]));
+    CHECK(std::get<ErrorMsg>(msgs[0]).code == ErrorCode::SchemaMismatch);
+}
+
+TEST_CASE("master: bucket hashes all match produces empty DiffReady") {
+    DB d;
+    d.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
     d.exec("INSERT INTO t1 VALUES (1, 'a')");
-    m.flush();
     d.exec("INSERT INTO t1 VALUES (2, 'b')");
+    Master m(d.db);
     m.flush();
-    d.exec("INSERT INTO t1 VALUES (3, 'c')");
-    m.flush();
+    m.flush(); // get seq up
 
     auto sv = m.schema_version();
-    // Replica at seq=1, master at seq=3 → catchup 2..3.
-    auto msgs = m.handle_message(HelloMsg{kProtocolVersion, 1, sv});
 
-    // HelloMsg + CatchupBegin + 2 Changesets + CatchupEnd.
-    REQUIRE(msgs.size() == 5);
-    CHECK(std::holds_alternative<HelloMsg>(msgs[0]));
-    CHECK(std::holds_alternative<CatchupBeginMsg>(msgs[1]));
-    CHECK(std::get<CatchupBeginMsg>(msgs[1]).from_seq == 2);
-    CHECK(std::get<CatchupBeginMsg>(msgs[1]).to_seq == 3);
-    CHECK(std::holds_alternative<ChangesetMsg>(msgs[2]));
-    CHECK(std::get<ChangesetMsg>(msgs[2]).seq == 2);
-    CHECK(std::holds_alternative<ChangesetMsg>(msgs[3]));
-    CHECK(std::get<ChangesetMsg>(msgs[3]).seq == 3);
-    CHECK(std::holds_alternative<CatchupEndMsg>(msgs[4]));
+    // Handshake: send HelloMsg.
+    auto hello_resp = m.handle_message(HelloMsg{kProtocolVersion, sv, {}});
+    REQUIRE(!hello_resp.empty());
+    CHECK(std::holds_alternative<HelloMsg>(hello_resp[0]));
+
+    // Now simulate replica sending matching bucket hashes.
+    // We need to compute the same bucket hashes the master has.
+    // Easiest: create a "replica" DB with same data and compute buckets.
+    DB r;
+    r.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    r.exec("INSERT INTO t1 VALUES (1, 'a')");
+    r.exec("INSERT INTO t1 VALUES (2, 'b')");
+    Replica replica(r.db);
+    replica.hello();
+    // Deliver master's HelloMsg to get BucketHashesMsg.
+    auto replica_result = replica.handle_message(hello_resp[0]);
+    REQUIRE(!replica_result.messages.empty());
+    CHECK(std::holds_alternative<BucketHashesMsg>(replica_result.messages[0]));
+
+    // Send those bucket hashes to master.
+    auto bh_resp = m.handle_message(replica_result.messages[0]);
+    // Should get NeedBucketsMsg (empty) + DiffReadyMsg (empty).
+    REQUIRE(bh_resp.size() == 2);
+    CHECK(std::holds_alternative<NeedBucketsMsg>(bh_resp[0]));
+    CHECK(std::get<NeedBucketsMsg>(bh_resp[0]).ranges.empty());
+    CHECK(std::holds_alternative<DiffReadyMsg>(bh_resp[1]));
+    auto& dr = std::get<DiffReadyMsg>(bh_resp[1]);
+    CHECK(dr.patchset.empty());
+    CHECK(dr.deletes.empty());
 }

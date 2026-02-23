@@ -20,11 +20,11 @@ memory, etc.).
   set of tables, with server-authoritative ownership negotiation
 - **Incremental replication** via SQLite's session extension (compact binary
   changesets)
-- **Catchup on reconnect** from a configurable log of recent changesets
-- **Full resync** when the log doesn't cover the gap or schemas diverge
+- **Efficient diff sync** on reconnect — bucketed row hashes identify what
+  differs, then only the delta is transferred
 - **Per-row change events** (insert/update/delete) on the receiving side
 - **Conflict callbacks** for custom resolution logic
-- **Schema fingerprinting** to detect and handle schema mismatches
+- **Schema fingerprinting** to detect schema mismatches
 - **Single header + source** (`sqlpipe.h` / `sqlpipe.cpp`) for easy integration
 
 ## Requirements
@@ -34,7 +34,7 @@ memory, etc.).
   -DSQLITE_ENABLE_PREUPDATE_HOOK`
 
 All tables must have explicit `PRIMARY KEY`s (required by SQLite's session
-extension).
+extension). `WITHOUT ROWID` tables are not supported.
 
 ## Quick start
 
@@ -55,10 +55,8 @@ sqlite3_exec(replica_db,
 Master master(master_db);
 Replica replica(replica_db);
 
-// Handshake.
-auto hello = replica.hello();
-auto resp = master.handle_message(hello);
-for (auto& m : resp) replica.handle_message(m);
+// Handshake (exchange messages until replica reaches Live state).
+// See examples/loopback.cpp for the full multi-step handshake.
 
 // Make changes on the master, then flush.
 sqlite3_exec(master_db, "INSERT INTO t VALUES (1, 'hello')", 0, 0, 0);
@@ -72,14 +70,14 @@ for (auto& m : msgs) {
 ```
 
 See [`examples/loopback.cpp`](examples/loopback.cpp) for a complete working
-example including change event handling.
+example including the handshake and change event handling.
 
 ## Building
 
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-mk test     # build and run tests (43 test cases)
+mk test     # build and run tests (46 test cases)
 mk example  # build and run the loopback demo
 ```
 
@@ -89,37 +87,27 @@ API reference.
 
 ## Protocol overview
 
-**Catchup** (schema match, replica behind, log covers the gap):
+**Diff sync** (reconnect — discovers and transfers only what differs):
 
 ```
 Replica                              Master
    |                                    |
-   |-- HelloMsg(seq, sv) ------------->|
+   |-- HelloMsg(sv) ------------------>|
+   |<-- HelloMsg(sv) -----------------|  schema mismatch → ErrorMsg
    |                                    |
-   |<-- HelloMsg(seq, sv) -------------|
-   |<-- CatchupBeginMsg --------------|
-   |<-- ChangesetMsg ... -------------|
-   |    (AckMsg after each) --------->|
-   |<-- CatchupEndMsg ----------------|
+   |-- BucketHashesMsg -------------->|  per-table bucketed row hashes
+   |                                    |  compare bucket hashes
+   |<-- NeedBucketsMsg (ranges) ------|  (empty if all match)
+   |                                    |
+   |-- RowHashesMsg ----------------->|  row-level hashes for mismatched buckets
+   |                                    |  compute diff: insert/update/delete
+   |<-- DiffReadyMsg(seq, patchset,  |
+   |      deletes per table) ---------|
+   |-- AckMsg ----------------------->|
    |                                    |
    |         [LIVE STREAMING]           |
    |<-- ChangesetMsg -----------------|  (master.flush())
    |-- AckMsg ----------------------->|
-```
-
-**Resync** (schema mismatch or log doesn't cover the gap):
-
-```
-Replica                              Master
-   |                                    |
-   |-- HelloMsg(seq, sv) ------------->|
-   |                                    |
-   |<-- ResyncBeginMsg(sv, DDL) ------|
-   |<-- ResyncTableMsg ... -----------|  (one per table)
-   |<-- ResyncEndMsg(seq) ------------|
-   |-- AckMsg ----------------------->|
-   |                                    |
-   |         [LIVE STREAMING]           |
 ```
 
 ## API
@@ -128,7 +116,8 @@ Replica                              Master
 
 ```cpp
 struct MasterConfig {
-    std::size_t max_log_entries = 10000;  // 0 = unlimited
+    std::optional<std::set<std::string>> table_filter;
+    std::int64_t bucket_size = 1024;  // rows per diff bucket
 };
 
 class Master {
@@ -136,7 +125,6 @@ public:
     explicit Master(sqlite3* db, MasterConfig config = {});
     std::vector<Message> flush();
     std::vector<Message> handle_message(const Message& msg);
-    std::vector<Message> generate_resync();
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 };
@@ -147,6 +135,8 @@ public:
 ```cpp
 struct ReplicaConfig {
     ConflictCallback on_conflict = nullptr;  // default: Abort
+    std::optional<std::set<std::string>> table_filter;
+    std::int64_t bucket_size = 1024;
 };
 
 struct HandleResult {
@@ -161,7 +151,7 @@ public:
     HandleResult handle_message(const Message& msg);
     Seq current_seq() const;
     SchemaVersion schema_version() const;
-    State state() const;  // Init, Handshake, Catchup, Resync, Live, Error
+    State state() const;  // Init, Handshake, DiffBuckets, DiffRows, Live, Error
 };
 ```
 
@@ -172,7 +162,6 @@ struct PeerConfig {
     std::set<std::string> owned_tables;       // tables this side masters
     ApproveOwnershipCallback approve_ownership; // non-null = server side
     ConflictCallback on_conflict = nullptr;
-    std::size_t max_log_entries = 10000;
 };
 
 struct PeerHandleResult {
@@ -186,7 +175,7 @@ public:
     std::vector<PeerMessage> start();   // client initiates handshake
     std::vector<PeerMessage> flush();   // after writing owned tables
     PeerHandleResult handle_message(const PeerMessage& msg);
-    State state() const;  // Init, Negotiating, Syncing, Live, Error
+    State state() const;  // Init, Negotiating, Diffing, Live, Error
     const std::set<std::string>& owned_tables() const;
     const std::set<std::string>& remote_tables() const;
 };
@@ -215,26 +204,6 @@ auto msgs = client.start();
 //       server.flush() after writes to other tables.
 ```
 
-**Bidirectional handshake:**
-
-```
-Client                                  Server
-  |                                       |
-  | start() → PeerMsg{AsReplica,          |
-  |   HelloMsg{owned={"drafts"}}}         |
-  | ─────────────────────────────────────>|
-  |                                       | approve_ownership({"drafts"}) ✓
-  |                                       |
-  |<───────────────────────────────────── | PeerMsg{AsMaster, HelloMsg}
-  |<───────────────────────────────────── | PeerMsg{AsMaster, CatchupEndMsg}
-  |<───────────────────────────────────── | PeerMsg{AsReplica, HelloMsg}
-  |                                       |
-  | ─────────────────────────────────────>| PeerMsg{AsMaster, HelloMsg}
-  | ─────────────────────────────────────>| PeerMsg{AsMaster, CatchupEndMsg}
-  |                                       |
-  |         [BOTH LIVE]                   |
-```
-
 ## Error handling
 
 All operations may throw `sqlpipe::Error`, which carries an `ErrorCode` and a
@@ -249,9 +218,8 @@ try {
 }
 ```
 
-Error codes: `SqliteError`, `ProtocolError`, `SequenceGap`, `SchemaMismatch`,
-`InvalidState`, `ResyncRequired`, `OwnershipRejected`. See `sqlpipe.h` for
-details.
+Error codes: `SqliteError`, `ProtocolError`, `SchemaMismatch`, `InvalidState`,
+`OwnershipRejected`, `WithoutRowidTable`. See `sqlpipe.h` for details.
 
 The replica also returns `ErrorMsg` messages when it receives unexpected
 protocol messages — these should be forwarded to the master over the transport.

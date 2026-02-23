@@ -6,7 +6,7 @@ Streaming replication protocol for SQLite. Two-file library: `sqlpipe.h`
 ## Build
 
 ```sh
-mk test     # build and run all tests (43 cases)
+mk test     # build and run all tests (46 cases)
 mk example  # build and run examples/loopback.cpp
 mk clean    # remove build/
 ```
@@ -39,13 +39,12 @@ side owns a disjoint set of tables. A `PeerMessage` wraps `Message` with a
 in its HelloMsg; server validates via a callback. Wire format:
 `[4B LE length][1B sender_role][1B tag][payload]`.
 
-Three sync modes:
+Two sync modes:
 1. **Live streaming** — Master calls `flush()` after each write transaction;
    replica applies the resulting `ChangesetMsg`.
-2. **Catchup** — Replica reconnects behind; master replays missed changesets
-   from `_sqlpipe_log`.
-3. **Full resync** — Schema mismatch or log gap; master sends a complete
-   database snapshot via `ResyncBegin/ResyncTable/ResyncEnd`.
+2. **Diff sync** — On reconnect, master and replica exchange bucketed row hashes
+   to discover what differs, then the master sends only the delta as a
+   `DiffReadyMsg` (INSERT patchset + per-table delete rowid lists).
 
 ### Key internals
 
@@ -56,25 +55,53 @@ Three sync modes:
   tracking. `sqlite3changeset_apply` on the replica side.
 - **Pimpl**: `Master`, `Replica`, and `Peer` use `struct Impl` behind
   `std::unique_ptr` to keep the header dependency-free.
-- **Internal tables**: `_sqlpipe_meta` (key-value, stores seq) and
-  `_sqlpipe_log` (seq + changeset blob, master only). Excluded from tracking.
-  In Peer mode, Master and Replica use separate meta keys (`master_seq` /
-  `replica_seq`) to avoid collision.
+- **Internal tables**: `_sqlpipe_meta` (key-value, stores seq). Excluded from
+  tracking. In Peer mode, Master and Replica use separate meta keys
+  (`master_seq` / `replica_seq`) to avoid collision.
 - **Table filtering**: `MasterConfig::table_filter` and
   `ReplicaConfig::table_filter` (`std::optional<std::set<std::string>>`)
   restrict which tables are tracked. `nullopt` = all tables, empty set = none.
   `compute_schema_fingerprint`, `get_tracked_tables`, and `get_schema_sql`
   accept an optional `const std::set<std::string>* filter` parameter.
+- **Row hashing**: 64-bit FNV-1a over type-tagged column values. Used by the
+  diff protocol to compare row content without sending data.
+- **Bucket hashing**: Rows grouped into fixed-size buckets by rowid range
+  (default 1024). Bucket hash = XOR of `fnv1a(rowid || row_hash)` for each row.
+  Order-independent. Enables O(d + b) bandwidth for diff where d = differing
+  rows and b = total buckets.
+- **WITHOUT ROWID**: Not supported. Tables using `WITHOUT ROWID` are rejected
+  during table discovery with `ErrorCode::WithoutRowidTable`.
 
 ### Wire format
 
 `[4-byte LE length][1-byte tag][payload...]` — see `MessageTag` enum and
 `serialize`/`deserialize` in `sqlpipe.cpp`.
 
+### Diff sync protocol
+
+```
+Replica                              Master
+   |                                    |
+   |-- HelloMsg(sv) ------------------>|
+   |<-- HelloMsg(sv) -----------------|  schema mismatch → ErrorMsg
+   |                                    |
+   |-- BucketHashesMsg -------------->|
+   |                                    |  compare bucket hashes
+   |<-- NeedBucketsMsg (ranges) ------|  (empty if all match)
+   |                                    |
+   |-- RowHashesMsg ----------------->|  (skipped if NeedBuckets empty)
+   |                                    |
+   |<-- DiffReadyMsg(seq, patchset,  |
+   |      deletes per table) ---------|
+   |-- AckMsg ----------------------->|
+   |                                    |
+   |         [LIVE STREAMING]           |
+```
+
 ## File layout
 
 ```
-sqlpipe.h           Public header (types, messages, Master, Replica)
+sqlpipe.h           Public header (types, messages, Master, Replica, Peer)
 sqlpipe.cpp         Implementation (all internals)
 tests/              doctest test files
 examples/           loopback.cpp demo
@@ -84,16 +111,17 @@ mkfile              Build system (mk)
 
 ## Tests
 
-43 test cases across 6 files (all use doctest):
+46 test cases across 7 files (all use doctest):
 
 - `test_protocol.cpp` — Serialization round-trips for all message types
-  including PeerMessage
-- `test_master.cpp` — Master state, flush behaviour, hello/catchup handling
-- `test_replica.cpp` — Replica state transitions
-- `test_integration.cpp` — End-to-end: live streaming, catchup, multi-table
-- `test_resync.cpp` — Schema mismatch, log pruning, resync change events
+  including PeerMessage and new diff protocol messages
+- `test_master.cpp` — Master state, flush behaviour, handshake state machine
+- `test_replica.cpp` — Replica state transitions (DiffBuckets, DiffRows, Live)
+- `test_integration.cpp` — End-to-end: live streaming, diff sync, multi-table
+- `test_diff_sync.cpp` — Schema mismatch, populated/empty sync, overlap,
+  already-in-sync, diff-then-live
 - `test_peer.cpp` — Peer handshake, ownership negotiation, bidirectional
-  streaming, catchup after reconnect
+  streaming, diff sync after reconnect
 
 Add new tests to the file matching the component under test.
 

@@ -12,7 +12,7 @@ Add `sqlpipe.h` and `sqlpipe.cpp` to your project. Compile with:
 ```
 
 Requires SQLite 3 on the include path. All tables must have explicit `PRIMARY
-KEY`s.
+KEY`s. `WITHOUT ROWID` tables are not supported.
 
 ## API
 
@@ -27,11 +27,11 @@ auto msgs = master.flush();                  // after each write txn
 auto resp = master.handle_message(incoming); // process replica msgs
 master.current_seq();                        // current sequence number
 master.schema_version();                     // schema fingerprint
-master.generate_resync();                    // force full resync
 ```
 
-`MasterConfig{.max_log_entries = 10000}` — changesets kept for catchup (0 =
-unlimited).
+`MasterConfig`:
+- `table_filter` — `optional<set<string>>`. `nullopt` = all tables, empty = none.
+- `bucket_size` — rows per bucket for diff protocol (default 1024).
 
 ### Replica (receiving side)
 
@@ -39,16 +39,18 @@ unlimited).
 Replica replica(db, config);                   // does NOT own db
 auto hello = replica.hello();                  // send to master first
 HandleResult r = replica.handle_message(incoming);
-// r.messages — protocol responses (AckMsg, ErrorMsg) to send back
+// r.messages — protocol responses to send back
 // r.changes  — per-row ChangeEvents applied this call
 replica.current_seq();
 replica.schema_version();
-replica.state();  // Init → Handshake → Catchup/Resync → Live (or Error)
+replica.state();  // Init → Handshake → DiffBuckets → DiffRows → Live (or Error)
 ```
 
 `ReplicaConfig`:
 - `on_conflict` — `ConflictAction(ConflictType, const ChangeEvent&)`. Default:
   Abort.
+- `table_filter` — `optional<set<string>>`. `nullopt` = all tables, empty = none.
+- `bucket_size` — rows per bucket for diff protocol (default 1024).
 
 ### Peer (bidirectional)
 
@@ -62,7 +64,7 @@ PeerHandleResult r = client.handle_message(incoming);
 // r.messages — PeerMessages to send back
 // r.changes  — per-row ChangeEvents applied
 auto fmsgs = client.flush();             // after writing owned tables
-client.state();    // Init → Negotiating → Syncing → Live (or Error)
+client.state();    // Init → Negotiating → Diffing → Live (or Error)
 client.owned_tables();                   // tables we master
 client.remote_tables();                  // tables we replicate
 ```
@@ -72,7 +74,6 @@ client.remote_tables();                  // tables we replicate
 - `approve_ownership` — server-side callback; non-null marks this peer as
   server. `nullptr` = auto-approve.
 - `on_conflict` — forwarded to internal Replica
-- `max_log_entries` — forwarded to internal Master
 
 `PeerMessage` wraps `Message` with `SenderRole` (`AsMaster`/`AsReplica`) for
 routing. Wire format: `[4B LE length][1B sender_role][1B tag][payload]`.
@@ -85,13 +86,13 @@ doesn't claim. Client calls `start()`; server receives messages via
 ### Typical loop (unidirectional)
 
 ```cpp
-// 1. Handshake
-auto hello = replica.hello();          // → send to master
+// 1. Handshake (multi-step: hello → bucket hashes → row hashes → diff)
+auto hello = replica.hello();
 auto resp = master.handle_message(hello);
-for (auto& m : resp) {
-    auto result = replica.handle_message(m);
-    // result.messages → send back to master
-}
+// Exchange messages until replica.state() == Live:
+// master → HelloMsg → replica → BucketHashesMsg → master
+// master → NeedBucketsMsg → replica → RowHashesMsg → master
+// master → DiffReadyMsg → replica → AckMsg → master
 
 // 2. Live streaming
 sqlite3_exec(db, "INSERT ...", ...);
@@ -131,9 +132,8 @@ for (auto& m : peer_msgs) {
 ### Key types
 
 - `HandleResult` — `.messages` (protocol responses), `.changes` (row events)
-- `Message` — variant of: `HelloMsg`, `CatchupBeginMsg`, `ChangesetMsg`,
-  `CatchupEndMsg`, `ResyncBeginMsg`, `ResyncTableMsg`, `ResyncEndMsg`,
-  `AckMsg`, `ErrorMsg`
+- `Message` — variant of: `HelloMsg`, `ChangesetMsg`, `AckMsg`, `ErrorMsg`,
+  `BucketHashesMsg`, `NeedBucketsMsg`, `RowHashesMsg`, `DiffReadyMsg`
 - `ChangeEvent` — `.table`, `.op` (Insert/Update/Delete), `.pk_flags`,
   `.old_values`, `.new_values`
 - `Value` — variant: `monostate` (NULL), `int64_t`, `double`, `string`,
@@ -147,8 +147,8 @@ for (auto& m : peer_msgs) {
 
 ### Error codes
 
-`SqliteError`, `ProtocolError`, `SequenceGap`, `SchemaMismatch`,
-`InvalidState`, `ResyncRequired`, `OwnershipRejected`.
+`SqliteError`, `ProtocolError`, `SchemaMismatch`, `InvalidState`,
+`OwnershipRejected`, `WithoutRowidTable`.
 
 ## Gotchas
 
@@ -160,5 +160,7 @@ for (auto& m : peer_msgs) {
   forward to the master.
 - Replica may return `ErrorMsg` in `result.messages` — forward to the master.
 - Row-level changes are in `result.changes`, not a callback.
-- Catchup/resync happen automatically during handshake based on sequence gap
-  and schema fingerprint.
+- Diff sync happens automatically during handshake: bucket hash exchange
+  discovers differences, then only the delta is transferred.
+- Schema mismatch is an error (not auto-resolved). Migrate schemas before
+  connecting.

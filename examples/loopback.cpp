@@ -24,6 +24,33 @@ static HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) 
     return result;
 }
 
+// Perform the multi-step handshake (hello → bucket hashes → row hashes → diff).
+static void handshake(Master& master, Replica& replica) {
+    auto hello = replica.hello();
+    auto resp = master.handle_message(hello);
+    HandleResult r;
+    for (const auto& m : resp) {
+        auto result = replica.handle_message(m);
+        r.messages.insert(r.messages.end(),
+                          result.messages.begin(), result.messages.end());
+    }
+    for (const auto& m : r.messages) {
+        auto result = master.handle_message(m);
+        HandleResult r2;
+        for (const auto& m2 : result) {
+            auto result2 = replica.handle_message(m2);
+            r2.messages.insert(r2.messages.end(),
+                               result2.messages.begin(), result2.messages.end());
+        }
+        for (const auto& m3 : r2.messages) {
+            auto result3 = master.handle_message(m3);
+            for (const auto& m4 : result3) {
+                replica.handle_message(m4);
+            }
+        }
+    }
+}
+
 static void print_events(const std::vector<ChangeEvent>& changes) {
     for (const auto& e : changes) {
         const char* op_str = "?";
@@ -54,11 +81,9 @@ int main() {
     Master master(master_db);
     Replica replica(replica_db);
 
-    // 1. Handshake.
+    // 1. Handshake (includes diff sync).
     std::printf("=== Handshake ===\n");
-    auto hello = replica.hello();
-    auto master_resp = master.handle_message(hello);
-    deliver(master_resp, replica);
+    handshake(master, replica);
     std::printf("Replica state: Live=%d, seq=%lld\n\n",
                 replica.state() == Replica::State::Live,
                 static_cast<long long>(replica.current_seq()));

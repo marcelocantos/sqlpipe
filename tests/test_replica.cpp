@@ -39,20 +39,30 @@ TEST_CASE("replica: hello produces HelloMsg") {
     auto msg = r.hello();
     auto& h = std::get<HelloMsg>(msg);
     CHECK(h.protocol_version == kProtocolVersion);
-    CHECK(h.seq == 0);
     CHECK(r.state() == Replica::State::Handshake);
 }
 
-TEST_CASE("replica: transitions to live after catchup end") {
+TEST_CASE("replica: transitions through diff states to live") {
     DB d;
     d.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
     Replica r(d.db);
     r.hello();
 
     // Master says hello back.
-    r.handle_message(HelloMsg{kProtocolVersion, 0, r.schema_version()});
-    // Catchup end (nothing to catch up).
-    r.handle_message(CatchupEndMsg{});
+    auto result = r.handle_message(HelloMsg{kProtocolVersion, r.schema_version(), {}});
+    CHECK(r.state() == Replica::State::DiffBuckets);
+    // Replica sends BucketHashesMsg.
+    REQUIRE(!result.messages.empty());
+    CHECK(std::holds_alternative<BucketHashesMsg>(result.messages[0]));
 
+    // Master says no buckets needed (empty NeedBucketsMsg).
+    result = r.handle_message(NeedBucketsMsg{});
+    CHECK(r.state() == Replica::State::DiffRows);
+
+    // Master sends empty DiffReadyMsg.
+    result = r.handle_message(DiffReadyMsg{0, {}, {}});
     CHECK(r.state() == Replica::State::Live);
+    // Should produce an AckMsg.
+    REQUIRE(!result.messages.empty());
+    CHECK(std::holds_alternative<AckMsg>(result.messages[0]));
 }

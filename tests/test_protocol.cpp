@@ -6,22 +6,13 @@
 using namespace sqlpipe;
 
 TEST_CASE("HelloMsg round-trip") {
-    HelloMsg orig{kProtocolVersion, 42, 3};
+    HelloMsg orig{kProtocolVersion, 3, {}};
     auto buf = serialize(Message{orig});
     auto msg = deserialize(buf);
     auto& m = std::get<HelloMsg>(msg);
     CHECK(m.protocol_version == kProtocolVersion);
-    CHECK(m.seq == 42);
     CHECK(m.schema_version == 3);
-}
-
-TEST_CASE("CatchupBeginMsg round-trip") {
-    CatchupBeginMsg orig{10, 20};
-    auto buf = serialize(Message{orig});
-    auto msg = deserialize(buf);
-    auto& m = std::get<CatchupBeginMsg>(msg);
-    CHECK(m.from_seq == 10);
-    CHECK(m.to_seq == 20);
+    CHECK(m.owned_tables.empty());
 }
 
 TEST_CASE("ChangesetMsg round-trip") {
@@ -34,39 +25,6 @@ TEST_CASE("ChangesetMsg round-trip") {
     CHECK(m.data == data);
 }
 
-TEST_CASE("CatchupEndMsg round-trip") {
-    auto buf = serialize(Message{CatchupEndMsg{}});
-    auto msg = deserialize(buf);
-    CHECK(std::holds_alternative<CatchupEndMsg>(msg));
-}
-
-TEST_CASE("ResyncBeginMsg round-trip") {
-    ResyncBeginMsg orig{5, "CREATE TABLE foo (id INTEGER PRIMARY KEY)"};
-    auto buf = serialize(Message{orig});
-    auto msg = deserialize(buf);
-    auto& m = std::get<ResyncBeginMsg>(msg);
-    CHECK(m.schema_version == 5);
-    CHECK(m.schema_sql == "CREATE TABLE foo (id INTEGER PRIMARY KEY)");
-}
-
-TEST_CASE("ResyncTableMsg round-trip") {
-    Changeset data = {0xAA, 0xBB};
-    ResyncTableMsg orig{"users", data};
-    auto buf = serialize(Message{orig});
-    auto msg = deserialize(buf);
-    auto& m = std::get<ResyncTableMsg>(msg);
-    CHECK(m.table_name == "users");
-    CHECK(m.data == data);
-}
-
-TEST_CASE("ResyncEndMsg round-trip") {
-    ResyncEndMsg orig{99};
-    auto buf = serialize(Message{orig});
-    auto msg = deserialize(buf);
-    auto& m = std::get<ResyncEndMsg>(msg);
-    CHECK(m.seq == 99);
-}
-
 TEST_CASE("AckMsg round-trip") {
     AckMsg orig{55};
     auto buf = serialize(Message{orig});
@@ -76,12 +34,100 @@ TEST_CASE("AckMsg round-trip") {
 }
 
 TEST_CASE("ErrorMsg round-trip") {
-    ErrorMsg orig{ErrorCode::SequenceGap, "gap detected"};
+    ErrorMsg orig{ErrorCode::SchemaMismatch, "schema differs"};
     auto buf = serialize(Message{orig});
     auto msg = deserialize(buf);
     auto& m = std::get<ErrorMsg>(msg);
-    CHECK(m.code == ErrorCode::SequenceGap);
-    CHECK(m.detail == "gap detected");
+    CHECK(m.code == ErrorCode::SchemaMismatch);
+    CHECK(m.detail == "schema differs");
+}
+
+TEST_CASE("BucketHashesMsg round-trip") {
+    BucketHashesMsg orig;
+    orig.buckets.push_back({"t1", 0, 1023, 0xABCDEF0123456789ULL, 100});
+    orig.buckets.push_back({"t1", 1024, 2047, 0x1122334455667788ULL, 50});
+
+    auto buf = serialize(Message{orig});
+    auto msg = deserialize(buf);
+    auto& m = std::get<BucketHashesMsg>(msg);
+    REQUIRE(m.buckets.size() == 2);
+    CHECK(m.buckets[0].table == "t1");
+    CHECK(m.buckets[0].bucket_lo == 0);
+    CHECK(m.buckets[0].bucket_hi == 1023);
+    CHECK(m.buckets[0].hash == 0xABCDEF0123456789ULL);
+    CHECK(m.buckets[0].row_count == 100);
+    CHECK(m.buckets[1].table == "t1");
+    CHECK(m.buckets[1].bucket_lo == 1024);
+}
+
+TEST_CASE("NeedBucketsMsg round-trip") {
+    NeedBucketsMsg orig;
+    orig.ranges.push_back({"users", 0, 1023});
+    orig.ranges.push_back({"orders", 1024, 2047});
+
+    auto buf = serialize(Message{orig});
+    auto msg = deserialize(buf);
+    auto& m = std::get<NeedBucketsMsg>(msg);
+    REQUIRE(m.ranges.size() == 2);
+    CHECK(m.ranges[0].table == "users");
+    CHECK(m.ranges[0].lo == 0);
+    CHECK(m.ranges[0].hi == 1023);
+    CHECK(m.ranges[1].table == "orders");
+}
+
+TEST_CASE("RowHashesMsg round-trip") {
+    RowHashesMsg orig;
+    RowHashesEntry entry;
+    entry.table = "t1";
+    entry.lo = 0;
+    entry.hi = 1023;
+    entry.runs.push_back({1, 3, {0xAA, 0xBB, 0xCC}});
+    entry.runs.push_back({10, 2, {0xDD, 0xEE}});
+    orig.entries.push_back(std::move(entry));
+
+    auto buf = serialize(Message{orig});
+    auto msg = deserialize(buf);
+    auto& m = std::get<RowHashesMsg>(msg);
+    REQUIRE(m.entries.size() == 1);
+    CHECK(m.entries[0].table == "t1");
+    CHECK(m.entries[0].lo == 0);
+    CHECK(m.entries[0].hi == 1023);
+    REQUIRE(m.entries[0].runs.size() == 2);
+    CHECK(m.entries[0].runs[0].start_rowid == 1);
+    CHECK(m.entries[0].runs[0].count == 3);
+    REQUIRE(m.entries[0].runs[0].hashes.size() == 3);
+    CHECK(m.entries[0].runs[0].hashes[0] == 0xAA);
+    CHECK(m.entries[0].runs[1].start_rowid == 10);
+    CHECK(m.entries[0].runs[1].count == 2);
+}
+
+TEST_CASE("DiffReadyMsg round-trip") {
+    DiffReadyMsg orig;
+    orig.seq = 42;
+    orig.patchset = {0x01, 0x02, 0x03};
+    orig.deletes.push_back({"t1", {1, 2, 3}});
+    orig.deletes.push_back({"t2", {10, 20}});
+
+    auto buf = serialize(Message{orig});
+    auto msg = deserialize(buf);
+    auto& m = std::get<DiffReadyMsg>(msg);
+    CHECK(m.seq == 42);
+    CHECK(m.patchset == Changeset{0x01, 0x02, 0x03});
+    REQUIRE(m.deletes.size() == 2);
+    CHECK(m.deletes[0].table == "t1");
+    CHECK(m.deletes[0].rowids == std::vector<std::int64_t>{1, 2, 3});
+    CHECK(m.deletes[1].table == "t2");
+    CHECK(m.deletes[1].rowids == std::vector<std::int64_t>{10, 20});
+}
+
+TEST_CASE("DiffReadyMsg empty round-trip") {
+    DiffReadyMsg orig{5, {}, {}};
+    auto buf = serialize(Message{orig});
+    auto msg = deserialize(buf);
+    auto& m = std::get<DiffReadyMsg>(msg);
+    CHECK(m.seq == 5);
+    CHECK(m.patchset.empty());
+    CHECK(m.deletes.empty());
 }
 
 TEST_CASE("deserialize rejects truncated buffer") {
@@ -92,7 +138,6 @@ TEST_CASE("deserialize rejects truncated buffer") {
 TEST_CASE("HelloMsg with owned_tables round-trip") {
     HelloMsg orig;
     orig.protocol_version = kProtocolVersion;
-    orig.seq = 10;
     orig.schema_version = 42;
     orig.owned_tables = {"drafts", "local_prefs", "settings"};
 
@@ -100,7 +145,6 @@ TEST_CASE("HelloMsg with owned_tables round-trip") {
     auto msg = deserialize(buf);
     auto& m = std::get<HelloMsg>(msg);
     CHECK(m.protocol_version == kProtocolVersion);
-    CHECK(m.seq == 10);
     CHECK(m.schema_version == 42);
     REQUIRE(m.owned_tables.size() == 3);
     CHECK(m.owned_tables.count("drafts") == 1);
@@ -108,18 +152,13 @@ TEST_CASE("HelloMsg with owned_tables round-trip") {
     CHECK(m.owned_tables.count("settings") == 1);
 }
 
-TEST_CASE("HelloMsg without owned_tables backward compat") {
-    // Serialize with empty owned_tables, verify identical to old format.
+TEST_CASE("HelloMsg without owned_tables") {
     HelloMsg orig;
     orig.protocol_version = kProtocolVersion;
-    orig.seq = 5;
     orig.schema_version = 7;
     // owned_tables is empty by default.
 
     auto buf = serialize(Message{orig});
-    // Old format: 4 len + 1 tag + 4 version + 8 seq + 4 sv = 21 bytes.
-    CHECK(buf.size() == 21);
-
     auto msg = deserialize(buf);
     auto& m = std::get<HelloMsg>(msg);
     CHECK(m.owned_tables.empty());

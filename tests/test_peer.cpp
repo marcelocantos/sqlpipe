@@ -353,7 +353,7 @@ TEST_CASE("peer: one side owns all tables") {
     CHECK(server_msgs.empty());
 }
 
-TEST_CASE("peer: catchup after reconnect") {
+TEST_CASE("peer: diff sync after reconnect") {
     DB client_db, server_db;
     const char* schema =
         "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);"
@@ -392,7 +392,7 @@ TEST_CASE("peer: catchup after reconnect") {
         m.flush();
     }
 
-    // Second connection: client should catch up.
+    // Second connection: diff sync discovers the missing data.
     {
         PeerConfig client_cfg;
         client_cfg.owned_tables = {"t1"};
