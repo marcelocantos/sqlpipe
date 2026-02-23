@@ -74,6 +74,16 @@ using ConflictCallback = std::function<ConflictAction(
 /// Default bucket size for the diff protocol (rows per bucket).
 inline constexpr std::int64_t kDefaultBucketSize = 1024;
 
+/// Opaque handle for a query subscription.
+using SubscriptionId = std::uint64_t;
+
+/// Full result set of a subscribed query.
+struct QueryResult {
+    SubscriptionId                  id;
+    std::vector<std::string>        columns;  ///< Column names.
+    std::vector<std::vector<Value>> rows;     ///< Result rows.
+};
+
 } // namespace sqlpipe
 
 // ── error.h ─────────────────────────────────────────────────────
@@ -302,8 +312,9 @@ struct ReplicaConfig {
 
 /// Return type for Replica::handle_message.
 struct HandleResult {
-    std::vector<Message>     messages;  ///< Protocol responses to send back.
-    std::vector<ChangeEvent> changes;   ///< Row-level changes applied this call.
+    std::vector<Message>      messages;       ///< Protocol responses to send back.
+    std::vector<ChangeEvent>  changes;        ///< Row-level changes applied this call.
+    std::vector<QueryResult>  subscriptions;  ///< Invalidated subscription results.
 };
 
 /// The receiving side of the replication protocol.
@@ -325,6 +336,14 @@ public:
 
     /// Process an incoming message from the master.
     HandleResult handle_message(const Message& msg);
+
+    /// Subscribe to a SQL query. Returns the current result immediately.
+    /// After each handle_message that changes a table the query reads from,
+    /// the updated result appears in HandleResult::subscriptions.
+    QueryResult subscribe(const std::string& sql);
+
+    /// Remove a subscription.
+    void unsubscribe(SubscriptionId id);
 
     Seq current_seq() const;
     SchemaVersion schema_version() const;

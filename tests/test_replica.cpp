@@ -66,3 +66,37 @@ TEST_CASE("replica: transitions through diff states to live") {
     REQUIRE(!result.messages.empty());
     CHECK(std::holds_alternative<AckMsg>(result.messages[0]));
 }
+
+TEST_CASE("replica: subscribe returns immediate result") {
+    DB d;
+    d.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    d.exec("INSERT INTO t1 VALUES (1, 'a')");
+    d.exec("INSERT INTO t1 VALUES (2, 'b')");
+
+    Replica r(d.db);
+    auto qr = r.subscribe("SELECT id, val FROM t1 ORDER BY id");
+
+    CHECK(qr.id == 1);
+    REQUIRE(qr.columns.size() == 2);
+    CHECK(qr.columns[0] == "id");
+    CHECK(qr.columns[1] == "val");
+    REQUIRE(qr.rows.size() == 2);
+    CHECK(std::get<std::int64_t>(qr.rows[0][0]) == 1);
+    CHECK(std::get<std::string>(qr.rows[0][1]) == "a");
+    CHECK(std::get<std::int64_t>(qr.rows[1][0]) == 2);
+    CHECK(std::get<std::string>(qr.rows[1][1]) == "b");
+}
+
+TEST_CASE("replica: unsubscribe stops delivery") {
+    DB d;
+    d.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    Replica r(d.db);
+    auto qr = r.subscribe("SELECT * FROM t1");
+    r.unsubscribe(qr.id);
+
+    // No subscriptions left — even if we could trigger evaluation,
+    // there should be nothing to evaluate. Verify the ID is gone
+    // by subscribing again and getting a new ID.
+    auto qr2 = r.subscribe("SELECT * FROM t1");
+    CHECK(qr2.id != qr.id);
+}

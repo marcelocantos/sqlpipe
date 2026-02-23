@@ -22,6 +22,8 @@ memory, etc.).
   changesets)
 - **Efficient diff sync** on reconnect — bucketed row hashes identify what
   differs, then only the delta is transferred
+- **Query subscriptions** — register SQL queries on the replica; receive updated
+  result sets automatically when incoming changes affect relevant tables
 - **Per-row change events** (insert/update/delete) on the receiving side
 - **Conflict callbacks** for custom resolution logic
 - **Schema fingerprinting** to detect schema mismatches
@@ -77,7 +79,7 @@ example including the handshake and change event handling.
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-mk test     # build and run tests (46 test cases)
+mk test     # build and run tests (54 test cases)
 mk example  # build and run the loopback demo
 ```
 
@@ -140,8 +142,9 @@ struct ReplicaConfig {
 };
 
 struct HandleResult {
-    std::vector<Message>     messages;  // protocol responses to send back
-    std::vector<ChangeEvent> changes;   // row-level changes applied this call
+    std::vector<Message>      messages;       // protocol responses to send back
+    std::vector<ChangeEvent>  changes;        // row-level changes applied this call
+    std::vector<QueryResult>  subscriptions;  // invalidated subscription results
 };
 
 class Replica {
@@ -149,6 +152,8 @@ public:
     explicit Replica(sqlite3* db, ReplicaConfig config = {});
     Message hello() const;
     HandleResult handle_message(const Message& msg);
+    QueryResult subscribe(const std::string& sql);  // register a query
+    void unsubscribe(SubscriptionId id);             // remove a subscription
     Seq current_seq() const;
     SchemaVersion schema_version() const;
     State state() const;  // Init, Handshake, DiffBuckets, DiffRows, Live, Error
@@ -203,6 +208,34 @@ auto msgs = client.start();
 // Then: client.flush() after writes to "drafts",
 //       server.flush() after writes to other tables.
 ```
+
+### Query subscriptions
+
+Register SQL queries on the replica to receive updated results whenever incoming
+changes affect a table the query reads from:
+
+```cpp
+// Subscribe to a query — returns the current result immediately.
+auto qr = replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
+// qr.id       — subscription handle
+// qr.columns  — {"id", "val"}
+// qr.rows     — current result set (vector of vector<Value>)
+
+// After applying a changeset that touches t1:
+auto result = replica.handle_message(changeset_msg);
+for (const auto& sub : result.subscriptions) {
+    // sub.id   — which subscription was invalidated
+    // sub.rows — the full updated result set
+}
+
+// Stop receiving updates.
+replica.unsubscribe(qr.id);
+```
+
+Table dependencies are discovered automatically via SQLite's authorizer API.
+Queries involving JOINs across multiple tables will fire when any of those
+tables change. Invalidation is table-level: any row change to a relevant table
+triggers re-evaluation of the full query.
 
 ## Error handling
 

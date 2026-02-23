@@ -6,7 +6,7 @@ Streaming replication protocol for SQLite. Two-file library: `sqlpipe.h`
 ## Build
 
 ```sh
-mk test     # build and run all tests (46 cases)
+mk test     # build and run all tests (53 cases)
 mk example  # build and run examples/loopback.cpp
 mk clean    # remove build/
 ```
@@ -71,6 +71,12 @@ Two sync modes:
   rows and b = total buckets.
 - **WITHOUT ROWID**: Not supported. Tables using `WITHOUT ROWID` are rejected
   during table discovery with `ErrorCode::WithoutRowidTable`.
+- **Query subscriptions**: Replica-side feature. `Replica::subscribe(sql)`
+  registers a query and returns the current result. After each
+  `handle_message` that applies changes to a table the query reads from, the
+  updated result appears in `HandleResult::subscriptions`. Table dependencies
+  discovered via `sqlite3_set_authorizer` during prepare. Invalidation is
+  table-level (any change to an overlapping table triggers re-evaluation).
 
 ### Wire format
 
@@ -111,13 +117,14 @@ mkfile              Build system (mk)
 
 ## Tests
 
-46 test cases across 7 files (all use doctest):
+54 test cases across 7 files (all use doctest):
 
 - `test_protocol.cpp` — Serialization round-trips for all message types
   including PeerMessage and new diff protocol messages
 - `test_master.cpp` — Master state, flush behaviour, handshake state machine
-- `test_replica.cpp` — Replica state transitions (DiffBuckets, DiffRows, Live)
-- `test_integration.cpp` — End-to-end: live streaming, diff sync, multi-table
+- `test_replica.cpp` — Replica state transitions, subscribe/unsubscribe
+- `test_integration.cpp` — End-to-end: live streaming, diff sync, multi-table,
+  query subscriptions (fires/no-fire/JOIN/unsubscribe)
 - `test_diff_sync.cpp` — Schema mismatch, populated/empty sync, overlap,
   already-in-sync, diff-then-live
 - `test_peer.cpp` — Peer handshake, ownership negotiation, bidirectional

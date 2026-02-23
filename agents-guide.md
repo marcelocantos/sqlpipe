@@ -39,11 +39,18 @@ master.schema_version();                     // schema fingerprint
 Replica replica(db, config);                   // does NOT own db
 auto hello = replica.hello();                  // send to master first
 HandleResult r = replica.handle_message(incoming);
-// r.messages — protocol responses to send back
-// r.changes  — per-row ChangeEvents applied this call
+// r.messages      — protocol responses to send back
+// r.changes       — per-row ChangeEvents applied this call
+// r.subscriptions — invalidated query subscription results
 replica.current_seq();
 replica.schema_version();
 replica.state();  // Init → Handshake → DiffBuckets → DiffRows → Live (or Error)
+
+// Query subscriptions (reactive queries)
+auto qr = replica.subscribe("SELECT * FROM t1 ORDER BY id");
+// qr.id, qr.columns, qr.rows — current result
+// After handle_message, check r.subscriptions for updated results
+replica.unsubscribe(qr.id);
 ```
 
 `ReplicaConfig`:
@@ -131,7 +138,9 @@ for (auto& m : peer_msgs) {
 
 ### Key types
 
-- `HandleResult` — `.messages` (protocol responses), `.changes` (row events)
+- `HandleResult` — `.messages` (protocol responses), `.changes` (row events),
+  `.subscriptions` (invalidated query results)
+- `QueryResult` — `.id` (SubscriptionId), `.columns`, `.rows`
 - `Message` — variant of: `HelloMsg`, `ChangesetMsg`, `AckMsg`, `ErrorMsg`,
   `BucketHashesMsg`, `NeedBucketsMsg`, `RowHashesMsg`, `DiffReadyMsg`
 - `ChangeEvent` — `.table`, `.op` (Insert/Update/Delete), `.pk_flags`,
@@ -160,6 +169,8 @@ for (auto& m : peer_msgs) {
   forward to the master.
 - Replica may return `ErrorMsg` in `result.messages` — forward to the master.
 - Row-level changes are in `result.changes`, not a callback.
+- Subscriptions use table-level invalidation: any change to a table a query
+  reads from triggers re-evaluation. JOIN queries fire on either table.
 - Diff sync happens automatically during handshake: bucket hash exchange
   discovers differences, then only the delta is transferred.
 - Schema mismatch is an error (not auto-resolved). Migrate schemas before

@@ -699,6 +699,44 @@ inline void fnv64_bytes(std::uint64_t& hash,
 }
 } // namespace
 
+/// Feed a Value into a running FNV-1a hash (type-tagged, same encoding as hash_row).
+inline void hash_value(std::uint64_t& hash, const Value& v) {
+    std::visit([&](const auto& val) {
+        using T = std::decay_t<decltype(val)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            fnv64_byte(hash, 0x00);
+        } else if constexpr (std::is_same_v<T, std::int64_t>) {
+            fnv64_byte(hash, 0x01);
+            auto u = static_cast<std::uint64_t>(val);
+            std::uint8_t bytes[8];
+            for (int j = 0; j < 8; ++j)
+                bytes[j] = static_cast<std::uint8_t>(u >> (j * 8));
+            fnv64_bytes(hash, bytes, 8);
+        } else if constexpr (std::is_same_v<T, double>) {
+            fnv64_byte(hash, 0x02);
+            std::uint8_t bytes[8];
+            std::memcpy(bytes, &val, 8);
+            fnv64_bytes(hash, bytes, 8);
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            fnv64_byte(hash, 0x03);
+            std::uint32_t ulen = static_cast<std::uint32_t>(val.size());
+            std::uint8_t lenbytes[4];
+            for (int j = 0; j < 4; ++j)
+                lenbytes[j] = static_cast<std::uint8_t>(ulen >> (j * 8));
+            fnv64_bytes(hash, lenbytes, 4);
+            fnv64_bytes(hash, val.data(), val.size());
+        } else if constexpr (std::is_same_v<T, std::vector<std::uint8_t>>) {
+            fnv64_byte(hash, 0x04);
+            std::uint32_t ulen = static_cast<std::uint32_t>(val.size());
+            std::uint8_t lenbytes[4];
+            for (int j = 0; j < 4; ++j)
+                lenbytes[j] = static_cast<std::uint8_t>(ulen >> (j * 8));
+            fnv64_bytes(hash, lenbytes, 4);
+            fnv64_bytes(hash, val.data(), val.size());
+        }
+    }, v);
+}
+
 std::uint64_t hash_row(sqlite3_stmt* stmt, int ncols) {
     std::uint64_t hash = kFnv64Offset;
 
@@ -1486,8 +1524,96 @@ struct Replica::Impl {
     Seq            seq = 0;
     Replica::State state = Replica::State::Init;
 
+    // Subscription state.
+    struct Subscription {
+        SubscriptionId               id;
+        std::string                  sql;
+        std::set<std::string>        tables;
+        detail::StmtGuard            stmt;     // cached prepared statement
+        std::vector<std::string>     columns;  // cached column names
+        std::uint64_t                result_hash = 0;  // hash of last delivered result
+    };
+    std::map<SubscriptionId, Subscription> subscriptions;
+    // Reverse index: table name → subscription IDs that depend on it.
+    std::unordered_map<std::string, std::set<SubscriptionId>> table_subs;
+    SubscriptionId next_sub_id = 1;
+
     const std::set<std::string>* filter() const {
         return config.table_filter ? &*config.table_filter : nullptr;
+    }
+
+    std::set<std::string> discover_tables(const std::string& sql) {
+        std::set<std::string> tables;
+        sqlite3_set_authorizer(db, [](void* ctx, int action,
+                const char* a1, const char*, const char*, const char*) -> int {
+            if (action == SQLITE_READ && a1) {
+                std::string name(a1);
+                if (name.compare(0, 9, "_sqlpipe_") != 0 &&
+                    name.compare(0, 7, "sqlite_") != 0) {
+                    static_cast<std::set<std::string>*>(ctx)->insert(name);
+                }
+            }
+            return SQLITE_OK;
+        }, &tables);
+
+        sqlite3_stmt* stmt = nullptr;
+        int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+        if (stmt) sqlite3_finalize(stmt);
+        sqlite3_set_authorizer(db, nullptr, nullptr);
+
+        if (rc != SQLITE_OK) {
+            throw Error(ErrorCode::SqliteError,
+                std::string("subscribe prepare: ") + sqlite3_errmsg(db));
+        }
+        return tables;
+    }
+
+    // Evaluate a subscription query. Returns the result and its hash.
+    std::pair<QueryResult, std::uint64_t> evaluate_query(Subscription& sub) {
+        QueryResult result;
+        result.id = sub.id;
+        result.columns = sub.columns;
+
+        std::uint64_t h = detail::kFnv64Offset;
+        sqlite3_reset(sub.stmt.get());
+        int ncols = static_cast<int>(sub.columns.size());
+        while (sqlite3_step(sub.stmt.get()) == SQLITE_ROW) {
+            detail::fnv64_byte(h, 0xFF);  // row separator
+            std::vector<Value> row;
+            row.reserve(static_cast<std::size_t>(ncols));
+            for (int i = 0; i < ncols; ++i) {
+                row.push_back(detail::to_value(
+                    sqlite3_column_value(sub.stmt.get(), i)));
+                detail::hash_value(h, row.back());
+            }
+            result.rows.push_back(std::move(row));
+        }
+        return {std::move(result), h};
+    }
+
+    std::vector<QueryResult> evaluate_invalidated(
+            const std::set<std::string>& affected) {
+        // Collect unique subscription IDs via reverse index.
+        std::set<SubscriptionId> ids;
+        for (const auto& table : affected) {
+            auto it = table_subs.find(table);
+            if (it != table_subs.end()) {
+                ids.insert(it->second.begin(), it->second.end());
+            }
+        }
+
+        std::vector<QueryResult> results;
+        for (auto id : ids) {
+            auto it = subscriptions.find(id);
+            if (it != subscriptions.end()) {
+                auto [result, hash] = evaluate_query(it->second);
+                if (hash != it->second.result_hash) {
+                    it->second.result_hash = hash;
+                    results.push_back(std::move(result));
+                }
+            }
+        }
+        return results;
     }
 
     void init() {
@@ -1547,12 +1673,12 @@ struct Replica::Impl {
         if (state != Replica::State::Handshake) {
             state = Replica::State::Error;
             return {{ErrorMsg{ErrorCode::InvalidState,
-                "received HelloMsg in unexpected state"}}, {}};
+                "received HelloMsg in unexpected state"}}, {}, {}};
         }
         if (m.protocol_version != kProtocolVersion) {
             state = Replica::State::Error;
             return {{ErrorMsg{ErrorCode::ProtocolError,
-                "unsupported protocol version"}}, {}};
+                "unsupported protocol version"}}, {}, {}};
         }
 
         // Compute bucket hashes and send to master.
@@ -1560,14 +1686,14 @@ struct Replica::Impl {
             db, filter(), config.bucket_size);
         state = Replica::State::DiffBuckets;
         SPDLOG_INFO("sending {} bucket hashes", buckets.size());
-        return {{BucketHashesMsg{std::move(buckets)}}, {}};
+        return {{BucketHashesMsg{std::move(buckets)}}, {}, {}};
     }
 
     HandleResult handle_need_buckets(const NeedBucketsMsg& m) {
         if (state != Replica::State::DiffBuckets) {
             state = Replica::State::Error;
             return {{ErrorMsg{ErrorCode::InvalidState,
-                "received NeedBucketsMsg in unexpected state"}}, {}};
+                "received NeedBucketsMsg in unexpected state"}}, {}, {}};
         }
 
         state = Replica::State::DiffRows;
@@ -1618,7 +1744,7 @@ struct Replica::Impl {
         }
 
         SPDLOG_INFO("sending row hashes for {} ranges", m.ranges.size());
-        return {{std::move(rh)}, {}};
+        return {{std::move(rh)}, {}, {}};
     }
 
     HandleResult handle_diff_ready(const DiffReadyMsg& m) {
@@ -1626,7 +1752,7 @@ struct Replica::Impl {
             state != Replica::State::DiffBuckets) {
             state = Replica::State::Error;
             return {{ErrorMsg{ErrorCode::InvalidState,
-                "received DiffReadyMsg in unexpected state"}}, {}};
+                "received DiffReadyMsg in unexpected state"}}, {}, {}};
         }
 
         std::vector<ChangeEvent> events;
@@ -1712,7 +1838,7 @@ struct Replica::Impl {
         state = Replica::State::Live;
         SPDLOG_INFO("diff applied, entering live at seq={}", seq);
 
-        return {{AckMsg{m.seq}}, std::move(events)};
+        return {{AckMsg{m.seq}}, std::move(events), {}};
     }
 };
 
@@ -1738,7 +1864,7 @@ Message Replica::hello() const {
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
-    return std::visit([&](const auto& m) -> HandleResult {
+    auto result = std::visit([&](const auto& m) -> HandleResult {
         using T = std::decay_t<decltype(m)>;
 
         if constexpr (std::is_same_v<T, HelloMsg>) {
@@ -1754,11 +1880,11 @@ HandleResult Replica::handle_message(const Message& msg) {
             if (impl_->state != State::Live) {
                 impl_->state = State::Error;
                 return {{ErrorMsg{ErrorCode::InvalidState,
-                    "received ChangesetMsg in unexpected state"}}, {}};
+                    "received ChangesetMsg in unexpected state"}}, {}, {}};
             }
             auto events = impl_->apply_changeset(m.data, m.seq);
             SPDLOG_DEBUG("applied changeset seq={}", m.seq);
-            return {{AckMsg{m.seq}}, std::move(events)};
+            return {{AckMsg{m.seq}}, std::move(events), {}};
         }
         else if constexpr (std::is_same_v<T, ErrorMsg>) {
             impl_->state = State::Error;
@@ -1767,9 +1893,63 @@ HandleResult Replica::handle_message(const Message& msg) {
         }
         else {
             return {{ErrorMsg{ErrorCode::InvalidState,
-                "unexpected message type from master"}}, {}};
+                "unexpected message type from master"}}, {}, {}};
         }
     }, msg);
+
+    // Evaluate invalidated subscriptions.
+    if (!result.changes.empty() && !impl_->subscriptions.empty()) {
+        std::set<std::string> affected;
+        for (const auto& ev : result.changes) {
+            if (!ev.table.empty()) affected.insert(ev.table);
+        }
+        result.subscriptions = impl_->evaluate_invalidated(affected);
+    }
+
+    return result;
+}
+
+QueryResult Replica::subscribe(const std::string& sql) {
+    auto tables = impl_->discover_tables(sql);
+    auto id = impl_->next_sub_id++;
+
+    // Prepare statement once and cache column names.
+    auto stmt = detail::prepare(impl_->db, sql.c_str());
+    int ncols = sqlite3_column_count(stmt.get());
+    std::vector<std::string> columns;
+    columns.reserve(static_cast<std::size_t>(ncols));
+    for (int i = 0; i < ncols; ++i) {
+        const char* name = sqlite3_column_name(stmt.get(), i);
+        columns.push_back(name ? name : "");
+    }
+
+    // Build reverse index entries.
+    for (const auto& t : tables) {
+        impl_->table_subs[t].insert(id);
+    }
+
+    impl_->subscriptions[id] = {id, sql, std::move(tables),
+                                std::move(stmt), std::move(columns), 0};
+    auto [result, hash] = impl_->evaluate_query(impl_->subscriptions[id]);
+    impl_->subscriptions[id].result_hash = hash;
+    return result;
+}
+
+void Replica::unsubscribe(SubscriptionId id) {
+    auto it = impl_->subscriptions.find(id);
+    if (it != impl_->subscriptions.end()) {
+        // Remove reverse index entries.
+        for (const auto& t : it->second.tables) {
+            auto ts_it = impl_->table_subs.find(t);
+            if (ts_it != impl_->table_subs.end()) {
+                ts_it->second.erase(id);
+                if (ts_it->second.empty()) {
+                    impl_->table_subs.erase(ts_it);
+                }
+            }
+        }
+        impl_->subscriptions.erase(it);
+    }
 }
 
 Seq Replica::current_seq() const { return impl_->seq; }

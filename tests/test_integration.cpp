@@ -84,6 +84,9 @@ HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
                                resp.messages.begin(), resp.messages.end());
         result.changes.insert(result.changes.end(),
                               resp.changes.begin(), resp.changes.end());
+        result.subscriptions.insert(result.subscriptions.end(),
+                                    resp.subscriptions.begin(),
+                                    resp.subscriptions.end());
     }
     return result;
 }
@@ -204,4 +207,155 @@ TEST_CASE("integration: multiple tables") {
     CHECK(replica_db.count("orders") == 1);
     CHECK(replica_db.query_val("SELECT name FROM users WHERE id=1") == "Alice");
     CHECK(replica_db.query_val("SELECT item FROM orders WHERE id=1") == "widget");
+}
+
+TEST_CASE("subscription: fires after live changeset") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    // Subscribe to a query on the replica.
+    auto qr = replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
+    CHECK(qr.rows.empty());  // nothing yet
+
+    // Master inserts a row.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    auto result = deliver(master.flush(), replica);
+
+    // Subscription should fire with the updated result.
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].id == qr.id);
+    REQUIRE(result.subscriptions[0].rows.size() == 1);
+    CHECK(std::get<std::int64_t>(result.subscriptions[0].rows[0][0]) == 1);
+    CHECK(std::get<std::string>(result.subscriptions[0].rows[0][1]) == "hello");
+}
+
+TEST_CASE("subscription: does not fire for unrelated table") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    master_db.exec("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    // Subscribe to t1 only.
+    replica.subscribe("SELECT * FROM t1");
+
+    // Change t2 only.
+    master_db.exec("INSERT INTO t2 VALUES (1, 'x')");
+    auto result = deliver(master.flush(), replica);
+
+    // Subscription should NOT fire.
+    CHECK(result.subscriptions.empty());
+}
+
+TEST_CASE("subscription: multiple subscriptions, only relevant fires") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    master_db.exec("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    auto sub1 = replica.subscribe("SELECT * FROM t1");
+    auto sub2 = replica.subscribe("SELECT * FROM t2");
+
+    // Change t1 only.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    auto result = deliver(master.flush(), replica);
+
+    // Only sub1 should fire.
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].id == sub1.id);
+}
+
+TEST_CASE("subscription: JOIN query fires on either table") {
+    DB master_db, replica_db;
+    const char* schema =
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);"
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, item TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    auto sub = replica.subscribe(
+        "SELECT u.name, o.item FROM users u JOIN orders o ON o.user_id = u.id");
+    CHECK(sub.rows.empty());
+
+    // Insert into users only — JOIN still returns 0 rows (no orders yet),
+    // so the subscription should NOT fire (result unchanged).
+    master_db.exec("INSERT INTO users VALUES (1, 'Alice')");
+    auto result = deliver(master.flush(), replica);
+    CHECK(result.subscriptions.empty());
+
+    // Insert into orders — now the JOIN produces a row, so it fires.
+    master_db.exec("INSERT INTO orders VALUES (1, 1, 'widget')");
+    result = deliver(master.flush(), replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].id == sub.id);
+    CHECK(result.subscriptions[0].rows.size() == 1);
+    CHECK(std::get<std::string>(result.subscriptions[0].rows[0][0]) == "Alice");
+    CHECK(std::get<std::string>(result.subscriptions[0].rows[0][1]) == "widget");
+}
+
+TEST_CASE("subscription: unsubscribe prevents firing") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    auto sub = replica.subscribe("SELECT * FROM t1");
+    replica.unsubscribe(sub.id);
+
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    auto result = deliver(master.flush(), replica);
+
+    CHECK(result.subscriptions.empty());
+}
+
+TEST_CASE("subscription: suppressed when result unchanged") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    // Subscribe to a filtered query.
+    auto sub = replica.subscribe("SELECT val FROM t1 WHERE id = 1");
+    CHECK(sub.rows.empty());
+
+    // Insert matching row — subscription fires.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    auto result = deliver(master.flush(), replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(std::get<std::string>(result.subscriptions[0].rows[0][0]) == "hello");
+
+    // Insert a different row (id=2) — t1 changed but the query result didn't.
+    master_db.exec("INSERT INTO t1 VALUES (2, 'world')");
+    result = deliver(master.flush(), replica);
+    CHECK(result.subscriptions.empty());
+
+    // Update the matching row — result changes, fires again.
+    master_db.exec("UPDATE t1 SET val='goodbye' WHERE id=1");
+    result = deliver(master.flush(), replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(std::get<std::string>(result.subscriptions[0].rows[0][0]) == "goodbye");
 }
