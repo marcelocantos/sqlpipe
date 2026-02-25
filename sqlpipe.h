@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#define SQLPIPE_VERSION       "0.4.0"
+#define SQLPIPE_VERSION_MAJOR 0
+#define SQLPIPE_VERSION_MINOR 4
+#define SQLPIPE_VERSION_PATCH 0
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -83,6 +88,28 @@ struct QueryResult {
     std::vector<std::string>        columns;  ///< Column names.
     std::vector<std::vector<Value>> rows;     ///< Result rows.
 };
+
+// ── Diff sync progress ──────────────────────────────────────────
+
+/// Phase of the diff sync protocol for progress reporting.
+enum class DiffPhase : std::uint8_t {
+    ComputingBuckets,   ///< Computing bucket hashes for tables.
+    ComparingBuckets,   ///< Comparing bucket hashes (master only).
+    ComputingRowHashes, ///< Computing per-row hashes for mismatched buckets.
+    BuildingPatchset,   ///< Building INSERT patchset (master only).
+    ApplyingPatchset,   ///< Applying patchset + deletes (replica only).
+};
+
+/// Progress information emitted during diff sync.
+struct DiffProgress {
+    DiffPhase    phase;
+    std::string  table;           ///< Current table (empty if N/A).
+    std::int64_t items_done = 0;  ///< Buckets/rows/tables processed so far.
+    std::int64_t items_total = 0; ///< Total items (0 if unknown).
+};
+
+/// Callback for diff sync progress reporting.
+using ProgressCallback = std::function<void(const DiffProgress&)>;
 
 } // namespace sqlpipe
 
@@ -257,6 +284,9 @@ struct MasterConfig {
 
     /// Rows per bucket for the diff protocol.
     std::int64_t bucket_size = kDefaultBucketSize;
+
+    /// Diff sync progress callback. nullptr = no reporting.
+    ProgressCallback on_progress = nullptr;
 };
 
 /// The sending side of the replication protocol.
@@ -308,6 +338,9 @@ struct ReplicaConfig {
 
     /// Rows per bucket for the diff protocol.
     std::int64_t bucket_size = kDefaultBucketSize;
+
+    /// Diff sync progress callback. nullptr = no reporting.
+    ProgressCallback on_progress = nullptr;
 };
 
 /// Return type for Replica::handle_message.
@@ -385,6 +418,11 @@ struct PeerConfig {
     /// Ignored on the server side (computed as complement of client's).
     std::set<std::string> owned_tables;
 
+    /// If set, only consider these tables for replication.
+    /// nullopt = all user tables (default). owned_tables must be a subset.
+    /// Complement (remote tables) is computed within this filtered set.
+    std::optional<std::set<std::string>> table_filter;
+
     /// Server-side ownership validation callback.
     /// Non-null indicates this peer is the server.
     /// nullptr = auto-approve any request.
@@ -392,6 +430,10 @@ struct PeerConfig {
 
     /// Conflict callback for the internal Replica.
     ConflictCallback on_conflict = nullptr;
+
+    /// Diff sync progress callback. nullptr = no reporting.
+    /// Forwarded to both the internal Master and Replica.
+    ProgressCallback on_progress = nullptr;
 };
 
 /// Identifies whether the sender was acting as master or replica.

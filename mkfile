@@ -11,7 +11,7 @@ vendor   = vendor
 incflags = -I. -I$vendor/include -I$vendor/github.com/gabime/spdlog/include
 
 # ── Sources ──────────────────────────────────────────────────────────
-test_srcs = $[wildcard tests/*.cpp]
+test_srcs = tests/doctest_main.cpp $[wildcard tests/test_*.cpp]
 test_objs = $[patsubst %.cpp,build/%.o,$test_srcs]
 
 # ── Default target ───────────────────────────────────────────────────
@@ -25,6 +25,10 @@ build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlpipe.o
 !example: build/loopback
     ./$input
 
+!fuzz: build/fuzz_deserialize
+    mkdir -p corpus/deserialize
+    ./$input corpus/deserialize -max_total_time=60
+
 !clean:
     rm -rf build/ .mk/
 
@@ -34,6 +38,12 @@ build/sqlpipe_tests: $test_objs build/libsqlpipe.a
 
 build/loopback: build/examples/loopback.o build/libsqlpipe.a
     $cxx $cxxflags -o $target $inputs
+
+build/fuzz_deserialize: build/tests/fuzz_deserialize.o build/libsqlpipe.a
+    $cxx $cxxflags -fsanitize=fuzzer,address -o $target $inputs
+
+build/tests/fuzz_deserialize.o: tests/fuzz_deserialize.cpp
+    $cxx $cxxflags $incflags -fsanitize=fuzzer,address -c $input -o $target
 
 # ── Compilation rules ────────────────────────────────────────────────
 build/sqlite3.o: $vendor/src/sqlite3.c

@@ -1229,6 +1229,13 @@ struct Master::Impl {
         return config.table_filter ? &*config.table_filter : nullptr;
     }
 
+    void report(DiffPhase phase, const std::string& table,
+                std::int64_t done, std::int64_t total) {
+        if (config.on_progress) {
+            config.on_progress(DiffProgress{phase, table, done, total});
+        }
+    }
+
     void init() {
         detail::ensure_meta_table(db);
         seq = detail::read_seq(db, config.seq_key);
@@ -1312,8 +1319,13 @@ struct Master::Impl {
         }
 
         // Compute our own bucket hashes.
+        report(DiffPhase::ComputingBuckets, {},
+               0, static_cast<std::int64_t>(tracked_tables.size()));
         auto my_buckets = detail::compute_all_buckets(
             db, filter(), config.bucket_size);
+        report(DiffPhase::ComputingBuckets, {},
+               static_cast<std::int64_t>(tracked_tables.size()),
+               static_cast<std::int64_t>(tracked_tables.size()));
 
         // Build lookup: (table, lo) → hash for our buckets.
         struct BucketKey {
@@ -1376,6 +1388,10 @@ struct Master::Impl {
             }
         }
 
+        report(DiffPhase::ComparingBuckets, {},
+               static_cast<std::int64_t>(need.ranges.size()),
+               static_cast<std::int64_t>(all_keys.size()));
+
         // Sort ranges for deterministic order.
         std::sort(need.ranges.begin(), need.ranges.end(),
             [](const NeedBucketRange& a, const NeedBucketRange& b) {
@@ -1427,7 +1443,13 @@ struct Master::Impl {
             table_ranges[r.table].push_back({r.lo, r.hi});
         }
 
+        std::int64_t tables_done = 0;
+        auto tables_total = static_cast<std::int64_t>(table_ranges.size());
+
         for (const auto& [table, ranges] : table_ranges) {
+            report(DiffPhase::ComputingRowHashes, table,
+                   tables_done, tables_total);
+
             std::vector<std::int64_t> insert_rowids;
             std::vector<std::int64_t> update_rowids;
             std::vector<std::int64_t> delete_rowids;
@@ -1479,6 +1501,8 @@ struct Master::Impl {
                                  update_rowids.begin(), update_rowids.end());
 
             if (!upsert_rowids.empty()) {
+                report(DiffPhase::BuildingPatchset, table,
+                       static_cast<std::int64_t>(upsert_rowids.size()), 0);
                 auto ps = detail::build_insert_patchset(db, table, upsert_rowids);
                 if (!ps.empty()) {
                     patchsets.push_back(std::move(ps));
@@ -1489,6 +1513,8 @@ struct Master::Impl {
                 std::sort(delete_rowids.begin(), delete_rowids.end());
                 deletes.push_back(TableDeletes{table, std::move(delete_rowids)});
             }
+
+            ++tables_done;
         }
 
         // Combine all per-table patchsets.
@@ -1595,6 +1621,13 @@ struct Replica::Impl {
 
     const std::set<std::string>* filter() const {
         return config.table_filter ? &*config.table_filter : nullptr;
+    }
+
+    void report(DiffPhase phase, const std::string& table,
+                std::int64_t done, std::int64_t total) {
+        if (config.on_progress) {
+            config.on_progress(DiffProgress{phase, table, done, total});
+        }
     }
 
     std::set<std::string> discover_tables(const std::string& sql) {
@@ -1737,8 +1770,12 @@ struct Replica::Impl {
         }
 
         // Compute bucket hashes and send to master.
+        report(DiffPhase::ComputingBuckets, {}, 0, 0);
         auto buckets = detail::compute_all_buckets(
             db, filter(), config.bucket_size);
+        report(DiffPhase::ComputingBuckets, {},
+               static_cast<std::int64_t>(buckets.size()),
+               static_cast<std::int64_t>(buckets.size()));
         state = Replica::State::DiffBuckets;
         SPDLOG_INFO("sending {} bucket hashes", buckets.size());
         return {{BucketHashesMsg{std::move(buckets)}}, {}, {}};
@@ -1761,7 +1798,11 @@ struct Replica::Impl {
 
         // Compute row hashes for requested ranges.
         RowHashesMsg rh;
+        std::int64_t ranges_done = 0;
+        auto ranges_total = static_cast<std::int64_t>(m.ranges.size());
         for (const auto& range : m.ranges) {
+            report(DiffPhase::ComputingRowHashes, range.table,
+                   ranges_done, ranges_total);
             auto rows = detail::compute_row_hashes(
                 db, range.table, range.lo, range.hi);
 
@@ -1796,6 +1837,7 @@ struct Replica::Impl {
             }
 
             rh.entries.push_back(std::move(entry));
+            ++ranges_done;
         }
 
         SPDLOG_INFO("sending row hashes for {} ranges", m.ranges.size());
@@ -1824,6 +1866,9 @@ struct Replica::Impl {
         }
 
         detail::exec(db, "BEGIN");
+
+        report(DiffPhase::ApplyingPatchset, {},
+               0, static_cast<std::int64_t>(m.deletes.size()) + 1);
 
         // Apply INSERT patchset (handles both inserts and updates via REPLACE).
         if (!m.patchset.empty()) {
@@ -2120,6 +2165,7 @@ struct Peer::Impl {
         MasterConfig mc;
         mc.table_filter = my_tables;
         mc.seq_key = "master_seq";
+        mc.on_progress = config.on_progress;
         master = std::make_unique<Master>(db, mc);
     }
 
@@ -2128,6 +2174,7 @@ struct Peer::Impl {
         rc.on_conflict = config.on_conflict;
         rc.table_filter = their_tables;
         rc.seq_key = "replica_seq";
+        rc.on_progress = config.on_progress;
         replica = std::make_unique<Replica>(db, rc);
     }
 
@@ -2141,7 +2188,13 @@ struct Peer::Impl {
 
     std::set<std::string> complement_tables(
             const std::set<std::string>& subset) {
-        auto all = detail::get_tracked_tables(db);
+        std::vector<std::string> all;
+        if (config.table_filter) {
+            all.assign(config.table_filter->begin(),
+                       config.table_filter->end());
+        } else {
+            all = detail::get_tracked_tables(db);
+        }
         std::set<std::string> result;
         for (auto& t : all) {
             if (subset.find(t) == subset.end()) {
@@ -2166,6 +2219,22 @@ struct Peer::Impl {
                         ErrorMsg{ErrorCode::ProtocolError,
                                  "peer hello must include owned_tables"}});
                     return result;
+                }
+
+                // Reject if client claims tables outside our table_filter.
+                if (config.table_filter) {
+                    for (const auto& t : hello->owned_tables) {
+                        if (config.table_filter->find(t) ==
+                                config.table_filter->end()) {
+                            state = Peer::State::Error;
+                            result.messages.push_back(PeerMessage{
+                                SenderRole::AsMaster,
+                                ErrorMsg{ErrorCode::OwnershipRejected,
+                                    "table '" + t +
+                                    "' is not in table_filter"}});
+                            return result;
+                        }
+                    }
                 }
 
                 if (config.approve_ownership) {
@@ -2297,6 +2366,18 @@ std::vector<PeerMessage> Peer::start() {
     if (impl_->is_server()) {
         throw Error(ErrorCode::InvalidState,
                     "server peer must not call start()");
+    }
+
+    // Validate owned_tables ⊆ table_filter when filter is set.
+    if (impl_->config.table_filter) {
+        for (const auto& t : impl_->config.owned_tables) {
+            if (impl_->config.table_filter->find(t) ==
+                    impl_->config.table_filter->end()) {
+                throw Error(ErrorCode::InvalidState,
+                    "owned_tables entry '" + t +
+                    "' is not in table_filter");
+            }
+        }
     }
 
     impl_->state = State::Negotiating;

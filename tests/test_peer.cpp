@@ -466,3 +466,92 @@ TEST_CASE("peer: reset and reconnect") {
     // Server should still have the t1 row.
     CHECK(server_db.count("t1") == 1);
 }
+
+TEST_CASE("peer: table_filter excludes tables from replication") {
+    DB client_db, server_db;
+    const char* schema =
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);"
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);"
+        "CREATE TABLE t3 (id INTEGER PRIMARY KEY, val TEXT)";
+    client_db.exec(schema);
+    server_db.exec(schema);
+
+    // Client owns t1, filter includes only t1 and t2; t3 is excluded.
+    PeerConfig client_cfg;
+    client_cfg.owned_tables = {"t1"};
+    client_cfg.table_filter = std::set<std::string>{"t1", "t2"};
+    Peer client(client_db.db, client_cfg);
+
+    PeerConfig server_cfg;
+    server_cfg.table_filter = std::set<std::string>{"t1", "t2"};
+    server_cfg.approve_ownership = [](const std::set<std::string>&) {
+        return true;
+    };
+    Peer server(server_db.db, server_cfg);
+
+    auto initial = client.start();
+    exchange(client, server, initial);
+
+    CHECK(client.state() == Peer::State::Live);
+    CHECK(server.state() == Peer::State::Live);
+
+    // Only t1 and t2 are replicated; t3 is outside the filter.
+    CHECK(client.owned_tables() == std::set<std::string>{"t1"});
+    CHECK(client.remote_tables() == std::set<std::string>{"t2"});
+    CHECK(server.owned_tables() == std::set<std::string>{"t2"});
+    CHECK(server.remote_tables() == std::set<std::string>{"t1"});
+
+    // Server writes to t2, client receives.
+    server_db.exec("INSERT INTO t2 VALUES (1, 'hello')");
+    auto msgs = server.flush();
+    deliver(msgs, client);
+    CHECK(client_db.count("t2") == 1);
+
+    // Server writes to t3 (outside filter) — not tracked by server's Master.
+    server_db.exec("INSERT INTO t3 VALUES (1, 'ignored')");
+    auto t3_msgs = server.flush();
+    CHECK(t3_msgs.empty());
+}
+
+TEST_CASE("peer: server rejects client ownership outside table_filter") {
+    DB client_db, server_db;
+    const char* schema =
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);"
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)";
+    client_db.exec(schema);
+    server_db.exec(schema);
+
+    PeerConfig client_cfg;
+    client_cfg.owned_tables = {"t1"};
+    Peer client(client_db.db, client_cfg);
+
+    // Server filter only includes t2 — t1 is outside.
+    PeerConfig server_cfg;
+    server_cfg.table_filter = std::set<std::string>{"t2"};
+    server_cfg.approve_ownership = [](const std::set<std::string>&) {
+        return true;
+    };
+    Peer server(server_db.db, server_cfg);
+
+    auto initial = client.start();
+    auto resp = deliver(initial, server);
+
+    CHECK(server.state() == Peer::State::Error);
+    REQUIRE(!resp.messages.empty());
+    auto* err = std::get_if<ErrorMsg>(&resp.messages[0].payload);
+    REQUIRE(err != nullptr);
+    CHECK(err->code == ErrorCode::OwnershipRejected);
+}
+
+TEST_CASE("peer: client owned_tables must be subset of table_filter") {
+    DB d;
+    d.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);"
+           "CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    PeerConfig cfg;
+    cfg.owned_tables = {"t1", "t2"};
+    cfg.table_filter = std::set<std::string>{"t1"};  // t2 not in filter
+    Peer peer(d.db, cfg);
+
+    CHECK_THROWS_AS(peer.start(), Error);
+}

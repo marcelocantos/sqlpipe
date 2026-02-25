@@ -400,3 +400,49 @@ TEST_CASE("integration: replica reset preserves subscriptions") {
     CHECK(result.subscriptions[0].id == sub.id);
     CHECK(result.subscriptions[0].rows.size() == 3);
 }
+
+TEST_CASE("integration: diff sync progress callbacks") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    // Master accumulates data while replica is disconnected.
+    std::vector<DiffProgress> master_progress, replica_progress;
+
+    MasterConfig mc;
+    mc.on_progress = [&](const DiffProgress& p) {
+        master_progress.push_back(p);
+    };
+    Master master(master_db.db, mc);
+
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    master.flush();
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    master.flush();
+
+    ReplicaConfig rc;
+    rc.on_progress = [&](const DiffProgress& p) {
+        replica_progress.push_back(p);
+    };
+    Replica replica(replica_db.db, rc);
+    handshake(master, replica);
+
+    CHECK(replica.state() == Replica::State::Live);
+
+    // Master should have reported: ComputingBuckets, ComparingBuckets,
+    // ComputingRowHashes, BuildingPatchset.
+    auto has_phase = [](const std::vector<DiffProgress>& v, DiffPhase ph) {
+        for (const auto& p : v) if (p.phase == ph) return true;
+        return false;
+    };
+    CHECK(has_phase(master_progress, DiffPhase::ComputingBuckets));
+    CHECK(has_phase(master_progress, DiffPhase::ComparingBuckets));
+    CHECK(has_phase(master_progress, DiffPhase::ComputingRowHashes));
+    CHECK(has_phase(master_progress, DiffPhase::BuildingPatchset));
+
+    // Replica should have reported: ComputingBuckets, ComputingRowHashes,
+    // ApplyingPatchset.
+    CHECK(has_phase(replica_progress, DiffPhase::ComputingBuckets));
+    CHECK(has_phase(replica_progress, DiffPhase::ComputingRowHashes));
+    CHECK(has_phase(replica_progress, DiffPhase::ApplyingPatchset));
+}
