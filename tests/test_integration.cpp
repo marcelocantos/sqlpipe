@@ -446,3 +446,187 @@ TEST_CASE("integration: diff sync progress callbacks") {
     CHECK(has_phase(replica_progress, DiffPhase::ComputingRowHashes));
     CHECK(has_phase(replica_progress, DiffPhase::ApplyingPatchset));
 }
+
+TEST_CASE("integration: master schema migration hook resolves mismatch") {
+    DB master_db, replica_db;
+    // Replica has an extra column that the master lacks.
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT, extra TEXT)");
+
+    bool callback_called = false;
+    MasterConfig mc;
+    mc.on_schema_mismatch = [&](SchemaVersion, SchemaVersion) {
+        callback_called = true;
+        // Migrate: add the extra column to match the replica.
+        master_db.exec("ALTER TABLE t1 ADD COLUMN extra TEXT");
+        return true;
+    };
+    Master master(master_db.db, mc);
+    Replica replica(replica_db.db);
+
+    handshake(master, replica);
+
+    CHECK(callback_called);
+    CHECK(replica.state() == Replica::State::Live);
+}
+
+TEST_CASE("integration: master schema migration hook returns false") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT, extra TEXT)");
+
+    MasterConfig mc;
+    mc.on_schema_mismatch = [&](SchemaVersion, SchemaVersion) {
+        return false;  // decline to fix
+    };
+    Master master(master_db.db, mc);
+    Replica replica(replica_db.db);
+
+    auto hello = replica.hello();
+    auto resp = master.handle_message(hello);
+
+    REQUIRE(resp.size() == 1);
+    CHECK(std::holds_alternative<ErrorMsg>(resp[0]));
+    CHECK(std::get<ErrorMsg>(resp[0]).code == ErrorCode::SchemaMismatch);
+}
+
+TEST_CASE("integration: replica schema migration hook resolves mismatch") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT, extra TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+
+    bool callback_called = false;
+    ReplicaConfig rc;
+    rc.on_schema_mismatch = [&](SchemaVersion, SchemaVersion) {
+        callback_called = true;
+        // Migrate: add the missing column to match the master.
+        replica_db.exec("ALTER TABLE t1 ADD COLUMN extra TEXT");
+        return true;
+    };
+    Replica replica(replica_db.db, rc);
+
+    // First handshake attempt: master sends ErrorMsg, replica callback fires.
+    auto hello = replica.hello();
+    auto master_resp = master.handle_message(hello);
+    REQUIRE(master_resp.size() == 1);
+    CHECK(std::holds_alternative<ErrorMsg>(master_resp[0]));
+
+    auto result = replica.handle_message(master_resp[0]);
+    CHECK(callback_called);
+    // Replica should have reset to Init (not Error).
+    CHECK(replica.state() == Replica::State::Init);
+
+    // Second handshake should succeed now that schemas match.
+    handshake(master, replica);
+    CHECK(replica.state() == Replica::State::Live);
+}
+
+TEST_CASE("integration: batched handle_messages defers subscriptions") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    auto sub = replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
+    CHECK(sub.rows.empty());
+
+    // Generate 3 separate changesets.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    auto m1 = master.flush();
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    auto m2 = master.flush();
+    master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
+    auto m3 = master.flush();
+
+    // Batch them all.
+    std::vector<Message> batch;
+    batch.insert(batch.end(), m1.begin(), m1.end());
+    batch.insert(batch.end(), m2.begin(), m2.end());
+    batch.insert(batch.end(), m3.begin(), m3.end());
+
+    auto result = replica.handle_messages(batch);
+
+    // All 3 changes should be applied.
+    CHECK(result.changes.size() == 3);
+    CHECK(replica_db.count("t1") == 3);
+
+    // Subscription should fire exactly once with all 3 rows.
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.size() == 3);
+}
+
+TEST_CASE("integration: crash recovery after aborted changeset") {
+    // Use temporary file-backed databases.
+    std::string master_path = "/tmp/sqlpipe_test_master.db";
+    std::string replica_path = "/tmp/sqlpipe_test_replica.db";
+    std::remove(master_path.c_str());
+    std::remove(replica_path.c_str());
+
+    sqlite3* mdb = nullptr;
+    sqlite3* rdb = nullptr;
+    sqlite3_open(master_path.c_str(), &mdb);
+    sqlite3_open(replica_path.c_str(), &rdb);
+
+    auto exec = [](sqlite3* db, const char* sql) {
+        char* err = nullptr;
+        int rc = sqlite3_exec(db, sql, nullptr, nullptr, &err);
+        if (rc != SQLITE_OK) {
+            std::string msg = err ? err : "error";
+            sqlite3_free(err);
+            throw std::runtime_error(msg);
+        }
+    };
+
+    exec(mdb, "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    exec(rdb, "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    // First session: normal sync.
+    {
+        Master master(mdb);
+        Replica replica(rdb);
+        handshake(master, replica);
+
+        exec(mdb, "INSERT INTO t1 VALUES (1, 'hello')");
+        auto msgs = master.flush();
+        deliver(msgs, replica);
+    }
+
+    // Add more data while "disconnected".
+    exec(mdb, "INSERT INTO t1 VALUES (2, 'world')");
+    {
+        Master m(mdb);
+        m.flush();
+    }
+
+    // Close and reopen databases (simulating process restart).
+    sqlite3_close(rdb);
+    sqlite3_close(mdb);
+    sqlite3_open(master_path.c_str(), &mdb);
+    sqlite3_open(replica_path.c_str(), &rdb);
+
+    // Re-sync should succeed.
+    {
+        Master master(mdb);
+        Replica replica(rdb);
+        handshake(master, replica);
+
+        CHECK(replica.state() == Replica::State::Live);
+
+        // Verify both rows are present.
+        sqlite3_stmt* stmt = nullptr;
+        sqlite3_prepare_v2(rdb, "SELECT COUNT(*) FROM t1", -1, &stmt, nullptr);
+        sqlite3_step(stmt);
+        CHECK(sqlite3_column_int(stmt, 0) == 2);
+        sqlite3_finalize(stmt);
+    }
+
+    sqlite3_close(rdb);
+    sqlite3_close(mdb);
+    std::remove(master_path.c_str());
+    std::remove(replica_path.c_str());
+}

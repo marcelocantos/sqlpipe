@@ -81,7 +81,7 @@ example including the handshake and change event handling.
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-mk test     # build and run tests (57 test cases)
+mk test     # build and run tests (74 test cases)
 mk example  # build and run the loopback demo
 ```
 
@@ -122,6 +122,8 @@ Replica                              Master
 struct MasterConfig {
     std::optional<std::set<std::string>> table_filter;
     std::int64_t bucket_size = 1024;  // rows per diff bucket
+    ProgressCallback on_progress = nullptr;
+    SchemaMismatchCallback on_schema_mismatch = nullptr;
 };
 
 class Master {
@@ -141,6 +143,8 @@ struct ReplicaConfig {
     ConflictCallback on_conflict = nullptr;  // default: Abort
     std::optional<std::set<std::string>> table_filter;
     std::int64_t bucket_size = 1024;
+    ProgressCallback on_progress = nullptr;
+    SchemaMismatchCallback on_schema_mismatch = nullptr;
 };
 
 struct HandleResult {
@@ -154,6 +158,7 @@ public:
     explicit Replica(sqlite3* db, ReplicaConfig config = {});
     Message hello() const;
     HandleResult handle_message(const Message& msg);
+    HandleResult handle_messages(std::span<const Message> msgs);  // batched
     QueryResult subscribe(const std::string& sql);  // register a query
     void unsubscribe(SubscriptionId id);             // remove a subscription
     void reset();                                    // return to Init; preserves subscriptions
@@ -170,6 +175,8 @@ struct PeerConfig {
     std::set<std::string> owned_tables;       // tables this side masters
     ApproveOwnershipCallback approve_ownership; // non-null = server side
     ConflictCallback on_conflict = nullptr;
+    ProgressCallback on_progress = nullptr;
+    SchemaMismatchCallback on_schema_mismatch = nullptr;
 };
 
 struct PeerHandleResult {
@@ -260,6 +267,129 @@ Error codes: `SqliteError`, `ProtocolError`, `SchemaMismatch`, `InvalidState`,
 
 The replica also returns `ErrorMsg` messages when it receives unexpected
 protocol messages — these should be forwarded to the master over the transport.
+
+## Schema migration
+
+By default, a schema mismatch between master and replica is a hard error. You
+can install a callback to run migrations instead:
+
+```cpp
+MasterConfig mc;
+mc.on_schema_mismatch = [&](SchemaVersion remote, SchemaVersion local) {
+    // ALTER the master's DB to match the replica, then return true to retry.
+    sqlite3_exec(master_db, "ALTER TABLE t ADD COLUMN new_col TEXT", 0, 0, 0);
+    return true;  // recompute fingerprint and retry
+};
+Master master(master_db, mc);
+
+ReplicaConfig rc;
+rc.on_schema_mismatch = [&](SchemaVersion remote, SchemaVersion local) {
+    // ALTER the replica's DB to match the master, then return true.
+    // The replica will reset to Init — call hello() again to re-handshake.
+    sqlite3_exec(replica_db, "ALTER TABLE t ADD COLUMN new_col TEXT", 0, 0, 0);
+    return true;
+};
+Replica replica(replica_db, rc);
+```
+
+The same callback is available on `PeerConfig` and is forwarded to both the
+internal Master and Replica.
+
+## Batched message handling
+
+When processing a burst of messages, use `handle_messages()` to defer
+subscription re-evaluation until all messages are applied:
+
+```cpp
+std::vector<Message> burst = /* received from network */;
+auto result = replica.handle_messages(burst);
+// Subscriptions are evaluated once, not per-message.
+```
+
+## Thread safety
+
+`Master`, `Replica`, and `Peer` are **not thread-safe**. Each instance must be
+accessed from a single thread at a time. If you need multi-threaded access,
+provide your own synchronisation (e.g. a mutex around all calls to the
+instance). The `sqlite3*` handle must not be used concurrently by other threads
+during sqlpipe operations.
+
+## WAL mode
+
+SQLite WAL mode is recommended but not required. WAL allows concurrent readers
+while the replica applies changes, which is useful if your application reads the
+database on a separate thread. Enable it before creating any sqlpipe objects:
+
+```cpp
+sqlite3_exec(db, "PRAGMA journal_mode=WAL", 0, 0, 0);
+```
+
+## Transport wiring
+
+sqlpipe is transport-agnostic. The wire format is already length-prefixed, so
+integrating with any byte-stream transport (TCP, WebSocket, serial, etc.) is
+straightforward:
+
+**Sending:**
+```cpp
+auto buf = sqlpipe::serialize(msg);      // or serialize(peer_msg)
+send(socket, buf.data(), buf.size());    // your transport
+```
+
+**Receiving:**
+```cpp
+// 1. Read the 4-byte little-endian length prefix.
+uint8_t hdr[4];
+recv(socket, hdr, 4);
+uint32_t len = hdr[0] | (hdr[1]<<8) | (hdr[2]<<16) | (hdr[3]<<24);
+
+// 2. Read the full message (length prefix + payload).
+std::vector<uint8_t> buf(4 + len);
+memcpy(buf.data(), hdr, 4);
+recv(socket, buf.data() + 4, len);
+
+// 3. Deserialize.
+auto msg = sqlpipe::deserialize(buf);    // or deserialize_peer(buf)
+```
+
+## Reconnection
+
+Both `Replica` and `Peer` support reconnection without recreating the object:
+
+```cpp
+// Replica reconnection:
+replica.reset();           // back to Init; subscriptions are preserved
+auto hello = replica.hello();
+// ... re-run the handshake exchange ...
+// Diff sync will discover and transfer only what changed.
+
+// Peer reconnection:
+peer.reset();              // back to Init; table ownership is preserved
+auto msgs = peer.start();  // re-initiate handshake
+// ... exchange messages until Live ...
+```
+
+## Error recovery
+
+| ErrorCode | Meaning | Recommended action |
+|---|---|---|
+| `SqliteError` | An underlying SQLite call failed | Check the message for details; may indicate corruption or a constraint violation |
+| `ProtocolError` | Malformed or unexpected message | Disconnect and reconnect; the peer may be buggy or malicious |
+| `SchemaMismatch` | Master and replica schemas differ | Install an `on_schema_mismatch` callback, or migrate offline and reconnect |
+| `InvalidState` | Operation not valid in the current state | Bug in the calling code; check the state machine |
+| `OwnershipRejected` | Peer ownership request was rejected | The server's `approve_ownership` callback returned false |
+| `WithoutRowidTable` | Table uses `WITHOUT ROWID` | Not supported; use regular rowid tables |
+
+## Message size limits
+
+Incoming messages are validated against built-in limits to resist malicious
+peers:
+
+- **`kMaxMessageSize`** (64 MB) — maximum serialized message size
+- **`kMaxArrayCount`** (10 M) — maximum number of elements in any array field
+
+Messages exceeding these limits cause `deserialize()` to throw
+`ProtocolError`. The limits are defined as `inline constexpr` in `sqlpipe.h`.
 
 ## License
 

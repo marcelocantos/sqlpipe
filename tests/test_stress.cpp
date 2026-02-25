@@ -285,6 +285,74 @@ TEST_CASE("stress: peer bidirectional random operations") {
     check_convergence(client_db, server_db, "t2");
 }
 
+TEST_CASE("stress: large dataset live streaming") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    std::mt19937 rng(555);
+
+    // Insert 10K rows in batches of 100.
+    for (int batch = 0; batch < 100; ++batch) {
+        master_db.exec("BEGIN");
+        for (int i = 0; i < 100; ++i) {
+            int id = batch * 100 + i + 1;
+            std::string val = random_string(rng);
+            master_db.exec(("INSERT INTO t1 VALUES (" +
+                            std::to_string(id) + ", '" + val + "')").c_str());
+        }
+        master_db.exec("COMMIT");
+
+        auto msgs = master.flush();
+        auto result = deliver(msgs, replica);
+        for (const auto& m : result.messages) {
+            master.handle_message(m);
+        }
+    }
+
+    CHECK(master_db.count("t1") == 10000);
+    check_convergence(master_db, replica_db, "t1");
+}
+
+TEST_CASE("stress: large dataset diff sync") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    std::mt19937 rng(666);
+
+    // Populate master with 10K rows.
+    Master master(master_db.db);
+    master_db.exec("BEGIN");
+    for (int i = 1; i <= 10000; ++i) {
+        std::string val = random_string(rng);
+        master_db.exec(("INSERT INTO t1 VALUES (" +
+                        std::to_string(i) + ", '" + val + "')").c_str());
+    }
+    master_db.exec("COMMIT");
+    master.flush();
+
+    // Replica has a stale/partial subset (rows 5000-7000 with different values).
+    replica_db.exec("BEGIN");
+    for (int i = 5000; i <= 7000; ++i) {
+        std::string val = random_string(rng);  // different seed state = different values
+        replica_db.exec(("INSERT INTO t1 VALUES (" +
+                         std::to_string(i) + ", '" + val + "')").c_str());
+    }
+    replica_db.exec("COMMIT");
+
+    Replica replica(replica_db.db);
+    handshake(master, replica);
+
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 10000);
+    check_convergence(master_db, replica_db, "t1");
+}
+
 TEST_CASE("stress: peer diff sync after random divergence") {
     DB client_db, server_db;
     const char* schema =

@@ -199,3 +199,38 @@ TEST_CASE("PeerMessage round-trip (AsReplica)") {
     auto& ack = std::get<AckMsg>(decoded.payload);
     CHECK(ack.seq == 99);
 }
+
+TEST_CASE("deserialize rejects oversized message") {
+    // Create a buffer that exceeds kMaxMessageSize.
+    std::vector<std::uint8_t> buf(kMaxMessageSize + 5 + 1);
+    // Write a valid length prefix (content = kMaxMessageSize + 1).
+    auto len = static_cast<std::uint32_t>(kMaxMessageSize + 1);
+    buf[0] = static_cast<std::uint8_t>(len);
+    buf[1] = static_cast<std::uint8_t>(len >> 8);
+    buf[2] = static_cast<std::uint8_t>(len >> 16);
+    buf[3] = static_cast<std::uint8_t>(len >> 24);
+    buf[4] = static_cast<std::uint8_t>(MessageTag::Hello);
+
+    CHECK_THROWS_AS(deserialize(buf), Error);
+}
+
+TEST_CASE("deserialize rejects absurd array count") {
+    // Craft a BucketHashesMsg with count = 0xFFFFFFFF.
+    std::vector<std::uint8_t> buf;
+    // Length prefix (placeholder).
+    buf.resize(4);
+    buf.push_back(static_cast<std::uint8_t>(MessageTag::BucketHashes));
+    // count = 0xFFFFFFFF (> kMaxArrayCount).
+    buf.push_back(0xFF);
+    buf.push_back(0xFF);
+    buf.push_back(0xFF);
+    buf.push_back(0xFF);
+    // Patch length.
+    auto total = static_cast<std::uint32_t>(buf.size() - 4);
+    buf[0] = static_cast<std::uint8_t>(total);
+    buf[1] = static_cast<std::uint8_t>(total >> 8);
+    buf[2] = static_cast<std::uint8_t>(total >> 16);
+    buf[3] = static_cast<std::uint8_t>(total >> 24);
+
+    CHECK_THROWS_AS(deserialize(buf), Error);
+}

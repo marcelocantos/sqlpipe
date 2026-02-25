@@ -331,6 +331,10 @@ public:
 
     std::string read_string() {
         auto len = read_u32();
+        if (len > kMaxMessageSize) {
+            throw Error(ErrorCode::ProtocolError,
+                        "string length exceeds limit");
+        }
         check(len);
         std::string s(reinterpret_cast<const char*>(data_ + pos_), len);
         pos_ += len;
@@ -490,12 +494,25 @@ Message deserialize(std::span<const std::uint8_t> buf) {
     if (buf.size() < 5) {
         throw Error(ErrorCode::ProtocolError, "message too short");
     }
+    if (buf.size() > kMaxMessageSize + 4) {
+        throw Error(ErrorCode::ProtocolError,
+                    "message exceeds maximum size (" +
+                    std::to_string(buf.size()) + " bytes)");
+    }
 
     Reader r(buf);
     auto total_len = r.read_u32();
     (void)total_len;  // already have the full buffer
 
     auto tag = static_cast<MessageTag>(r.read_u8());
+
+    auto check_count = [](std::uint32_t n) {
+        if (n > kMaxArrayCount) {
+            throw Error(ErrorCode::ProtocolError,
+                        "array count exceeds limit (" +
+                        std::to_string(n) + ")");
+        }
+    };
 
     switch (tag) {
     case MessageTag::Hello: {
@@ -504,6 +521,7 @@ Message deserialize(std::span<const std::uint8_t> buf) {
         m.schema_version = r.read_i32();
         if (!r.at_end()) {
             auto count = r.read_u32();
+            check_count(count);
             for (std::uint32_t i = 0; i < count; ++i) {
                 m.owned_tables.insert(r.read_string());
             }
@@ -530,6 +548,7 @@ Message deserialize(std::span<const std::uint8_t> buf) {
     case MessageTag::BucketHashes: {
         BucketHashesMsg m;
         auto count = r.read_u32();
+        check_count(count);
         m.buckets.resize(count);
         for (std::uint32_t i = 0; i < count; ++i) {
             m.buckets[i].table = r.read_string();
@@ -543,6 +562,7 @@ Message deserialize(std::span<const std::uint8_t> buf) {
     case MessageTag::NeedBuckets: {
         NeedBucketsMsg m;
         auto count = r.read_u32();
+        check_count(count);
         m.ranges.resize(count);
         for (std::uint32_t i = 0; i < count; ++i) {
             m.ranges[i].table = r.read_string();
@@ -554,12 +574,14 @@ Message deserialize(std::span<const std::uint8_t> buf) {
     case MessageTag::RowHashes: {
         RowHashesMsg m;
         auto entry_count = r.read_u32();
+        check_count(entry_count);
         m.entries.resize(entry_count);
         for (std::uint32_t i = 0; i < entry_count; ++i) {
             m.entries[i].table = r.read_string();
             m.entries[i].lo = r.read_i64();
             m.entries[i].hi = r.read_i64();
             auto run_count = r.read_u32();
+            check_count(run_count);
             m.entries[i].runs.resize(run_count);
             for (std::uint32_t j = 0; j < run_count; ++j) {
                 m.entries[i].runs[j].start_rowid = r.read_i64();
@@ -579,10 +601,12 @@ Message deserialize(std::span<const std::uint8_t> buf) {
         m.seq = r.read_i64();
         m.patchset = r.read_changeset();
         auto del_count = r.read_u32();
+        check_count(del_count);
         m.deletes.resize(del_count);
         for (std::uint32_t i = 0; i < del_count; ++i) {
             m.deletes[i].table = r.read_string();
             auto rid_count = r.read_u32();
+            check_count(rid_count);
             m.deletes[i].rowids.resize(rid_count);
             for (std::uint32_t j = 0; j < rid_count; ++j) {
                 m.deletes[i].rowids[j] = r.read_i64();
@@ -1297,14 +1321,24 @@ struct Master::Impl {
 
         auto my_sv = detail::compute_schema_fingerprint(db, filter());
 
-        // Schema mismatch → error (caller should use sqlift or similar).
+        // Schema mismatch → invoke callback or error.
         if (hello.schema_version != my_sv) {
-            SPDLOG_INFO("schema mismatch (replica={}, master={})",
-                        hello.schema_version, my_sv);
-            return {ErrorMsg{ErrorCode::SchemaMismatch,
-                "schema mismatch: replica=" +
-                std::to_string(hello.schema_version) +
-                " master=" + std::to_string(my_sv)}};
+            if (config.on_schema_mismatch &&
+                config.on_schema_mismatch(hello.schema_version, my_sv)) {
+                // Callback may have modified the schema. Recompute.
+                cached_sv = detail::compute_schema_fingerprint(db, filter());
+                scan_tables();
+                recreate_session();
+                my_sv = cached_sv;
+            }
+            if (hello.schema_version != my_sv) {
+                SPDLOG_INFO("schema mismatch (replica={}, master={})",
+                            hello.schema_version, my_sv);
+                return {ErrorMsg{ErrorCode::SchemaMismatch,
+                    "schema mismatch: replica=" +
+                    std::to_string(hello.schema_version) +
+                    " master=" + std::to_string(my_sv)}};
+            }
         }
 
         hs_state = HSState::WaitBucketHashes;
@@ -1987,6 +2021,20 @@ HandleResult Replica::handle_message(const Message& msg) {
             return {{AckMsg{m.seq}}, std::move(events), {}};
         }
         else if constexpr (std::is_same_v<T, ErrorMsg>) {
+            if (m.code == ErrorCode::SchemaMismatch &&
+                impl_->config.on_schema_mismatch) {
+                auto my_sv = schema_version();
+                if (impl_->config.on_schema_mismatch(my_sv, my_sv)) {
+                    // Callback modified the local schema. Reset to Init
+                    // so the caller can retry the handshake.
+                    SPDLOG_INFO("schema mismatch resolved by callback, "
+                                "resetting to Init");
+                    impl_->state = State::Init;
+                    impl_->seq = detail::read_seq(
+                        impl_->db, impl_->config.seq_key);
+                    return {};
+                }
+            }
             impl_->state = State::Error;
             SPDLOG_ERROR("received error from master: {}", m.detail);
             return {};
@@ -2007,6 +2055,75 @@ HandleResult Replica::handle_message(const Message& msg) {
     }
 
     return result;
+}
+
+HandleResult Replica::handle_messages(std::span<const Message> msgs) {
+    HandleResult combined;
+    std::set<std::string> affected;
+
+    for (const auto& msg : msgs) {
+        auto result = std::visit([&](const auto& m) -> HandleResult {
+            using T = std::decay_t<decltype(m)>;
+
+            if constexpr (std::is_same_v<T, HelloMsg>) {
+                return impl_->handle_hello_from_master(m);
+            }
+            else if constexpr (std::is_same_v<T, NeedBucketsMsg>) {
+                return impl_->handle_need_buckets(m);
+            }
+            else if constexpr (std::is_same_v<T, DiffReadyMsg>) {
+                return impl_->handle_diff_ready(m);
+            }
+            else if constexpr (std::is_same_v<T, ChangesetMsg>) {
+                if (impl_->state != State::Live) {
+                    impl_->state = State::Error;
+                    return {{ErrorMsg{ErrorCode::InvalidState,
+                        "received ChangesetMsg in unexpected state"}}, {}, {}};
+                }
+                auto events = impl_->apply_changeset(m.data, m.seq);
+                SPDLOG_DEBUG("applied changeset seq={}", m.seq);
+                return {{AckMsg{m.seq}}, std::move(events), {}};
+            }
+            else if constexpr (std::is_same_v<T, ErrorMsg>) {
+                if (m.code == ErrorCode::SchemaMismatch &&
+                    impl_->config.on_schema_mismatch) {
+                    auto my_sv = schema_version();
+                    if (impl_->config.on_schema_mismatch(my_sv, my_sv)) {
+                        SPDLOG_INFO("schema mismatch resolved by callback, "
+                                    "resetting to Init");
+                        impl_->state = State::Init;
+                        impl_->seq = detail::read_seq(
+                            impl_->db, impl_->config.seq_key);
+                        return {};
+                    }
+                }
+                impl_->state = State::Error;
+                SPDLOG_ERROR("received error from master: {}", m.detail);
+                return {};
+            }
+            else {
+                return {{ErrorMsg{ErrorCode::InvalidState,
+                    "unexpected message type from master"}}, {}, {}};
+            }
+        }, msg);
+
+        combined.messages.insert(combined.messages.end(),
+                                 result.messages.begin(),
+                                 result.messages.end());
+        for (const auto& ev : result.changes) {
+            if (!ev.table.empty()) affected.insert(ev.table);
+        }
+        combined.changes.insert(combined.changes.end(),
+                                result.changes.begin(),
+                                result.changes.end());
+    }
+
+    // Evaluate subscriptions once for all accumulated changes.
+    if (!affected.empty() && !impl_->subscriptions.empty()) {
+        combined.subscriptions = impl_->evaluate_invalidated(affected);
+    }
+
+    return combined;
 }
 
 QueryResult Replica::subscribe(const std::string& sql) {
@@ -2166,6 +2283,7 @@ struct Peer::Impl {
         mc.table_filter = my_tables;
         mc.seq_key = "master_seq";
         mc.on_progress = config.on_progress;
+        mc.on_schema_mismatch = config.on_schema_mismatch;
         master = std::make_unique<Master>(db, mc);
     }
 
@@ -2175,6 +2293,7 @@ struct Peer::Impl {
         rc.table_filter = their_tables;
         rc.seq_key = "replica_seq";
         rc.on_progress = config.on_progress;
+        rc.on_schema_mismatch = config.on_schema_mismatch;
         replica = std::make_unique<Replica>(db, rc);
     }
 

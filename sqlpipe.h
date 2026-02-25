@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#define SQLPIPE_VERSION       "0.4.0"
+#define SQLPIPE_VERSION       "0.5.0"
 #define SQLPIPE_VERSION_MAJOR 0
-#define SQLPIPE_VERSION_MINOR 4
+#define SQLPIPE_VERSION_MINOR 5
 #define SQLPIPE_VERSION_PATCH 0
 
 #include <cstdint>
@@ -79,6 +79,12 @@ using ConflictCallback = std::function<ConflictAction(
 /// Default bucket size for the diff protocol (rows per bucket).
 inline constexpr std::int64_t kDefaultBucketSize = 1024;
 
+/// Maximum serialized message size accepted by deserialize() (64 MB).
+inline constexpr std::size_t kMaxMessageSize = 64 * 1024 * 1024;
+
+/// Maximum number of elements in a deserialized array (10 M).
+inline constexpr std::uint32_t kMaxArrayCount = 10'000'000;
+
 /// Opaque handle for a query subscription.
 using SubscriptionId = std::uint64_t;
 
@@ -110,6 +116,14 @@ struct DiffProgress {
 
 /// Callback for diff sync progress reporting.
 using ProgressCallback = std::function<void(const DiffProgress&)>;
+
+/// Called when a schema mismatch is detected during handshake.
+/// Receives (remote_fingerprint, local_fingerprint).
+/// The callback may ALTER the local database to resolve the mismatch.
+/// Return true to recompute fingerprints and retry; false to proceed
+/// with the default behaviour (ErrorMsg on master, Error state on replica).
+using SchemaMismatchCallback = std::function<bool(
+    SchemaVersion remote_sv, SchemaVersion local_sv)>;
 
 } // namespace sqlpipe
 
@@ -287,6 +301,12 @@ struct MasterConfig {
 
     /// Diff sync progress callback. nullptr = no reporting.
     ProgressCallback on_progress = nullptr;
+
+    /// Called when a replica's schema fingerprint doesn't match.
+    /// The callback may ALTER the local DB to resolve the mismatch,
+    /// then return true to recompute and retry the comparison.
+    /// nullptr or returning false = send ErrorMsg (default behaviour).
+    SchemaMismatchCallback on_schema_mismatch = nullptr;
 };
 
 /// The sending side of the replication protocol.
@@ -341,6 +361,13 @@ struct ReplicaConfig {
 
     /// Diff sync progress callback. nullptr = no reporting.
     ProgressCallback on_progress = nullptr;
+
+    /// Called when a SchemaMismatch error is received from the master.
+    /// The callback may ALTER the local DB to match the master's schema,
+    /// then return true to auto-reset to Init state (caller should retry
+    /// the handshake). nullptr or returning false = transition to Error
+    /// state (default behaviour).
+    SchemaMismatchCallback on_schema_mismatch = nullptr;
 };
 
 /// Return type for Replica::handle_message.
@@ -369,6 +396,11 @@ public:
 
     /// Process an incoming message from the master.
     HandleResult handle_message(const Message& msg);
+
+    /// Process multiple messages, deferring subscription evaluation until
+    /// all are applied. More efficient than calling handle_message() in a
+    /// loop when processing a burst of messages.
+    HandleResult handle_messages(std::span<const Message> msgs);
 
     /// Subscribe to a SQL query. Returns the current result immediately.
     /// After each handle_message that changes a table the query reads from,
@@ -434,6 +466,10 @@ struct PeerConfig {
     /// Diff sync progress callback. nullptr = no reporting.
     /// Forwarded to both the internal Master and Replica.
     ProgressCallback on_progress = nullptr;
+
+    /// Called when a schema mismatch is detected during handshake.
+    /// Forwarded to both the internal Master and Replica.
+    SchemaMismatchCallback on_schema_mismatch = nullptr;
 };
 
 /// Identifies whether the sender was acting as master or replica.
