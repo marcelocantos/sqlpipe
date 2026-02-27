@@ -31,7 +31,7 @@ Snapshot as of v0.5.0. Items annotated with stability assessments.
 | `SubscriptionId` | `std::uint64_t` | **Stable** |
 | `ConflictCallback` | `std::function<ConflictAction(ConflictType, const ChangeEvent&)>` | **Stable** |
 | `ProgressCallback` | `std::function<void(const DiffProgress&)>` | **Stable** |
-| `SchemaMismatchCallback` | `std::function<bool(SchemaVersion remote, SchemaVersion local)>` | **Needs review** — see Gaps |
+| `SchemaMismatchCallback` | `std::function<bool(SchemaVersion remote, SchemaVersion local, const std::string& remote_schema_sql)>` | **Stable** |
 | `ApproveOwnershipCallback` | `std::function<bool(const std::set<std::string>&)>` | **Stable** |
 
 ### Enums
@@ -66,7 +66,7 @@ Snapshot as of v0.5.0. Items annotated with stability assessments.
 | `HelloMsg` | `protocol_version, schema_version, owned_tables` | **Stable** |
 | `ChangesetMsg` | `seq, data` | **Stable** |
 | `AckMsg` | `seq` | **Stable** |
-| `ErrorMsg` | `code, detail` | **Stable** |
+| `ErrorMsg` | `code, detail, remote_schema_version, remote_schema_sql` | **Stable** |
 | `BucketHashEntry` | `table, bucket_lo, bucket_hi, hash, row_count` | **Stable** |
 | `BucketHashesMsg` | `buckets` | **Stable** |
 | `NeedBucketRange` | `table, lo, hi` | **Stable** |
@@ -82,15 +82,15 @@ Snapshot as of v0.5.0. Items annotated with stability assessments.
 
 | Struct | Fields | Stability |
 |---|---|---|
-| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch` | **Needs review** — `on_schema_mismatch` (see Gaps) |
-| `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch` | **Needs review** — `on_schema_mismatch` (see Gaps) |
-| `PeerConfig` | `owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch` | **Needs review** — `on_schema_mismatch` (see Gaps) |
+| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch` | **Stable** |
+| `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch` | **Stable** |
+| `PeerConfig` | `owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch` | **Stable** |
 
 ### Constants
 
 | Name | Value | Stability |
 |---|---|---|
-| `kProtocolVersion` | `3` | **Stable** (will increment with breaking wire changes) |
+| `kProtocolVersion` | `4` | **Stable** (will increment with breaking wire changes) |
 | `kDefaultBucketSize` | `1024` | **Stable** |
 | `kMaxMessageSize` | `64 * 1024 * 1024` (64 MB) | **Stable** |
 | `kMaxArrayCount` | `10'000'000` (10 M) | **Stable** |
@@ -194,17 +194,6 @@ class Peer {
 Keys: `seq` (Master/Replica solo), `master_seq` / `replica_seq` (Peer mode).
 
 ## Gaps and prerequisites
-
-### Must fix before 1.0
-
-1. **Schema mismatch callback redesign** — The replica's
-   `on_schema_mismatch` callback currently receives `(my_sv, my_sv)` because
-   the replica does not know the master's schema fingerprint (only that it
-   mismatched). The callback signature promises `(remote_sv, local_sv)` but
-   cannot deliver on the replica side. Fix: extend the `ErrorMsg` wire format
-   (or add a new message) to carry the master's fingerprint or schema SQL,
-   then pass the real remote value. This requires a protocol version bump to
-   v4.
 
 ### Should address before 1.0
 

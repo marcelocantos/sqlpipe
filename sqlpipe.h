@@ -118,12 +118,16 @@ struct DiffProgress {
 using ProgressCallback = std::function<void(const DiffProgress&)>;
 
 /// Called when a schema mismatch is detected during handshake.
-/// Receives (remote_fingerprint, local_fingerprint).
+/// Receives (remote_fingerprint, local_fingerprint, remote_schema_sql).
+/// remote_schema_sql contains the remote side's sorted CREATE TABLE statements
+/// (semicolon-separated). On the master side, this is empty because the replica
+/// only sends a fingerprint in HelloMsg, not its full schema.
 /// The callback may ALTER the local database to resolve the mismatch.
 /// Return true to recompute fingerprints and retry; false to proceed
 /// with the default behaviour (ErrorMsg on master, Error state on replica).
 using SchemaMismatchCallback = std::function<bool(
-    SchemaVersion remote_sv, SchemaVersion local_sv)>;
+    SchemaVersion remote_sv, SchemaVersion local_sv,
+    const std::string& remote_schema_sql)>;
 
 } // namespace sqlpipe
 
@@ -158,7 +162,7 @@ private:
 // ── protocol.h ──────────────────────────────────────────────────
 namespace sqlpipe {
 
-inline constexpr std::uint32_t kProtocolVersion = 3;
+inline constexpr std::uint32_t kProtocolVersion = 4;
 
 // ── Message types ───────────────────────────────────────────────────
 
@@ -182,8 +186,16 @@ struct AckMsg {
 
 /// Protocol-level error. Receiving side should transition to Error state.
 struct ErrorMsg {
-    ErrorCode   code;    ///< Machine-readable error category.
-    std::string detail;  ///< Human-readable description.
+    ErrorCode     code{};                      ///< Machine-readable error category.
+    std::string   detail;                      ///< Human-readable description.
+    SchemaVersion remote_schema_version = 0;   ///< Remote fingerprint (SchemaMismatch only).
+    std::string   remote_schema_sql;           ///< Remote CREATE TABLE SQL (SchemaMismatch only).
+
+    ErrorMsg() = default;
+    ErrorMsg(ErrorCode c, std::string d,
+             SchemaVersion rsv = 0, std::string rsql = {})
+        : code(c), detail(std::move(d)),
+          remote_schema_version(rsv), remote_schema_sql(std::move(rsql)) {}
 };
 
 // ── Diff protocol messages ──────────────────────────────────────────

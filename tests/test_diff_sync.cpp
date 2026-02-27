@@ -101,7 +101,10 @@ TEST_CASE("diff sync: schema mismatch produces ErrorMsg") {
     // Master should detect schema mismatch and send ErrorMsg.
     REQUIRE(master_resp.size() == 1);
     CHECK(std::holds_alternative<ErrorMsg>(master_resp[0]));
-    CHECK(std::get<ErrorMsg>(master_resp[0]).code == ErrorCode::SchemaMismatch);
+    auto& err = std::get<ErrorMsg>(master_resp[0]);
+    CHECK(err.code == ErrorCode::SchemaMismatch);
+    CHECK(err.remote_schema_version == master.schema_version());
+    CHECK(!err.remote_schema_sql.empty());
 }
 
 TEST_CASE("diff sync: populated master vs empty replica") {

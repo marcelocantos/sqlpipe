@@ -455,7 +455,8 @@ TEST_CASE("integration: master schema migration hook resolves mismatch") {
 
     bool callback_called = false;
     MasterConfig mc;
-    mc.on_schema_mismatch = [&](SchemaVersion, SchemaVersion) {
+    mc.on_schema_mismatch = [&](SchemaVersion, SchemaVersion,
+                                const std::string&) {
         callback_called = true;
         // Migrate: add the extra column to match the replica.
         master_db.exec("ALTER TABLE t1 ADD COLUMN extra TEXT");
@@ -476,7 +477,8 @@ TEST_CASE("integration: master schema migration hook returns false") {
     replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT, extra TEXT)");
 
     MasterConfig mc;
-    mc.on_schema_mismatch = [&](SchemaVersion, SchemaVersion) {
+    mc.on_schema_mismatch = [&](SchemaVersion, SchemaVersion,
+                                const std::string&) {
         return false;  // decline to fix
     };
     Master master(master_db.db, mc);
@@ -498,9 +500,14 @@ TEST_CASE("integration: replica schema migration hook resolves mismatch") {
     Master master(master_db.db);
 
     bool callback_called = false;
+    SchemaVersion received_remote_sv = 0;
+    std::string received_remote_sql;
     ReplicaConfig rc;
-    rc.on_schema_mismatch = [&](SchemaVersion, SchemaVersion) {
+    rc.on_schema_mismatch = [&](SchemaVersion remote_sv, SchemaVersion,
+                                const std::string& remote_schema_sql) {
         callback_called = true;
+        received_remote_sv = remote_sv;
+        received_remote_sql = remote_schema_sql;
         // Migrate: add the missing column to match the master.
         replica_db.exec("ALTER TABLE t1 ADD COLUMN extra TEXT");
         return true;
@@ -515,6 +522,9 @@ TEST_CASE("integration: replica schema migration hook resolves mismatch") {
 
     auto result = replica.handle_message(master_resp[0]);
     CHECK(callback_called);
+    // Replica callback must receive the master's real fingerprint and schema.
+    CHECK(received_remote_sv == master.schema_version());
+    CHECK(received_remote_sql.find("extra TEXT") != std::string::npos);
     // Replica should have reset to Init (not Error).
     CHECK(replica.state() == Replica::State::Init);
 

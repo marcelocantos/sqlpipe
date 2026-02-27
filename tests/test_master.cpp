@@ -108,7 +108,10 @@ TEST_CASE("master: schema mismatch returns ErrorMsg") {
 
     REQUIRE(msgs.size() == 1);
     CHECK(std::holds_alternative<ErrorMsg>(msgs[0]));
-    CHECK(std::get<ErrorMsg>(msgs[0]).code == ErrorCode::SchemaMismatch);
+    auto& err = std::get<ErrorMsg>(msgs[0]);
+    CHECK(err.code == ErrorCode::SchemaMismatch);
+    CHECK(err.remote_schema_version == m.schema_version());
+    CHECK(!err.remote_schema_sql.empty());
 }
 
 TEST_CASE("master: bucket hashes all match produces empty DiffReady") {

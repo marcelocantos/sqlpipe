@@ -275,19 +275,22 @@ can install a callback to run migrations instead:
 
 ```cpp
 MasterConfig mc;
-mc.on_schema_mismatch = [&](SchemaVersion remote, SchemaVersion local) {
+mc.on_schema_mismatch = [&](SchemaVersion remote, SchemaVersion local,
+                            const std::string& /*remote_schema_sql*/) {
     // ALTER the master's DB to match the replica, then return true to retry.
+    // remote_schema_sql is empty on the master side (replica only sends fingerprint).
     sqlite3_exec(master_db, "ALTER TABLE t ADD COLUMN new_col TEXT", 0, 0, 0);
     return true;  // recompute fingerprint and retry
 };
 Master master(master_db, mc);
 
 ReplicaConfig rc;
-rc.on_schema_mismatch = [&](SchemaVersion remote, SchemaVersion local) {
-    // ALTER the replica's DB to match the master, then return true.
-    // The replica will reset to Init — call hello() again to re-handshake.
+rc.on_schema_mismatch = [&](SchemaVersion remote, SchemaVersion local,
+                            const std::string& remote_schema_sql) {
+    // remote_schema_sql contains the master's CREATE TABLE statements.
+    // Use it to determine what ALTER TABLE commands to run.
     sqlite3_exec(replica_db, "ALTER TABLE t ADD COLUMN new_col TEXT", 0, 0, 0);
-    return true;
+    return true;  // reset to Init — call hello() again to re-handshake
 };
 Replica replica(replica_db, rc);
 ```

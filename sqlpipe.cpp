@@ -425,6 +425,8 @@ std::vector<std::uint8_t> serialize(const Message& msg) {
             put_u8(buf, static_cast<std::uint8_t>(MessageTag::Error));
             put_i32(buf, static_cast<std::int32_t>(m.code));
             put_string(buf, m.detail);
+            put_i32(buf, m.remote_schema_version);
+            put_string(buf, m.remote_schema_sql);
         }
         else if constexpr (std::is_same_v<T, BucketHashesMsg>) {
             put_u8(buf, static_cast<std::uint8_t>(MessageTag::BucketHashes));
@@ -543,6 +545,8 @@ Message deserialize(std::span<const std::uint8_t> buf) {
         ErrorMsg m;
         m.code = static_cast<ErrorCode>(r.read_i32());
         m.detail = r.read_string();
+        m.remote_schema_version = r.read_i32();
+        m.remote_schema_sql = r.read_string();
         return m;
     }
     case MessageTag::BucketHashes: {
@@ -1324,7 +1328,7 @@ struct Master::Impl {
         // Schema mismatch → invoke callback or error.
         if (hello.schema_version != my_sv) {
             if (config.on_schema_mismatch &&
-                config.on_schema_mismatch(hello.schema_version, my_sv)) {
+                config.on_schema_mismatch(hello.schema_version, my_sv, "")) {
                 // Callback may have modified the schema. Recompute.
                 cached_sv = detail::compute_schema_fingerprint(db, filter());
                 scan_tables();
@@ -1337,7 +1341,9 @@ struct Master::Impl {
                 return {ErrorMsg{ErrorCode::SchemaMismatch,
                     "schema mismatch: replica=" +
                     std::to_string(hello.schema_version) +
-                    " master=" + std::to_string(my_sv)}};
+                    " master=" + std::to_string(my_sv),
+                    my_sv,
+                    detail::get_schema_sql(db, filter())}};
             }
         }
 
@@ -2024,7 +2030,9 @@ HandleResult Replica::handle_message(const Message& msg) {
             if (m.code == ErrorCode::SchemaMismatch &&
                 impl_->config.on_schema_mismatch) {
                 auto my_sv = schema_version();
-                if (impl_->config.on_schema_mismatch(my_sv, my_sv)) {
+                if (impl_->config.on_schema_mismatch(
+                        m.remote_schema_version, my_sv,
+                        m.remote_schema_sql)) {
                     // Callback modified the local schema. Reset to Init
                     // so the caller can retry the handshake.
                     SPDLOG_INFO("schema mismatch resolved by callback, "
@@ -2088,7 +2096,9 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
                 if (m.code == ErrorCode::SchemaMismatch &&
                     impl_->config.on_schema_mismatch) {
                     auto my_sv = schema_version();
-                    if (impl_->config.on_schema_mismatch(my_sv, my_sv)) {
+                    if (impl_->config.on_schema_mismatch(
+                            m.remote_schema_version, my_sv,
+                            m.remote_schema_sql)) {
                         SPDLOG_INFO("schema mismatch resolved by callback, "
                                     "resetting to Init");
                         impl_->state = State::Init;
