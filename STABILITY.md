@@ -212,10 +212,6 @@ Keys: `seq` (Master/Replica solo), `master_seq` / `replica_seq` (Peer mode).
    Users must manually set include/link paths. At minimum, provide a
    `sqlpipe.pc.in` template.
 
-3. **Single-header amalgamation** — A `dist/sqlpipe.h` that bundles the
-   header and implementation (behind `SQLPIPE_IMPLEMENTATION`) would make
-   vendoring trivial. Add an `mk dist` target to generate it.
-
 ## Out of scope for 1.0
 
 - Subscription prepared statement sharing (statement cache keyed by SQL text
