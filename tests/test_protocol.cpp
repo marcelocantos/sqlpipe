@@ -50,12 +50,27 @@ TEST_CASE("AckMsg round-trip") {
 }
 
 TEST_CASE("ErrorMsg round-trip") {
-    ErrorMsg orig{ErrorCode::SchemaMismatch, "schema differs"};
+    ErrorMsg orig(ErrorCode::SchemaMismatch, "schema differs", 42,
+                  "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);");
     auto buf = serialize(Message{orig});
     auto msg = deserialize(buf);
     auto& m = std::get<ErrorMsg>(msg);
     CHECK(m.code == ErrorCode::SchemaMismatch);
     CHECK(m.detail == "schema differs");
+    CHECK(m.remote_schema_version == 42);
+    CHECK(m.remote_schema_sql ==
+          "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);");
+}
+
+TEST_CASE("ErrorMsg round-trip (non-schema-mismatch defaults)") {
+    ErrorMsg orig(ErrorCode::ProtocolError, "bad version");
+    auto buf = serialize(Message{orig});
+    auto msg = deserialize(buf);
+    auto& m = std::get<ErrorMsg>(msg);
+    CHECK(m.code == ErrorCode::ProtocolError);
+    CHECK(m.detail == "bad version");
+    CHECK(m.remote_schema_version == 0);
+    CHECK(m.remote_schema_sql.empty());
 }
 
 TEST_CASE("BucketHashesMsg round-trip") {

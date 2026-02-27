@@ -7,6 +7,31 @@ breaking changes to the public C++ API, wire format, or internal storage schema
 require a major version bump (which, per project policy, means forking to a new
 product). The pre-1.0 period exists to get these right.
 
+Even when all known gaps are resolved and the surface catalogue shows everything
+as Stable, the project should remain pre-1.0 for a settling period — real-world
+usage over time is the only reliable way to discover API design mistakes that
+aren't obvious from tests and documentation alone. Once 1.0 ships, fixing those
+mistakes becomes extremely costly. Think twice, cut once.
+
+The settling threshold scales with API surface area: count every public function,
+type, enum, constant, wire format, and config field in the interaction surface
+catalogue below, then look up N:
+
+| Surface items | N |
+|---|---|
+| < 20 | 2 |
+| 20–50 | 3 |
+| 50–100 | 4 |
+| > 100 | 5 |
+
+The project is eligible for 1.0 when **either** of these conditions is met:
+
+- **N consecutive minor releases** with zero breaking changes to the surface, OR
+- **N months** since the last breaking change.
+
+Current surface: ~65 items → N = 4. Last breaking change: v0.6.0 (protocol v4,
+callback signature change). Clock starts from that release.
+
 ## Interaction surface catalogue
 
 Snapshot as of v0.5.0. Items annotated with stability assessments.
@@ -31,7 +56,7 @@ Snapshot as of v0.5.0. Items annotated with stability assessments.
 | `SubscriptionId` | `std::uint64_t` | **Stable** |
 | `ConflictCallback` | `std::function<ConflictAction(ConflictType, const ChangeEvent&)>` | **Stable** |
 | `ProgressCallback` | `std::function<void(const DiffProgress&)>` | **Stable** |
-| `SchemaMismatchCallback` | `std::function<bool(SchemaVersion remote, SchemaVersion local)>` | **Needs review** — see Gaps |
+| `SchemaMismatchCallback` | `std::function<bool(SchemaVersion remote, SchemaVersion local, const std::string& remote_schema_sql)>` | **Stable** |
 | `ApproveOwnershipCallback` | `std::function<bool(const std::set<std::string>&)>` | **Stable** |
 
 ### Enums
@@ -66,7 +91,7 @@ Snapshot as of v0.5.0. Items annotated with stability assessments.
 | `HelloMsg` | `protocol_version, schema_version, owned_tables` | **Stable** |
 | `ChangesetMsg` | `seq, data` | **Stable** |
 | `AckMsg` | `seq` | **Stable** |
-| `ErrorMsg` | `code, detail` | **Stable** |
+| `ErrorMsg` | `code, detail, remote_schema_version, remote_schema_sql` | **Stable** |
 | `BucketHashEntry` | `table, bucket_lo, bucket_hi, hash, row_count` | **Stable** |
 | `BucketHashesMsg` | `buckets` | **Stable** |
 | `NeedBucketRange` | `table, lo, hi` | **Stable** |
@@ -82,15 +107,15 @@ Snapshot as of v0.5.0. Items annotated with stability assessments.
 
 | Struct | Fields | Stability |
 |---|---|---|
-| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch` | **Needs review** — `on_schema_mismatch` (see Gaps) |
-| `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch` | **Needs review** — `on_schema_mismatch` (see Gaps) |
-| `PeerConfig` | `owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch` | **Needs review** — `on_schema_mismatch` (see Gaps) |
+| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch` | **Stable** |
+| `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch` | **Stable** |
+| `PeerConfig` | `owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch` | **Stable** |
 
 ### Constants
 
 | Name | Value | Stability |
 |---|---|---|
-| `kProtocolVersion` | `3` | **Stable** (will increment with breaking wire changes) |
+| `kProtocolVersion` | `4` | **Stable** (will increment with breaking wire changes) |
 | `kDefaultBucketSize` | `1024` | **Stable** |
 | `kMaxMessageSize` | `64 * 1024 * 1024` (64 MB) | **Stable** |
 | `kMaxArrayCount` | `10'000'000` (10 M) | **Stable** |
@@ -192,25 +217,6 @@ class Peer {
 | `_sqlpipe_meta` | `CREATE TABLE _sqlpipe_meta(key TEXT PRIMARY KEY, value)` | **Stable** |
 
 Keys: `seq` (Master/Replica solo), `master_seq` / `replica_seq` (Peer mode).
-
-## Gaps and prerequisites
-
-### Must fix before 1.0
-
-1. **Schema mismatch callback redesign** — The replica's
-   `on_schema_mismatch` callback currently receives `(my_sv, my_sv)` because
-   the replica does not know the master's schema fingerprint (only that it
-   mismatched). The callback signature promises `(remote_sv, local_sv)` but
-   cannot deliver on the replica side. Fix: extend the `ErrorMsg` wire format
-   (or add a new message) to carry the master's fingerprint or schema SQL,
-   then pass the real remote value. This requires a protocol version bump to
-   v4.
-
-### Should address before 1.0
-
-2. **Packaging** — No pkg-config `.pc` file or CMake `find_package` module.
-   Users must manually set include/link paths. At minimum, provide a
-   `sqlpipe.pc.in` template.
 
 ## Out of scope for 1.0
 
