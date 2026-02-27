@@ -7,6 +7,31 @@ breaking changes to the public C++ API, wire format, or internal storage schema
 require a major version bump (which, per project policy, means forking to a new
 product). The pre-1.0 period exists to get these right.
 
+Even when all known gaps are resolved and the surface catalogue shows everything
+as Stable, the project should remain pre-1.0 for a settling period — real-world
+usage over time is the only reliable way to discover API design mistakes that
+aren't obvious from tests and documentation alone. Once 1.0 ships, fixing those
+mistakes becomes extremely costly. Think twice, cut once.
+
+The settling threshold scales with API surface area: count every public function,
+type, enum, constant, wire format, and config field in the interaction surface
+catalogue below, then look up N:
+
+| Surface items | N |
+|---|---|
+| < 20 | 2 |
+| 20–50 | 3 |
+| 50–100 | 4 |
+| > 100 | 5 |
+
+The project is eligible for 1.0 when **either** of these conditions is met:
+
+- **N consecutive minor releases** with zero breaking changes to the surface, OR
+- **N months** since the last breaking change.
+
+Current surface: ~65 items → N = 4. Last breaking change: v0.6.0 (protocol v4,
+callback signature change). Clock starts from that release.
+
 ## Interaction surface catalogue
 
 Snapshot as of v0.5.0. Items annotated with stability assessments.
