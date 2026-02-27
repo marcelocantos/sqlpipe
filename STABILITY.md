@@ -193,14 +193,6 @@ class Peer {
 
 Keys: `seq` (Master/Replica solo), `master_seq` / `replica_seq` (Peer mode).
 
-## Gaps and prerequisites
-
-### Should address before 1.0
-
-2. **Packaging** — No pkg-config `.pc` file or CMake `find_package` module.
-   Users must manually set include/link paths. At minimum, provide a
-   `sqlpipe.pc.in` template.
-
 ## Out of scope for 1.0
 
 - Subscription prepared statement sharing (statement cache keyed by SQL text
