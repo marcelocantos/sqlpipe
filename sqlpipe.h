@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#define SQLPIPE_VERSION       "0.5.0"
+#define SQLPIPE_VERSION       "0.6.0"
 #define SQLPIPE_VERSION_MAJOR 0
-#define SQLPIPE_VERSION_MINOR 5
+#define SQLPIPE_VERSION_MINOR 6
 #define SQLPIPE_VERSION_PATCH 0
 
 #include <cstdint>

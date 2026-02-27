@@ -34,15 +34,15 @@ callback signature change). Clock starts from that release.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.5.0. Items annotated with stability assessments.
+Snapshot as of v0.6.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.5.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.6.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `5` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `6` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 
 ### Type aliases
