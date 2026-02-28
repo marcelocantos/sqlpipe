@@ -6,7 +6,7 @@ Streaming replication protocol for SQLite. Two-file library: `sqlpipe.h`
 ## Build
 
 ```sh
-mk test     # build and run all tests (74 cases)
+mk test     # build and run all tests
 mk example  # build and run examples/loopback.cpp
 mk clean    # remove build/
 ```
@@ -120,7 +120,7 @@ mkfile              Build system (mk)
 
 ## Tests
 
-74 test cases across 7 files (all use doctest):
+Test cases across 7 files (all use doctest):
 
 - `test_protocol.cpp` — Serialization round-trips for all message types
   including PeerMessage, diff protocol messages, and LZ4 compression paths
