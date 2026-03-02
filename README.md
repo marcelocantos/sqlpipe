@@ -394,6 +394,11 @@ peers:
 Messages exceeding these limits cause `deserialize()` to throw
 `ProtocolError`. The limits are defined as `inline constexpr` in `sqlpipe.h`.
 
+## Related projects
+
+- **[sqldeep](https://github.com/marcelocantos/sqldeep)** — JSON5-like SQL syntax transpiler. Write nested JSON queries naturally; sqldeep rewrites them into SQLite JSON functions.
+- **[sqlift](https://github.com/marcelocantos/sqlift)** — Declarative SQLite schema migrations. Describe your desired schema; sqlift diffs and applies the changes.
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE) for details.
