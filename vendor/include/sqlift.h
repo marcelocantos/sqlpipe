@@ -4,339 +4,89 @@
 #pragma once
 
 // sqlift - Declarative SQLite schema migration library
+// C API for FFI consumers (cgo, etc.). Data interchange is JSON strings.
+// Callers must free returned strings with sqlift_free().
 
-#define SQLIFT_VERSION "0.11.0"
+#define SQLIFT_VERSION "0.12.0"
 #define SQLIFT_VERSION_MAJOR 0
-#define SQLIFT_VERSION_MINOR 11
+#define SQLIFT_VERSION_MINOR 12
 #define SQLIFT_VERSION_PATCH 0
 
-#include <cstdint>
-#include <map>
-#include <stdexcept>
-#include <string>
-#include <vector>
-#include <sqlite3.h>
+#include <stdint.h>
 
-namespace sqlift {
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// --- error.h ---
-
-
-
-
-class Error : public std::runtime_error {
-    using std::runtime_error::runtime_error;
+// Error types returned by all C wrapper functions.
+enum sqlift_error_type {
+    SQLIFT_OK               = 0,
+    SQLIFT_ERROR            = 1,
+    SQLIFT_PARSE_ERROR      = 2,
+    SQLIFT_EXTRACT_ERROR    = 3,
+    SQLIFT_DIFF_ERROR       = 4,
+    SQLIFT_APPLY_ERROR      = 5,
+    SQLIFT_DRIFT_ERROR      = 6,
+    SQLIFT_DESTRUCTIVE_ERROR = 7,
+    SQLIFT_BREAKING_CHANGE_ERROR = 8,
+    SQLIFT_JSON_ERROR       = 9,
 };
 
-class ParseError : public Error {
-    using Error::Error;
-};
-
-class ExtractError : public Error {
-    using Error::Error;
-};
-
-class DiffError : public Error {
-    using Error::Error;
-};
-
-class ApplyError : public Error {
-    using Error::Error;
-};
-
-class DriftError : public Error {
-    using Error::Error;
-};
-
-class DestructiveError : public Error {
-    using Error::Error;
-};
-
-class BreakingChangeError : public Error {
-    using Error::Error;
-};
-
-class JsonError : public Error {
-    using Error::Error;
-};
-
-
-// --- sqlite_util.h ---
-
-
-
-
-// RAII wrapper for sqlite3*.
-class Database {
-public:
-    explicit Database(const std::string& path,
-                      int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
-    ~Database();
-
-    Database(Database&& other) noexcept;
-    Database& operator=(Database&& other) noexcept;
-    Database(const Database&) = delete;
-    Database& operator=(const Database&) = delete;
-
-    sqlite3* get() const { return db_; }
-    operator sqlite3*() const { return db_; }
-
-    // Execute SQL with no result. Throws Error on failure.
-    void exec(const std::string& sql);
-
-private:
-    sqlite3* db_ = nullptr;
-};
-
-// RAII wrapper for sqlite3_stmt*.
-class Statement {
-public:
-    Statement(sqlite3* db, const std::string& sql);
-    ~Statement();
-
-    Statement(Statement&& other) noexcept;
-    Statement& operator=(Statement&& other) noexcept;
-    Statement(const Statement&) = delete;
-    Statement& operator=(const Statement&) = delete;
-
-    // Step. Returns true if SQLITE_ROW, false if SQLITE_DONE. Throws on error.
-    bool step();
-
-    int64_t column_int(int col) const;
-    std::string column_text(int col) const;
-
-    void bind_text(int param, const std::string& value);
-    void bind_int(int param, int64_t value);
-
-    sqlite3_stmt* get() const { return stmt_; }
-
-private:
-    sqlite3_stmt* stmt_ = nullptr;
-};
-
-
-// --- schema.h ---
-
-
-
-
-// Matches SQLite's table_xinfo hidden field values.
-enum class GeneratedType {
-    Normal  = 0,
-    Virtual = 2,
-    Stored  = 3,
-};
-
-struct Column {
-    std::string name;
-    std::string type;            // Uppercase. Empty if untyped.
-    bool notnull = false;
-    std::string default_value;   // Raw SQL expression; empty if no default.
-    int pk = 0;                  // 0 = not PK, 1+ = position in composite PK.
-    std::string collation;       // e.g. "NOCASE"; empty = default (BINARY).
-    GeneratedType generated = GeneratedType::Normal;
-    std::string generated_expr;  // e.g. "first_name || ' ' || last_name"; empty if not generated.
-
-    bool operator==(const Column&) const = default;
-};
-
-struct CheckConstraint {
-    std::string name;         // empty if unnamed
-    std::string expression;   // e.g. "age > 0"
-    bool operator==(const CheckConstraint&) const = default;
-};
-
-struct ForeignKey {
-    std::string constraint_name;             // empty if unnamed
-    std::vector<std::string> from_columns;
-    std::string to_table;
-    std::vector<std::string> to_columns;
-    std::string on_update = "NO ACTION";
-    std::string on_delete = "NO ACTION";
-
-    // Structural equality — excludes constraint_name (cosmetic).
-    bool operator==(const ForeignKey& o) const {
-        return from_columns == o.from_columns && to_table == o.to_table &&
-               to_columns == o.to_columns && on_update == o.on_update &&
-               on_delete == o.on_delete;
-    }
-};
-
-struct Table {
-    std::string name;
-    std::vector<Column> columns;           // Ordered by cid.
-    std::vector<ForeignKey> foreign_keys;
-    std::vector<CheckConstraint> check_constraints;
-    std::string pk_constraint_name;        // empty if unnamed (cosmetic, excluded from ==).
-    bool without_rowid = false;
-    bool strict = false;
-    std::string raw_sql;                   // Original CREATE TABLE from sqlite_master.
-
-    // Structural equality — excludes raw_sql (which SQLite doesn't update after
-    // ALTER TABLE ADD COLUMN, so it can't be relied on for comparison).
-    bool operator==(const Table& o) const {
-        return name == o.name && columns == o.columns &&
-               foreign_keys == o.foreign_keys &&
-               check_constraints == o.check_constraints &&
-               without_rowid == o.without_rowid &&
-               strict == o.strict;
-    }
-};
-
-struct Index {
-    std::string name;
-    std::string table_name;
-    std::vector<std::string> columns;
-    bool unique = false;
-    std::string where_clause;   // Partial index; empty if not partial.
-    std::string raw_sql;        // Original CREATE INDEX from sqlite_master.
-
-    // Structural equality — excludes raw_sql.
-    bool operator==(const Index& o) const {
-        return name == o.name && table_name == o.table_name &&
-               columns == o.columns && unique == o.unique &&
-               where_clause == o.where_clause;
-    }
-};
-
-struct View {
-    std::string name;
-    std::string sql;
-
-    bool operator==(const View&) const = default;
-};
-
-struct Trigger {
-    std::string name;
-    std::string table_name;
-    std::string sql;
-
-    bool operator==(const Trigger&) const = default;
-};
-
-struct Schema {
-    std::map<std::string, Table>   tables;
-    std::map<std::string, Index>   indexes;
-    std::map<std::string, View>    views;
-    std::map<std::string, Trigger> triggers;
-
-    bool operator==(const Schema&) const = default;
-
-    // Deterministic SHA-256 hash of the schema.
-    std::string hash() const;
-};
-
-
-// --- parse.h ---
-
-
-
-
-// Parse SQL DDL statements into a Schema.
-// Loads the SQL into a :memory: database and extracts the resulting schema.
-Schema parse(const std::string& sql);
-
-
-// --- extract.h ---
-
-
-
-
-// Extract the current schema from a live database.
-Schema extract(sqlite3* db);
-
-
-// --- diff.h ---
-
-
-
-
-enum class WarningType {
-    RedundantIndex,
-};
-
-struct Warning {
-    WarningType type;
-    std::string message;        // Human-readable description.
-    std::string index_name;     // The redundant index.
-    std::string covered_by;     // The covering index name, or "PRIMARY KEY".
-    std::string table_name;
-};
-
-enum class OpType {
-    CreateTable,
-    DropTable,
-    RebuildTable,
-    AddColumn,
-    CreateIndex,
-    DropIndex,
-    CreateView,
-    DropView,
-    CreateTrigger,
-    DropTrigger,
-};
-
-struct Operation {
-    OpType type;
-    std::string object_name;
-    std::string description;
-    std::vector<std::string> sql;
-    bool destructive = false;
-};
-
-class MigrationPlan {
-public:
-    const std::vector<Operation>& operations() const { return ops_; }
-    const std::vector<Warning>& warnings() const { return warnings_; }
-    bool has_destructive_operations() const;
-    bool empty() const { return ops_.empty(); }
-
-private:
-    friend MigrationPlan diff(const Schema& current, const Schema& desired);
-    friend MigrationPlan from_json(const std::string& json_str);
-    std::vector<Operation> ops_;
-    std::vector<Warning> warnings_;
-};
-
-// Pure function: compare two schemas and produce a migration plan.
-MigrationPlan diff(const Schema& current, const Schema& desired);
-
-// Detect redundant indexes in a schema (prefix-duplicate and PK-duplicate).
-std::vector<Warning> detect_redundant_indexes(const Schema& schema);
-
-
-// --- apply.h ---
-
-
-
-
-struct ApplyOptions {
-    bool allow_destructive = false;
-};
-
-// Apply a migration plan to a live database.
-void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts = {});
+// Opaque database handle.
+typedef struct sqlift_db sqlift_db;
+
+// Open a database. Returns NULL on error with err_type/err_msg set.
+// flags: SQLite open flags (0 = default READWRITE|CREATE).
+sqlift_db* sqlift_db_open(const char* path, int flags,
+                          int* err_type, char** err_msg);
+
+// Close a database handle. Safe to call with NULL.
+void sqlift_db_close(sqlift_db* db);
+
+// Execute SQL with no result. Returns 0 on success, non-zero on error.
+int sqlift_db_exec(sqlift_db* db, const char* sql, char** err_msg);
+
+// Parse DDL into a schema. Returns JSON string (caller frees with sqlift_free).
+// On error, returns NULL and sets err_type + err_msg.
+char* sqlift_parse(const char* ddl, int* err_type, char** err_msg);
+
+// Extract schema from an open database. Returns JSON string.
+char* sqlift_extract(sqlift_db* db, int* err_type, char** err_msg);
+
+// Diff two schemas (JSON). Returns migration plan as JSON string.
+char* sqlift_diff(const char* current_json, const char* desired_json,
+                  int* err_type, char** err_msg);
+
+// Apply a migration plan (JSON) to a database.
+// Returns 0 on success, non-zero on error.
+int sqlift_apply(sqlift_db* db, const char* plan_json, int allow_destructive,
+                 int* err_type, char** err_msg);
 
 // Return the migration version counter (0 if no migrations have run).
-int64_t migration_version(sqlite3* db);
+int64_t sqlift_migration_version(sqlift_db* db, int* err_type, char** err_msg);
 
+// Detect redundant indexes in a schema (JSON). Returns warnings as JSON array.
+char* sqlift_detect_redundant_indexes(const char* schema_json,
+                                      int* err_type, char** err_msg);
 
-// --- json.h ---
+// Compute the deterministic SHA-256 hash of a schema (JSON).
+// Returns the hex hash string (caller frees with sqlift_free).
+char* sqlift_schema_hash(const char* schema_json,
+                         int* err_type, char** err_msg);
 
+// Execute a query that returns a single int64 value.
+// Returns 0 on success, non-zero on error.
+int sqlift_db_query_int64(sqlift_db* db, const char* sql,
+                          int64_t* result, char** err_msg);
 
+// Execute a query that returns a single TEXT value.
+// Returns a malloc'd string on success (caller frees with sqlift_free),
+// or NULL on error with err_msg set.
+char* sqlift_db_query_text(sqlift_db* db, const char* sql, char** err_msg);
 
+// Free a string or buffer allocated by the C wrapper.
+void sqlift_free(void* ptr);
 
-// Convert an OpType to its string representation (e.g. OpType::CreateTable -> "CreateTable").
-std::string to_string(OpType type);
-
-// Parse a string into an OpType. Throws JsonError if unrecognized.
-OpType op_type_from_string(const std::string& s);
-
-// Serialize a MigrationPlan to a JSON string.
-std::string to_json(const MigrationPlan& plan);
-
-// Deserialize a MigrationPlan from a JSON string. Throws JsonError on failure.
-MigrationPlan from_json(const std::string& json_str);
-
-
-} // namespace sqlift
+#ifdef __cplusplus
+}
+#endif

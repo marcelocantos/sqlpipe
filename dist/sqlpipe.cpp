@@ -673,29 +673,35 @@ void write_seq(sqlite3* db, Seq seq, const std::string& key) {
 
 SchemaVersion compute_schema_fingerprint(
         sqlite3* db, const std::set<std::string>* filter) {
-    auto tracked = get_tracked_tables(db, filter);
-    auto schema = sqlift::extract(db);
+    auto sql = get_schema_sql(db, filter);
 
-    // Keep only tracked tables.
-    std::map<std::string, sqlift::Table> filtered;
-    for (const auto& name : tracked) {
-        auto it = schema.tables.find(name);
-        if (it != schema.tables.end())
-            filtered.insert(*it);
+    int err_type;
+    char* err_msg = nullptr;
+
+    char* json = sqlift_parse(sql.c_str(), &err_type, &err_msg);
+    if (!json) {
+        std::string msg = err_msg ? err_msg : "unknown error";
+        sqlift_free(err_msg);
+        throw Error(ErrorCode::SqliteError,
+                    "sqlift_parse failed: " + msg);
     }
-    schema.tables = std::move(filtered);
-    schema.indexes.clear();
-    schema.views.clear();
-    schema.triggers.clear();
 
-    auto hex = schema.hash();
+    char* hex = sqlift_schema_hash(json, &err_type, &err_msg);
+    sqlift_free(json);
+    if (!hex) {
+        std::string msg = err_msg ? err_msg : "unknown error";
+        sqlift_free(err_msg);
+        throw Error(ErrorCode::SqliteError,
+                    "sqlift_schema_hash failed: " + msg);
+    }
 
     // FNV-1a 32-bit of the structural hash.
     std::uint32_t hash = 2166136261u;
-    for (char c : hex) {
-        hash ^= static_cast<std::uint8_t>(c);
+    for (const char* p = hex; *p; ++p) {
+        hash ^= static_cast<std::uint8_t>(*p);
         hash *= 16777619u;
     }
+    sqlift_free(hex);
     return static_cast<SchemaVersion>(hash);
 }
 

@@ -5,8 +5,288 @@
 
 #include "sqlift.h"
 
+#include <cstdint>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include <sqlite3.h>
+
+namespace sqlift {
+
+// --- error.h ---
+
+class Error : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+class ParseError : public Error {
+    using Error::Error;
+};
+
+class ExtractError : public Error {
+    using Error::Error;
+};
+
+class DiffError : public Error {
+    using Error::Error;
+};
+
+class ApplyError : public Error {
+    using Error::Error;
+};
+
+class DriftError : public Error {
+    using Error::Error;
+};
+
+class DestructiveError : public Error {
+    using Error::Error;
+};
+
+class BreakingChangeError : public Error {
+    using Error::Error;
+};
+
+class JsonError : public Error {
+    using Error::Error;
+};
+
+// --- sqlite_util.h ---
+
+// RAII wrapper for sqlite3*.
+class Database {
+public:
+    explicit Database(const std::string& path,
+                      int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+    ~Database();
+
+    Database(Database&& other) noexcept;
+    Database& operator=(Database&& other) noexcept;
+    Database(const Database&) = delete;
+    Database& operator=(const Database&) = delete;
+
+    sqlite3* get() const { return db_; }
+    operator sqlite3*() const { return db_; }
+
+    void exec(const std::string& sql);
+
+private:
+    sqlite3* db_ = nullptr;
+};
+
+// RAII wrapper for sqlite3_stmt*.
+class Statement {
+public:
+    Statement(sqlite3* db, const std::string& sql);
+    ~Statement();
+
+    Statement(Statement&& other) noexcept;
+    Statement& operator=(Statement&& other) noexcept;
+    Statement(const Statement&) = delete;
+    Statement& operator=(const Statement&) = delete;
+
+    bool step();
+
+    int64_t column_int(int col) const;
+    std::string column_text(int col) const;
+
+    void bind_text(int param, const std::string& value);
+    void bind_int(int param, int64_t value);
+
+    sqlite3_stmt* get() const { return stmt_; }
+
+private:
+    sqlite3_stmt* stmt_ = nullptr;
+};
+
+// --- schema.h ---
+
+enum class GeneratedType {
+    Normal  = 0,
+    Virtual = 2,
+    Stored  = 3,
+};
+
+struct Column {
+    std::string name;
+    std::string type;
+    bool notnull = false;
+    std::string default_value;
+    int pk = 0;
+    std::string collation;
+    GeneratedType generated = GeneratedType::Normal;
+    std::string generated_expr;
+
+    bool operator==(const Column&) const = default;
+};
+
+struct CheckConstraint {
+    std::string name;
+    std::string expression;
+    bool operator==(const CheckConstraint&) const = default;
+};
+
+struct ForeignKey {
+    std::string constraint_name;
+    std::vector<std::string> from_columns;
+    std::string to_table;
+    std::vector<std::string> to_columns;
+    std::string on_update = "NO ACTION";
+    std::string on_delete = "NO ACTION";
+
+    bool operator==(const ForeignKey& o) const {
+        return from_columns == o.from_columns && to_table == o.to_table &&
+               to_columns == o.to_columns && on_update == o.on_update &&
+               on_delete == o.on_delete;
+    }
+};
+
+struct Table {
+    std::string name;
+    std::vector<Column> columns;
+    std::vector<ForeignKey> foreign_keys;
+    std::vector<CheckConstraint> check_constraints;
+    std::string pk_constraint_name;
+    bool without_rowid = false;
+    bool strict = false;
+    std::string raw_sql;
+
+    bool operator==(const Table& o) const {
+        return name == o.name && columns == o.columns &&
+               foreign_keys == o.foreign_keys &&
+               check_constraints == o.check_constraints &&
+               without_rowid == o.without_rowid &&
+               strict == o.strict;
+    }
+};
+
+struct Index {
+    std::string name;
+    std::string table_name;
+    std::vector<std::string> columns;
+    bool unique = false;
+    std::string where_clause;
+    std::string raw_sql;
+
+    bool operator==(const Index& o) const {
+        return name == o.name && table_name == o.table_name &&
+               columns == o.columns && unique == o.unique &&
+               where_clause == o.where_clause;
+    }
+};
+
+struct View {
+    std::string name;
+    std::string sql;
+
+    bool operator==(const View&) const = default;
+};
+
+struct Trigger {
+    std::string name;
+    std::string table_name;
+    std::string sql;
+
+    bool operator==(const Trigger&) const = default;
+};
+
+struct Schema {
+    std::map<std::string, Table>   tables;
+    std::map<std::string, Index>   indexes;
+    std::map<std::string, View>    views;
+    std::map<std::string, Trigger> triggers;
+
+    bool operator==(const Schema&) const = default;
+
+    std::string hash() const;
+};
+
+// --- parse.h ---
+
+Schema parse(const std::string& sql);
+
+// --- extract.h ---
+
+Schema extract(sqlite3* db);
+
+// --- diff.h ---
+
+enum class WarningType {
+    RedundantIndex,
+};
+
+struct Warning {
+    WarningType type;
+    std::string message;
+    std::string index_name;
+    std::string covered_by;
+    std::string table_name;
+};
+
+enum class OpType {
+    CreateTable,
+    DropTable,
+    RebuildTable,
+    AddColumn,
+    CreateIndex,
+    DropIndex,
+    CreateView,
+    DropView,
+    CreateTrigger,
+    DropTrigger,
+};
+
+struct Operation {
+    OpType type;
+    std::string object_name;
+    std::string description;
+    std::vector<std::string> sql;
+    bool destructive = false;
+};
+
+class MigrationPlan {
+public:
+    const std::vector<Operation>& operations() const { return ops_; }
+    const std::vector<Warning>& warnings() const { return warnings_; }
+    bool has_destructive_operations() const;
+    bool empty() const { return ops_.empty(); }
+
+private:
+    friend MigrationPlan diff(const Schema& current, const Schema& desired);
+    friend MigrationPlan from_json(const std::string& json_str);
+    std::vector<Operation> ops_;
+    std::vector<Warning> warnings_;
+};
+
+MigrationPlan diff(const Schema& current, const Schema& desired);
+
+std::vector<Warning> detect_redundant_indexes(const Schema& schema);
+
+// --- apply.h ---
+
+struct ApplyOptions {
+    bool allow_destructive = false;
+};
+
+void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts = {});
+
+int64_t migration_version(sqlite3* db);
+
+// --- json.h ---
+
+std::string to_string(OpType type);
+OpType op_type_from_string(const std::string& s);
+std::string to_json(const MigrationPlan& plan);
+MigrationPlan from_json(const std::string& json_str);
+std::string schema_to_json(const Schema& schema);
+Schema schema_from_json(const std::string& json_str);
+
+} // namespace sqlift
+
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <set>
@@ -1877,4 +2157,454 @@ MigrationPlan from_json(const std::string& json_str) {
 }
 
 
+// --- schema_json.cpp ---
+
+
+
+
+std::string schema_to_json(const Schema& schema) {
+    nlohmann::json j;
+
+    // Tables
+    auto& jt = j["tables"];
+    jt = nlohmann::json::object();
+    for (const auto& [name, table] : schema.tables) {
+        nlohmann::json jtbl;
+        jtbl["name"] = table.name;
+
+        auto& jcols = jtbl["columns"];
+        jcols = nlohmann::json::array();
+        for (const auto& col : table.columns) {
+            nlohmann::json jcol;
+            jcol["name"] = col.name;
+            jcol["type"] = col.type;
+            jcol["notnull"] = col.notnull;
+            jcol["default_value"] = col.default_value;
+            jcol["pk"] = col.pk;
+            jcol["collation"] = col.collation;
+            jcol["generated"] = static_cast<int>(col.generated);
+            jcol["generated_expr"] = col.generated_expr;
+            jcols.push_back(std::move(jcol));
+        }
+
+        auto& jfks = jtbl["foreign_keys"];
+        jfks = nlohmann::json::array();
+        for (const auto& fk : table.foreign_keys) {
+            nlohmann::json jfk;
+            jfk["constraint_name"] = fk.constraint_name;
+            jfk["from_columns"] = fk.from_columns;
+            jfk["to_table"] = fk.to_table;
+            jfk["to_columns"] = fk.to_columns;
+            jfk["on_update"] = fk.on_update;
+            jfk["on_delete"] = fk.on_delete;
+            jfks.push_back(std::move(jfk));
+        }
+
+        auto& jchks = jtbl["check_constraints"];
+        jchks = nlohmann::json::array();
+        for (const auto& chk : table.check_constraints) {
+            nlohmann::json jchk;
+            jchk["name"] = chk.name;
+            jchk["expression"] = chk.expression;
+            jchks.push_back(std::move(jchk));
+        }
+
+        jtbl["pk_constraint_name"] = table.pk_constraint_name;
+        jtbl["without_rowid"] = table.without_rowid;
+        jtbl["strict"] = table.strict;
+        jtbl["raw_sql"] = table.raw_sql;
+
+        jt[name] = std::move(jtbl);
+    }
+
+    // Indexes
+    auto& ji = j["indexes"];
+    ji = nlohmann::json::object();
+    for (const auto& [name, idx] : schema.indexes) {
+        nlohmann::json jidx;
+        jidx["name"] = idx.name;
+        jidx["table_name"] = idx.table_name;
+        jidx["columns"] = idx.columns;
+        jidx["unique"] = idx.unique;
+        jidx["where_clause"] = idx.where_clause;
+        jidx["raw_sql"] = idx.raw_sql;
+        ji[name] = std::move(jidx);
+    }
+
+    // Views
+    auto& jv = j["views"];
+    jv = nlohmann::json::object();
+    for (const auto& [name, view] : schema.views) {
+        nlohmann::json jview;
+        jview["name"] = view.name;
+        jview["sql"] = view.sql;
+        jv[name] = std::move(jview);
+    }
+
+    // Triggers
+    auto& jtr = j["triggers"];
+    jtr = nlohmann::json::object();
+    for (const auto& [name, trig] : schema.triggers) {
+        nlohmann::json jtrig;
+        jtrig["name"] = trig.name;
+        jtrig["table_name"] = trig.table_name;
+        jtrig["sql"] = trig.sql;
+        jtr[name] = std::move(jtrig);
+    }
+
+    return j.dump(2);
+}
+
+Schema schema_from_json(const std::string& json_str) {
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(json_str);
+    } catch (const nlohmann::json::parse_error& e) {
+        throw JsonError(std::string("Invalid JSON: ") + e.what());
+    }
+
+    if (!j.is_object())
+        throw JsonError("Expected top-level JSON object");
+
+    Schema schema;
+
+    // Tables
+    if (j.contains("tables") && j["tables"].is_object()) {
+        for (const auto& [name, jtbl] : j["tables"].items()) {
+            Table table;
+            table.name = jtbl.value("name", "");
+
+            if (jtbl.contains("columns") && jtbl["columns"].is_array()) {
+                for (const auto& jcol : jtbl["columns"]) {
+                    Column col;
+                    col.name = jcol.value("name", "");
+                    col.type = jcol.value("type", "");
+                    col.notnull = jcol.value("notnull", false);
+                    col.default_value = jcol.value("default_value", "");
+                    col.pk = jcol.value("pk", 0);
+                    col.collation = jcol.value("collation", "");
+                    col.generated = static_cast<GeneratedType>(jcol.value("generated", 0));
+                    col.generated_expr = jcol.value("generated_expr", "");
+                    table.columns.push_back(std::move(col));
+                }
+            }
+
+            if (jtbl.contains("foreign_keys") && jtbl["foreign_keys"].is_array()) {
+                for (const auto& jfk : jtbl["foreign_keys"]) {
+                    ForeignKey fk;
+                    fk.constraint_name = jfk.value("constraint_name", "");
+                    fk.from_columns = jfk.value("from_columns", std::vector<std::string>{});
+                    fk.to_table = jfk.value("to_table", "");
+                    fk.to_columns = jfk.value("to_columns", std::vector<std::string>{});
+                    fk.on_update = jfk.value("on_update", "NO ACTION");
+                    fk.on_delete = jfk.value("on_delete", "NO ACTION");
+                    table.foreign_keys.push_back(std::move(fk));
+                }
+            }
+
+            if (jtbl.contains("check_constraints") && jtbl["check_constraints"].is_array()) {
+                for (const auto& jchk : jtbl["check_constraints"]) {
+                    CheckConstraint chk;
+                    chk.name = jchk.value("name", "");
+                    chk.expression = jchk.value("expression", "");
+                    table.check_constraints.push_back(std::move(chk));
+                }
+            }
+
+            table.pk_constraint_name = jtbl.value("pk_constraint_name", "");
+            table.without_rowid = jtbl.value("without_rowid", false);
+            table.strict = jtbl.value("strict", false);
+            table.raw_sql = jtbl.value("raw_sql", "");
+
+            schema.tables[name] = std::move(table);
+        }
+    }
+
+    // Indexes
+    if (j.contains("indexes") && j["indexes"].is_object()) {
+        for (const auto& [name, jidx] : j["indexes"].items()) {
+            Index idx;
+            idx.name = jidx.value("name", "");
+            idx.table_name = jidx.value("table_name", "");
+            idx.columns = jidx.value("columns", std::vector<std::string>{});
+            idx.unique = jidx.value("unique", false);
+            idx.where_clause = jidx.value("where_clause", "");
+            idx.raw_sql = jidx.value("raw_sql", "");
+            schema.indexes[name] = std::move(idx);
+        }
+    }
+
+    // Views
+    if (j.contains("views") && j["views"].is_object()) {
+        for (const auto& [name, jview] : j["views"].items()) {
+            View view;
+            view.name = jview.value("name", "");
+            view.sql = jview.value("sql", "");
+            schema.views[name] = std::move(view);
+        }
+    }
+
+    // Triggers
+    if (j.contains("triggers") && j["triggers"].is_object()) {
+        for (const auto& [name, jtrig] : j["triggers"].items()) {
+            Trigger trig;
+            trig.name = jtrig.value("name", "");
+            trig.table_name = jtrig.value("table_name", "");
+            trig.sql = jtrig.value("sql", "");
+            schema.triggers[name] = std::move(trig);
+        }
+    }
+
+    return schema;
+}
+
+
 } // namespace sqlift
+
+
+// --- C wrapper ---------------------------------------------------------------
+
+
+namespace {
+
+// Duplicate a std::string to a malloc'd C string (caller frees with sqlift_free).
+char* dup_str(const std::string& s) {
+    char* p = static_cast<char*>(std::malloc(s.size() + 1));
+    if (p) std::memcpy(p, s.c_str(), s.size() + 1);
+    return p;
+}
+
+// Set error output pointers. msg is malloc'd; caller frees with sqlift_free.
+void set_error(int* err_type, char** err_msg, int type, const std::string& msg) {
+    if (err_type) *err_type = type;
+    if (err_msg)  *err_msg = dup_str(msg);
+}
+
+void clear_error(int* err_type, char** err_msg) {
+    if (err_type) *err_type = SQLIFT_OK;
+    if (err_msg)  *err_msg = nullptr;
+}
+
+// Map a C++ exception to the error type enum.
+int classify_exception(const std::exception& e) {
+    if (dynamic_cast<const sqlift::ParseError*>(&e))          return SQLIFT_PARSE_ERROR;
+    if (dynamic_cast<const sqlift::ExtractError*>(&e))        return SQLIFT_EXTRACT_ERROR;
+    if (dynamic_cast<const sqlift::DiffError*>(&e))           return SQLIFT_DIFF_ERROR;
+    if (dynamic_cast<const sqlift::DriftError*>(&e))          return SQLIFT_DRIFT_ERROR;
+    if (dynamic_cast<const sqlift::DestructiveError*>(&e))    return SQLIFT_DESTRUCTIVE_ERROR;
+    if (dynamic_cast<const sqlift::BreakingChangeError*>(&e)) return SQLIFT_BREAKING_CHANGE_ERROR;
+    if (dynamic_cast<const sqlift::JsonError*>(&e))           return SQLIFT_JSON_ERROR;
+    if (dynamic_cast<const sqlift::ApplyError*>(&e))          return SQLIFT_APPLY_ERROR;
+    if (dynamic_cast<const sqlift::Error*>(&e))               return SQLIFT_ERROR;
+    return SQLIFT_ERROR;
+}
+
+// Warning JSON serialization (reused by sqlift_diff and sqlift_detect_redundant_indexes).
+std::string warnings_to_json(const std::vector<sqlift::Warning>& warnings) {
+    std::string s = "[";
+    for (size_t i = 0; i < warnings.size(); ++i) {
+        if (i > 0) s += ',';
+        const auto& w = warnings[i];
+        // Manual JSON to avoid pulling nlohmann into this TU via includes.
+        // The values are simple strings, no escaping issues in practice.
+        s += "{\"type\":\"RedundantIndex\"";
+        s += ",\"message\":\"" + w.message + "\"";
+        s += ",\"index_name\":\"" + w.index_name + "\"";
+        s += ",\"covered_by\":\"" + w.covered_by + "\"";
+        s += ",\"table_name\":\"" + w.table_name + "\"}";
+    }
+    s += "]";
+    return s;
+}
+
+} // namespace
+
+// --- opaque handle -----------------------------------------------------------
+
+struct sqlift_db {
+    sqlift::Database db;
+    explicit sqlift_db(const std::string& path, int flags)
+        : db(path, flags ? flags : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)) {}
+};
+
+// --- C API -------------------------------------------------------------------
+
+extern "C" {
+
+sqlift_db* sqlift_db_open(const char* path, int flags,
+                          int* err_type, char** err_msg) {
+    clear_error(err_type, err_msg);
+    try {
+        return new sqlift_db(path, flags);
+    } catch (const std::exception& e) {
+        set_error(err_type, err_msg, classify_exception(e), e.what());
+        return nullptr;
+    }
+}
+
+void sqlift_db_close(sqlift_db* db) {
+    delete db;
+}
+
+int sqlift_db_exec(sqlift_db* db, const char* sql, char** err_msg) {
+    if (err_msg) *err_msg = nullptr;
+    try {
+        db->db.exec(sql);
+        return 0;
+    } catch (const std::exception& e) {
+        if (err_msg) *err_msg = dup_str(e.what());
+        return 1;
+    }
+}
+
+char* sqlift_parse(const char* ddl, int* err_type, char** err_msg) {
+    clear_error(err_type, err_msg);
+    try {
+        auto schema = sqlift::parse(ddl);
+        return dup_str(sqlift::schema_to_json(schema));
+    } catch (const std::exception& e) {
+        set_error(err_type, err_msg, classify_exception(e), e.what());
+        return nullptr;
+    }
+}
+
+char* sqlift_extract(sqlift_db* db, int* err_type, char** err_msg) {
+    clear_error(err_type, err_msg);
+    try {
+        auto schema = sqlift::extract(db->db);
+        return dup_str(sqlift::schema_to_json(schema));
+    } catch (const std::exception& e) {
+        set_error(err_type, err_msg, classify_exception(e), e.what());
+        return nullptr;
+    }
+}
+
+char* sqlift_diff(const char* current_json, const char* desired_json,
+                  int* err_type, char** err_msg) {
+    clear_error(err_type, err_msg);
+    try {
+        auto current = sqlift::schema_from_json(current_json);
+        auto desired = sqlift::schema_from_json(desired_json);
+        auto plan = sqlift::diff(current, desired);
+        // Include warnings in the plan JSON (they're part of to_json output).
+        return dup_str(sqlift::to_json(plan));
+    } catch (const std::exception& e) {
+        set_error(err_type, err_msg, classify_exception(e), e.what());
+        return nullptr;
+    }
+}
+
+int sqlift_apply(sqlift_db* db, const char* plan_json, int allow_destructive,
+                 int* err_type, char** err_msg) {
+    clear_error(err_type, err_msg);
+    try {
+        auto plan = sqlift::from_json(plan_json);
+        sqlift::ApplyOptions opts;
+        opts.allow_destructive = (allow_destructive != 0);
+        sqlift::apply(db->db, plan, opts);
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(err_type, err_msg, classify_exception(e), e.what());
+        return 1;
+    }
+}
+
+int64_t sqlift_migration_version(sqlift_db* db, int* err_type, char** err_msg) {
+    clear_error(err_type, err_msg);
+    try {
+        return sqlift::migration_version(db->db);
+    } catch (const std::exception& e) {
+        set_error(err_type, err_msg, classify_exception(e), e.what());
+        return -1;
+    }
+}
+
+char* sqlift_detect_redundant_indexes(const char* schema_json,
+                                      int* err_type, char** err_msg) {
+    clear_error(err_type, err_msg);
+    try {
+        auto schema = sqlift::schema_from_json(schema_json);
+        auto warnings = sqlift::detect_redundant_indexes(schema);
+        return dup_str(warnings_to_json(warnings));
+    } catch (const std::exception& e) {
+        set_error(err_type, err_msg, classify_exception(e), e.what());
+        return nullptr;
+    }
+}
+
+char* sqlift_schema_hash(const char* schema_json,
+                         int* err_type, char** err_msg) {
+    clear_error(err_type, err_msg);
+    try {
+        auto schema = sqlift::schema_from_json(schema_json);
+        return dup_str(schema.hash());
+    } catch (const std::exception& e) {
+        set_error(err_type, err_msg, classify_exception(e), e.what());
+        return nullptr;
+    }
+}
+
+int sqlift_db_query_int64(sqlift_db* db, const char* sql,
+                          int64_t* result, char** err_msg) {
+    if (err_msg) *err_msg = nullptr;
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        int rc = sqlite3_prepare_v2(db->db.get(), sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->db.get()));
+            return 1;
+        }
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            if (result) *result = sqlite3_column_int64(stmt, 0);
+            sqlite3_finalize(stmt);
+            return 0;
+        }
+        sqlite3_finalize(stmt);
+        if (rc == SQLITE_DONE) {
+            // No rows -- return 0 as default.
+            if (result) *result = 0;
+            return 0;
+        }
+        if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->db.get()));
+        return 1;
+    } catch (const std::exception& e) {
+        if (err_msg) *err_msg = dup_str(e.what());
+        return 1;
+    }
+}
+
+char* sqlift_db_query_text(sqlift_db* db, const char* sql, char** err_msg) {
+    if (err_msg) *err_msg = nullptr;
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        int rc = sqlite3_prepare_v2(db->db.get(), sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->db.get()));
+            return nullptr;
+        }
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            const char* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            char* result = dup_str(text ? text : "");
+            sqlite3_finalize(stmt);
+            return result;
+        }
+        sqlite3_finalize(stmt);
+        if (rc == SQLITE_DONE) {
+            // No rows -- return empty string.
+            return dup_str("");
+        }
+        if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->db.get()));
+        return nullptr;
+    } catch (const std::exception& e) {
+        if (err_msg) *err_msg = dup_str(e.what());
+        return nullptr;
+    }
+}
+
+void sqlift_free(void* ptr) {
+    std::free(ptr);
+}
+
+} // extern "C"
