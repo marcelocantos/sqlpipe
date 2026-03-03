@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <sqlpipe.h>
 
-#include <spdlog/spdlog.h>
-
 #include <sqlite3.h>
 
 #include <cstdio>
@@ -24,33 +22,6 @@ static HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) 
     return result;
 }
 
-// Perform the multi-step handshake (hello → bucket hashes → row hashes → diff).
-static void handshake(Master& master, Replica& replica) {
-    auto hello = replica.hello();
-    auto resp = master.handle_message(hello);
-    HandleResult r;
-    for (const auto& m : resp) {
-        auto result = replica.handle_message(m);
-        r.messages.insert(r.messages.end(),
-                          result.messages.begin(), result.messages.end());
-    }
-    for (const auto& m : r.messages) {
-        auto result = master.handle_message(m);
-        HandleResult r2;
-        for (const auto& m2 : result) {
-            auto result2 = replica.handle_message(m2);
-            r2.messages.insert(r2.messages.end(),
-                               result2.messages.begin(), result2.messages.end());
-        }
-        for (const auto& m3 : r2.messages) {
-            auto result3 = master.handle_message(m3);
-            for (const auto& m4 : result3) {
-                replica.handle_message(m4);
-            }
-        }
-    }
-}
-
 static void print_events(const std::vector<ChangeEvent>& changes) {
     for (const auto& e : changes) {
         const char* op_str = "?";
@@ -63,9 +34,19 @@ static void print_events(const std::vector<ChangeEvent>& changes) {
     }
 }
 
-int main() {
-    spdlog::set_level(spdlog::level::info);
+static void log_callback(sqlpipe::LogLevel level, std::string_view message) {
+    const char* level_str = "?";
+    switch (level) {
+    case sqlpipe::LogLevel::Debug: level_str = "DEBUG"; break;
+    case sqlpipe::LogLevel::Info:  level_str = "INFO";  break;
+    case sqlpipe::LogLevel::Warn:  level_str = "WARN";  break;
+    case sqlpipe::LogLevel::Error: level_str = "ERROR"; break;
+    }
+    std::fprintf(stderr, "[%s] %.*s\n", level_str,
+                 static_cast<int>(message.size()), message.data());
+}
 
+int main() {
     // Open two in-memory databases.
     sqlite3* master_db = nullptr;
     sqlite3* replica_db = nullptr;
@@ -78,12 +59,17 @@ int main() {
     sqlite3_exec(master_db, schema, nullptr, nullptr, nullptr);
     sqlite3_exec(replica_db, schema, nullptr, nullptr, nullptr);
 
-    Master master(master_db);
-    Replica replica(replica_db);
+    MasterConfig mc;
+    mc.on_log = log_callback;
+    Master master(master_db, mc);
+
+    ReplicaConfig rc;
+    rc.on_log = log_callback;
+    Replica replica(replica_db, rc);
 
     // 1. Handshake (includes diff sync).
     std::printf("=== Handshake ===\n");
-    handshake(master, replica);
+    sync_handshake(master, replica);
     std::printf("Replica state: Live=%d, seq=%lld\n\n",
                 replica.state() == Replica::State::Live,
                 static_cast<long long>(replica.current_seq()));

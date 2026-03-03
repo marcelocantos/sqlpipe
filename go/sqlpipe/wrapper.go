@@ -1,0 +1,850 @@
+// Copyright 2026 Marcelo Cantos
+// SPDX-License-Identifier: Apache-2.0
+
+package sqlpipe
+
+/*
+#cgo CXXFLAGS: -std=c++23 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -I${SRCDIR}/../../dist -I${SRCDIR}/../../vendor/include
+#cgo CFLAGS: -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -I${SRCDIR}/../../vendor/include
+
+#include <stdlib.h>
+#include "sqlpipe_capi.h"
+
+// Forward-declare Go callback trampolines (defined in cgo_exports.go).
+extern void goProgressTrampoline(uintptr_t, uint8_t, const char*, int64_t, int64_t);
+extern int goSchemaMismatchTrampoline(uintptr_t, int32_t, int32_t, const char*);
+extern uint8_t goConflictTrampoline(uintptr_t, uint8_t, const uint8_t*, size_t);
+extern int goApproveOwnershipTrampoline(uintptr_t, const char**, size_t);
+extern void goLogTrampoline(uintptr_t, uint8_t, const char*);
+
+// C trampolines that cast void* ctx to uintptr_t for Go.
+// These cannot be static because CGo needs them as exported symbols.
+void cProgressTrampoline(void* ctx, uint8_t phase, const char* table, int64_t done, int64_t total) {
+	goProgressTrampoline((uintptr_t)ctx, phase, table, done, total);
+}
+int cSchemaMismatchTrampoline(void* ctx, int32_t remote_sv, int32_t local_sv, const char* remote_sql) {
+	return goSchemaMismatchTrampoline((uintptr_t)ctx, remote_sv, local_sv, remote_sql);
+}
+uint8_t cConflictTrampoline(void* ctx, uint8_t ct, const uint8_t* data, size_t len) {
+	return goConflictTrampoline((uintptr_t)ctx, ct, data, len);
+}
+int cApproveOwnershipTrampoline(void* ctx, const char** tables, size_t count) {
+	return goApproveOwnershipTrampoline((uintptr_t)ctx, tables, count);
+}
+void cLogTrampoline(void* ctx, uint8_t level, const char* message) {
+	goLogTrampoline((uintptr_t)ctx, level, message);
+}
+*/
+import "C"
+
+import (
+	"database/sql"
+	"encoding/binary"
+	"math"
+	"reflect"
+	"runtime/cgo"
+	"unsafe"
+
+	sqlite3 "github.com/mattn/go-sqlite3"
+)
+
+// ── DB handle extraction ────────────────────────────────────────
+
+func extractDBHandle(driverConn any) *C.sqlite3 {
+	v := reflect.ValueOf(driverConn).Elem()
+	f := v.FieldByName("db")
+	return (*C.sqlite3)(*(*unsafe.Pointer)(unsafe.Pointer(f.UnsafeAddr())))
+}
+
+func withDBHandle(conn *sql.Conn, fn func(db *C.sqlite3) error) error {
+	return conn.Raw(func(driverConn any) error {
+		_ = driverConn.(*sqlite3.SQLiteConn)
+		return fn(extractDBHandle(driverConn))
+	})
+}
+
+// ── Error conversion ────────────────────────────────────────────
+
+func convertError(e C.sqlpipe_error) error {
+	if e.code == 0 {
+		return nil
+	}
+	err := &Error{Code: ErrorCode(e.code), Msg: C.GoString(e.msg)}
+	C.sqlpipe_free_error(e)
+	return err
+}
+
+// ── Message buffer decoding ─────────────────────────────────────
+
+// decodeMessages reads [u32 count][msg1][msg2]... from a C buffer.
+func decodeMessages(buf C.sqlpipe_buf) ([]Message, error) {
+	if buf.data == nil || buf.len == 0 {
+		return nil, nil
+	}
+	defer C.sqlpipe_free_buf(buf)
+	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
+	return decodeMessagesFromBytes(data)
+}
+
+func decodeMessagesFromBytes(data []byte) ([]Message, error) {
+	if len(data) < 4 {
+		return nil, nil
+	}
+	count := binary.LittleEndian.Uint32(data[:4])
+	pos := 4
+	msgs := make([]Message, 0, count)
+	for i := uint32(0); i < count; i++ {
+		if pos+4 > len(data) {
+			break
+		}
+		mlen := binary.LittleEndian.Uint32(data[pos:])
+		total := 4 + int(mlen)
+		if pos+total > len(data) {
+			break
+		}
+		msg, err := Deserialize(data[pos : pos+total])
+		if err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, msg)
+		pos += total
+	}
+	return msgs, nil
+}
+
+// decodePeerMessages reads [u32 count][pmsg1][pmsg2]... from a C buffer.
+func decodePeerMessages(buf C.sqlpipe_buf) ([]PeerMessage, error) {
+	if buf.data == nil || buf.len == 0 {
+		return nil, nil
+	}
+	defer C.sqlpipe_free_buf(buf)
+	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
+	if len(data) < 4 {
+		return nil, nil
+	}
+	count := binary.LittleEndian.Uint32(data[:4])
+	pos := 4
+	msgs := make([]PeerMessage, 0, count)
+	for i := uint32(0); i < count; i++ {
+		if pos+4 > len(data) {
+			break
+		}
+		mlen := binary.LittleEndian.Uint32(data[pos:])
+		total := 4 + int(mlen)
+		if pos+total > len(data) {
+			break
+		}
+		msg, err := DeserializePeer(data[pos : pos+total])
+		if err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, msg)
+		pos += total
+	}
+	return msgs, nil
+}
+
+// ── Value decoding ──────────────────────────────────────────────
+
+type decoder struct {
+	data []byte
+	pos  int
+}
+
+func (d *decoder) u8() uint8       { v := d.data[d.pos]; d.pos++; return v }
+func (d *decoder) u32() uint32     { v := binary.LittleEndian.Uint32(d.data[d.pos:]); d.pos += 4; return v }
+func (d *decoder) i32() int32      { return int32(d.u32()) }
+func (d *decoder) u64() uint64     { v := binary.LittleEndian.Uint64(d.data[d.pos:]); d.pos += 8; return v }
+func (d *decoder) i64() int64      { return int64(d.u64()) }
+func (d *decoder) str() string     { n := d.u32(); s := string(d.data[d.pos : d.pos+int(n)]); d.pos += int(n); return s }
+func (d *decoder) bytes(n int) []byte { b := make([]byte, n); copy(b, d.data[d.pos:]); d.pos += n; return b }
+
+func (d *decoder) value() Value {
+	tag := d.u8()
+	switch tag {
+	case 0x00:
+		return nil
+	case 0x01:
+		return d.i64()
+	case 0x02:
+		bits := d.u64()
+		return math.Float64frombits(bits)
+	case 0x03:
+		return d.str()
+	case 0x04:
+		n := d.u32()
+		return d.bytes(int(n))
+	default:
+		return nil
+	}
+}
+
+func decodeChangeEvent(data []byte) ChangeEvent {
+	d := &decoder{data: data}
+	table := d.str()
+	op := OpType(d.u8())
+	ncols := d.u32()
+	pkFlags := make([]bool, ncols)
+	for i := uint32(0); i < ncols; i++ {
+		pkFlags[i] = d.u8() != 0
+	}
+	oldCount := d.u32()
+	oldValues := make([]Value, oldCount)
+	for i := uint32(0); i < oldCount; i++ {
+		oldValues[i] = d.value()
+	}
+	newCount := d.u32()
+	newValues := make([]Value, newCount)
+	for i := uint32(0); i < newCount; i++ {
+		newValues[i] = d.value()
+	}
+	return ChangeEvent{
+		Table:     table,
+		Op:        op,
+		PKFlags:   pkFlags,
+		OldValues: oldValues,
+		NewValues: newValues,
+	}
+}
+
+func decodeQueryResult(d *decoder) QueryResult {
+	id := d.u64()
+	colCount := d.u32()
+	columns := make([]string, colCount)
+	for i := uint32(0); i < colCount; i++ {
+		columns[i] = d.str()
+	}
+	rowCount := d.u32()
+	rows := make([][]Value, rowCount)
+	for i := uint32(0); i < rowCount; i++ {
+		row := make([]Value, colCount)
+		for j := uint32(0); j < colCount; j++ {
+			row[j] = d.value()
+		}
+		rows[i] = row
+	}
+	return QueryResult{
+		ID:      SubscriptionID(id),
+		Columns: columns,
+		Rows:    rows,
+	}
+}
+
+// decodeHandleResult decodes the binary HandleResult encoding from C.
+func decodeHandleResult(buf C.sqlpipe_buf) (HandleResult, error) {
+	if buf.data == nil || buf.len == 0 {
+		return HandleResult{}, nil
+	}
+	defer C.sqlpipe_free_buf(buf)
+	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
+	d := &decoder{data: data}
+
+	// Messages.
+	msgCount := d.u32()
+	var msgs []Message
+	for i := uint32(0); i < msgCount; i++ {
+		mlen := binary.LittleEndian.Uint32(d.data[d.pos:])
+		total := 4 + int(mlen)
+		msg, err := Deserialize(d.data[d.pos : d.pos+total])
+		if err != nil {
+			return HandleResult{}, err
+		}
+		msgs = append(msgs, msg)
+		d.pos += total
+	}
+
+	// Changes.
+	changeCount := d.u32()
+	var changes []ChangeEvent
+	for i := uint32(0); i < changeCount; i++ {
+		table := d.str()
+		op := OpType(d.u8())
+		ncols := d.u32()
+		pkFlags := make([]bool, ncols)
+		for j := uint32(0); j < ncols; j++ {
+			pkFlags[j] = d.u8() != 0
+		}
+		oldCount := d.u32()
+		oldValues := make([]Value, oldCount)
+		for j := uint32(0); j < oldCount; j++ {
+			oldValues[j] = d.value()
+		}
+		newCount := d.u32()
+		newValues := make([]Value, newCount)
+		for j := uint32(0); j < newCount; j++ {
+			newValues[j] = d.value()
+		}
+		changes = append(changes, ChangeEvent{
+			Table: table, Op: op, PKFlags: pkFlags,
+			OldValues: oldValues, NewValues: newValues,
+		})
+	}
+
+	// Subscriptions.
+	subCount := d.u32()
+	var subs []QueryResult
+	for i := uint32(0); i < subCount; i++ {
+		subs = append(subs, decodeQueryResult(d))
+	}
+
+	return HandleResult{Messages: msgs, Changes: changes, Subscriptions: subs}, nil
+}
+
+// decodePeerHandleResult decodes the binary PeerHandleResult encoding.
+func decodePeerHandleResult(buf C.sqlpipe_buf) (PeerHandleResult, error) {
+	if buf.data == nil || buf.len == 0 {
+		return PeerHandleResult{}, nil
+	}
+	defer C.sqlpipe_free_buf(buf)
+	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
+	d := &decoder{data: data}
+
+	// PeerMessages.
+	msgCount := d.u32()
+	var msgs []PeerMessage
+	for i := uint32(0); i < msgCount; i++ {
+		mlen := binary.LittleEndian.Uint32(d.data[d.pos:])
+		total := 4 + int(mlen)
+		msg, err := DeserializePeer(d.data[d.pos : d.pos+total])
+		if err != nil {
+			return PeerHandleResult{}, err
+		}
+		msgs = append(msgs, msg)
+		d.pos += total
+	}
+
+	// Changes.
+	changeCount := d.u32()
+	var changes []ChangeEvent
+	for i := uint32(0); i < changeCount; i++ {
+		table := d.str()
+		op := OpType(d.u8())
+		ncols := d.u32()
+		pkFlags := make([]bool, ncols)
+		for j := uint32(0); j < ncols; j++ {
+			pkFlags[j] = d.u8() != 0
+		}
+		oldCount := d.u32()
+		oldValues := make([]Value, oldCount)
+		for j := uint32(0); j < oldCount; j++ {
+			oldValues[j] = d.value()
+		}
+		newCount := d.u32()
+		newValues := make([]Value, newCount)
+		for j := uint32(0); j < newCount; j++ {
+			newValues[j] = d.value()
+		}
+		changes = append(changes, ChangeEvent{
+			Table: table, Op: op, PKFlags: pkFlags,
+			OldValues: oldValues, NewValues: newValues,
+		})
+	}
+
+	return PeerHandleResult{Messages: msgs, Changes: changes}, nil
+}
+
+// ── Callback handle management ──────────────────────────────────
+
+// callbackHandles holds cgo.Handles that must be kept alive for the
+// lifetime of a Master/Replica/Peer. Freed on Close().
+type callbackHandles []cgo.Handle
+
+func (h *callbackHandles) add(v any) cgo.Handle {
+	handle := cgo.NewHandle(v)
+	*h = append(*h, handle)
+	return handle
+}
+
+func (h *callbackHandles) free() {
+	for _, handle := range *h {
+		handle.Delete()
+	}
+	*h = nil
+}
+
+// ── C string array helpers ──────────────────────────────────────
+
+// toCStrings converts a map[string]bool to a C string array.
+// Caller must free with freeCStrings.
+func toCStrings(m map[string]bool) (**C.char, C.size_t) {
+	if len(m) == 0 {
+		return nil, 0
+	}
+	ptrs := make([]*C.char, 0, len(m))
+	for k := range m {
+		ptrs = append(ptrs, C.CString(k))
+	}
+	return &ptrs[0], C.size_t(len(ptrs))
+}
+
+func freeCStrings(ptrs **C.char, n C.size_t) {
+	if ptrs == nil {
+		return
+	}
+	s := unsafe.Slice(ptrs, int(n))
+	for _, p := range s {
+		C.free(unsafe.Pointer(p))
+	}
+}
+
+// tableFilterToCStrings converts a *TableFilter.
+func tableFilterToCStrings(tf *TableFilter) (**C.char, C.size_t) {
+	if tf == nil {
+		return nil, 0
+	}
+	return toCStrings(tf.Tables)
+}
+
+// ── Master ──────────────────────────────────────────────────────
+
+// Master is the sending side of the replication protocol.
+type Master struct {
+	ptr     *C.sqlpipe_master
+	conn    *sql.Conn
+	handles callbackHandles
+}
+
+// NewMaster creates a Master that tracks changes on conn.
+func NewMaster(conn *sql.Conn, config MasterConfig) (*Master, error) {
+	m := &Master{conn: conn}
+	var cfg C.sqlpipe_master_config
+
+	tfPtrs, tfCount := tableFilterToCStrings(config.TableFilter)
+	defer freeCStrings(tfPtrs, tfCount)
+	cfg.table_filter = tfPtrs
+	cfg.table_filter_count = tfCount
+
+	if config.SeqKey != "" {
+		csk := C.CString(config.SeqKey)
+		defer C.free(unsafe.Pointer(csk))
+		cfg.seq_key = csk
+	}
+	cfg.bucket_size = C.int64_t(config.BucketSize)
+
+	if config.OnProgress != nil {
+		h := m.handles.add(config.OnProgress)
+		cfg.on_progress = C.sqlpipe_progress_fn(C.cProgressTrampoline)
+		cfg.progress_ctx = unsafe.Pointer(uintptr(h))
+	}
+	if config.OnSchemaMismatch != nil {
+		h := m.handles.add(config.OnSchemaMismatch)
+		cfg.on_schema_mismatch = C.sqlpipe_schema_mismatch_fn(C.cSchemaMismatchTrampoline)
+		cfg.schema_mismatch_ctx = unsafe.Pointer(uintptr(h))
+	}
+	if config.OnLog != nil {
+		h := m.handles.add(config.OnLog)
+		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
+		cfg.log_ctx = unsafe.Pointer(uintptr(h))
+	}
+
+	err := withDBHandle(conn, func(db *C.sqlite3) error {
+		return convertError(C.sqlpipe_master_new(db, cfg, &m.ptr))
+	})
+	if err != nil {
+		m.handles.free()
+		return nil, err
+	}
+	return m, nil
+}
+
+// Flush extracts the changeset since the last flush and returns messages to send.
+func (m *Master) Flush() ([]Message, error) {
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_master_flush(m.ptr, &buf)); err != nil {
+		return nil, err
+	}
+	return decodeMessages(buf)
+}
+
+// HandleMessage processes an incoming message from a replica.
+func (m *Master) HandleMessage(msg Message) ([]Message, error) {
+	wire := Serialize(msg)
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_master_handle_message(
+		m.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&wire[0])), C.size_t(len(wire)),
+		&buf,
+	)); err != nil {
+		return nil, err
+	}
+	return decodeMessages(buf)
+}
+
+// CurrentSeq returns the latest sequence number.
+func (m *Master) CurrentSeq() Seq {
+	return Seq(C.sqlpipe_master_current_seq(m.ptr))
+}
+
+// SchemaVersion returns the current schema fingerprint.
+func (m *Master) SchemaVersion() SchemaVersion {
+	return SchemaVersion(C.sqlpipe_master_schema_version(m.ptr))
+}
+
+// Close releases the Master.
+func (m *Master) Close() error {
+	if m.ptr != nil {
+		C.sqlpipe_master_free(m.ptr)
+		m.ptr = nil
+	}
+	m.handles.free()
+	return nil
+}
+
+// ── Replica ─────────────────────────────────────────────────────
+
+// Replica is the receiving side of the replication protocol.
+type Replica struct {
+	ptr     *C.sqlpipe_replica
+	conn    *sql.Conn
+	handles callbackHandles
+}
+
+// NewReplica creates a Replica.
+func NewReplica(conn *sql.Conn, config ReplicaConfig) (*Replica, error) {
+	r := &Replica{conn: conn}
+	var cfg C.sqlpipe_replica_config
+
+	if config.OnConflict != nil {
+		h := r.handles.add(config.OnConflict)
+		cfg.on_conflict = C.sqlpipe_conflict_fn(C.cConflictTrampoline)
+		cfg.conflict_ctx = unsafe.Pointer(uintptr(h))
+	}
+
+	tfPtrs, tfCount := tableFilterToCStrings(config.TableFilter)
+	defer freeCStrings(tfPtrs, tfCount)
+	cfg.table_filter = tfPtrs
+	cfg.table_filter_count = tfCount
+
+	if config.SeqKey != "" {
+		csk := C.CString(config.SeqKey)
+		defer C.free(unsafe.Pointer(csk))
+		cfg.seq_key = csk
+	}
+	cfg.bucket_size = C.int64_t(config.BucketSize)
+
+	if config.OnProgress != nil {
+		h := r.handles.add(config.OnProgress)
+		cfg.on_progress = C.sqlpipe_progress_fn(C.cProgressTrampoline)
+		cfg.progress_ctx = unsafe.Pointer(uintptr(h))
+	}
+	if config.OnSchemaMismatch != nil {
+		h := r.handles.add(config.OnSchemaMismatch)
+		cfg.on_schema_mismatch = C.sqlpipe_schema_mismatch_fn(C.cSchemaMismatchTrampoline)
+		cfg.schema_mismatch_ctx = unsafe.Pointer(uintptr(h))
+	}
+	if config.OnLog != nil {
+		h := r.handles.add(config.OnLog)
+		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
+		cfg.log_ctx = unsafe.Pointer(uintptr(h))
+	}
+
+	err := withDBHandle(conn, func(db *C.sqlite3) error {
+		return convertError(C.sqlpipe_replica_new(db, cfg, &r.ptr))
+	})
+	if err != nil {
+		r.handles.free()
+		return nil, err
+	}
+	return r, nil
+}
+
+// Hello generates the initial HelloMsg to send to the master.
+func (r *Replica) Hello() (Message, error) {
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_replica_hello(r.ptr, &buf)); err != nil {
+		return nil, err
+	}
+	defer C.sqlpipe_free_buf(buf)
+	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
+	return Deserialize(data)
+}
+
+// HandleMessage processes an incoming message from the master.
+func (r *Replica) HandleMessage(msg Message) (HandleResult, error) {
+	wire := Serialize(msg)
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_replica_handle_message(
+		r.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&wire[0])), C.size_t(len(wire)),
+		&buf,
+	)); err != nil {
+		return HandleResult{}, err
+	}
+	return decodeHandleResult(buf)
+}
+
+// HandleMessages processes multiple messages, deferring subscription
+// evaluation until all are applied.
+func (r *Replica) HandleMessages(msgs []Message) (HandleResult, error) {
+	// Encode as [u32 count][msg1][msg2]...
+	var enc []byte
+	enc = binary.LittleEndian.AppendUint32(enc, uint32(len(msgs)))
+	for _, msg := range msgs {
+		enc = append(enc, Serialize(msg)...)
+	}
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_replica_handle_messages(
+		r.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&enc[0])), C.size_t(len(enc)),
+		&buf,
+	)); err != nil {
+		return HandleResult{}, err
+	}
+	return decodeHandleResult(buf)
+}
+
+// Subscribe registers a query and returns the current result.
+func (r *Replica) Subscribe(sql string) (QueryResult, error) {
+	csql := C.CString(sql)
+	defer C.free(unsafe.Pointer(csql))
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_replica_subscribe(r.ptr, csql, &buf)); err != nil {
+		return QueryResult{}, err
+	}
+	defer C.sqlpipe_free_buf(buf)
+	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
+	d := &decoder{data: data}
+	return decodeQueryResult(d), nil
+}
+
+// Unsubscribe removes a subscription.
+func (r *Replica) Unsubscribe(id SubscriptionID) error {
+	return convertError(C.sqlpipe_replica_unsubscribe(r.ptr, C.uint64_t(id)))
+}
+
+// Reset returns to Init state for reconnection.
+func (r *Replica) Reset() { C.sqlpipe_replica_reset(r.ptr) }
+
+// State returns the current replica state.
+func (r *Replica) State() ReplicaState {
+	return ReplicaState(C.sqlpipe_replica_state(r.ptr))
+}
+
+// CurrentSeq returns the latest applied sequence number.
+func (r *Replica) CurrentSeq() Seq {
+	return Seq(C.sqlpipe_replica_current_seq(r.ptr))
+}
+
+// SchemaVersion returns the current schema fingerprint.
+func (r *Replica) SchemaVersion() SchemaVersion {
+	return SchemaVersion(C.sqlpipe_replica_schema_version(r.ptr))
+}
+
+// Close releases the Replica.
+func (r *Replica) Close() error {
+	if r.ptr != nil {
+		C.sqlpipe_replica_free(r.ptr)
+		r.ptr = nil
+	}
+	r.handles.free()
+	return nil
+}
+
+// ── Peer ────────────────────────────────────────────────────────
+
+// Peer is a bidirectional replication peer.
+type Peer struct {
+	ptr     *C.sqlpipe_peer
+	conn    *sql.Conn
+	handles callbackHandles
+}
+
+// NewPeer creates a Peer.
+func NewPeer(conn *sql.Conn, config PeerConfig) (*Peer, error) {
+	p := &Peer{conn: conn}
+	var cfg C.sqlpipe_peer_config
+
+	otPtrs, otCount := toCStrings(config.OwnedTables)
+	defer freeCStrings(otPtrs, otCount)
+	cfg.owned_tables = otPtrs
+	cfg.owned_table_count = otCount
+
+	tfPtrs, tfCount := tableFilterToCStrings(config.TableFilter)
+	defer freeCStrings(tfPtrs, tfCount)
+	cfg.table_filter = tfPtrs
+	cfg.table_filter_count = tfCount
+
+	if config.ApproveOwnership != nil {
+		h := p.handles.add(config.ApproveOwnership)
+		cfg.approve_ownership = C.sqlpipe_approve_ownership_fn(C.cApproveOwnershipTrampoline)
+		cfg.approve_ownership_ctx = unsafe.Pointer(uintptr(h))
+	}
+	if config.OnConflict != nil {
+		h := p.handles.add(config.OnConflict)
+		cfg.on_conflict = C.sqlpipe_conflict_fn(C.cConflictTrampoline)
+		cfg.conflict_ctx = unsafe.Pointer(uintptr(h))
+	}
+	if config.OnProgress != nil {
+		h := p.handles.add(config.OnProgress)
+		cfg.on_progress = C.sqlpipe_progress_fn(C.cProgressTrampoline)
+		cfg.progress_ctx = unsafe.Pointer(uintptr(h))
+	}
+	if config.OnSchemaMismatch != nil {
+		h := p.handles.add(config.OnSchemaMismatch)
+		cfg.on_schema_mismatch = C.sqlpipe_schema_mismatch_fn(C.cSchemaMismatchTrampoline)
+		cfg.schema_mismatch_ctx = unsafe.Pointer(uintptr(h))
+	}
+	if config.OnLog != nil {
+		h := p.handles.add(config.OnLog)
+		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
+		cfg.log_ctx = unsafe.Pointer(uintptr(h))
+	}
+
+	err := withDBHandle(conn, func(db *C.sqlite3) error {
+		return convertError(C.sqlpipe_peer_new(db, cfg, &p.ptr))
+	})
+	if err != nil {
+		p.handles.free()
+		return nil, err
+	}
+	return p, nil
+}
+
+// Start initiates the handshake (client only).
+func (p *Peer) Start() ([]PeerMessage, error) {
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_peer_start(p.ptr, &buf)); err != nil {
+		return nil, err
+	}
+	return decodePeerMessages(buf)
+}
+
+// Flush extracts changes on owned tables.
+func (p *Peer) Flush() ([]PeerMessage, error) {
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_peer_flush(p.ptr, &buf)); err != nil {
+		return nil, err
+	}
+	return decodePeerMessages(buf)
+}
+
+// HandleMessage processes an incoming PeerMessage.
+func (p *Peer) HandleMessage(msg PeerMessage) (PeerHandleResult, error) {
+	wire := SerializePeer(msg)
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_peer_handle_message(
+		p.ptr,
+		(*C.uint8_t)(unsafe.Pointer(&wire[0])), C.size_t(len(wire)),
+		&buf,
+	)); err != nil {
+		return PeerHandleResult{}, err
+	}
+	return decodePeerHandleResult(buf)
+}
+
+// Reset returns to Init state for reconnection.
+func (p *Peer) Reset() { C.sqlpipe_peer_reset(p.ptr) }
+
+// State returns the current peer state.
+func (p *Peer) State() PeerState {
+	return PeerState(C.sqlpipe_peer_state(p.ptr))
+}
+
+// OwnedTables returns the tables this peer owns.
+func (p *Peer) OwnedTables() map[string]bool {
+	var arr **C.char
+	var count C.size_t
+	C.sqlpipe_peer_owned_tables(p.ptr, &arr, &count)
+	defer C.sqlpipe_free_string_array(arr, count)
+	return cStringArrayToMap(arr, count)
+}
+
+// RemoteTables returns the tables the remote peer owns.
+func (p *Peer) RemoteTables() map[string]bool {
+	var arr **C.char
+	var count C.size_t
+	C.sqlpipe_peer_remote_tables(p.ptr, &arr, &count)
+	defer C.sqlpipe_free_string_array(arr, count)
+	return cStringArrayToMap(arr, count)
+}
+
+// Close releases the Peer.
+func (p *Peer) Close() error {
+	if p.ptr != nil {
+		C.sqlpipe_peer_free(p.ptr)
+		p.ptr = nil
+	}
+	p.handles.free()
+	return nil
+}
+
+func cStringArrayToMap(arr **C.char, count C.size_t) map[string]bool {
+	if arr == nil || count == 0 {
+		return nil
+	}
+	n := int(count)
+	ptrs := unsafe.Slice(arr, n)
+	m := make(map[string]bool, n)
+	for _, p := range ptrs {
+		m[C.GoString(p)] = true
+	}
+	return m
+}
+
+// ── Convenience utilities ────────────────────────────────────────
+
+// SyncHandshake drives the Master/Replica handshake protocol to completion
+// when both are in the same process. Exchanges messages until no more remain.
+func SyncHandshake(m *Master, r *Replica) error {
+	hello, err := r.Hello()
+	if err != nil {
+		return err
+	}
+	pending, err := m.HandleMessage(hello)
+	if err != nil {
+		return err
+	}
+	for len(pending) > 0 {
+		var forMaster []Message
+		for _, msg := range pending {
+			hr, err := r.HandleMessage(msg)
+			if err != nil {
+				return err
+			}
+			forMaster = append(forMaster, hr.Messages...)
+		}
+		pending = nil
+		for _, msg := range forMaster {
+			resp, err := m.HandleMessage(msg)
+			if err != nil {
+				return err
+			}
+			pending = append(pending, resp...)
+		}
+	}
+	return nil
+}
+
+// SyncPeerHandshake drives the Peer handshake protocol to completion when
+// both peers are in the same process. The client initiates; messages are
+// exchanged until both peers reach Live state or no more messages remain.
+func SyncPeerHandshake(client, server *Peer) error {
+	pendingForServer, err := client.Start()
+	if err != nil {
+		return err
+	}
+	for len(pendingForServer) > 0 ||
+		client.State() != PeerLive || server.State() != PeerLive {
+		var pendingForClient []PeerMessage
+		for _, msg := range pendingForServer {
+			hr, err := server.HandleMessage(msg)
+			if err != nil {
+				return err
+			}
+			pendingForClient = append(pendingForClient, hr.Messages...)
+		}
+		pendingForServer = nil
+		for _, msg := range pendingForClient {
+			hr, err := client.HandleMessage(msg)
+			if err != nil {
+				return err
+			}
+			pendingForServer = append(pendingForServer, hr.Messages...)
+		}
+		if len(pendingForServer) == 0 &&
+			(client.State() != PeerLive || server.State() != PeerLive) {
+			break
+		}
+	}
+	return nil
+}

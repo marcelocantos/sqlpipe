@@ -117,6 +117,14 @@ struct DiffProgress {
 /// Callback for diff sync progress reporting.
 using ProgressCallback = std::function<void(const DiffProgress&)>;
 
+// ── Logging ────────────────────────────────────────────────────────
+
+/// Log severity level.
+enum class LogLevel : uint8_t { Debug = 0, Info, Warn, Error };
+
+/// Callback for library log output. If not set, logs are silently discarded.
+using LogCallback = std::function<void(LogLevel level, std::string_view message)>;
+
 /// Called when a schema mismatch is detected during handshake.
 /// Receives (remote_fingerprint, local_fingerprint, remote_schema_sql).
 /// remote_schema_sql contains the remote side's sorted CREATE TABLE statements
@@ -162,7 +170,7 @@ private:
 // ── protocol.h ──────────────────────────────────────────────────
 namespace sqlpipe {
 
-inline constexpr std::uint32_t kProtocolVersion = 4;
+inline constexpr std::uint32_t kProtocolVersion = 5;
 
 // ── Message types ───────────────────────────────────────────────────
 
@@ -319,6 +327,9 @@ struct MasterConfig {
     /// then return true to recompute and retry the comparison.
     /// nullptr or returning false = send ErrorMsg (default behaviour).
     SchemaMismatchCallback on_schema_mismatch = nullptr;
+
+    /// Log callback. nullptr = discard all log output.
+    LogCallback on_log = nullptr;
 };
 
 /// The sending side of the replication protocol.
@@ -380,6 +391,9 @@ struct ReplicaConfig {
     /// the handshake). nullptr or returning false = transition to Error
     /// state (default behaviour).
     SchemaMismatchCallback on_schema_mismatch = nullptr;
+
+    /// Log callback. nullptr = discard all log output.
+    LogCallback on_log = nullptr;
 };
 
 /// Return type for Replica::handle_message.
@@ -482,6 +496,10 @@ struct PeerConfig {
     /// Called when a schema mismatch is detected during handshake.
     /// Forwarded to both the internal Master and Replica.
     SchemaMismatchCallback on_schema_mismatch = nullptr;
+
+    /// Log callback. nullptr = discard all log output.
+    /// Forwarded to both the internal Master and Replica.
+    LogCallback on_log = nullptr;
 };
 
 /// Identifies whether the sender was acting as master or replica.
@@ -561,5 +579,16 @@ std::vector<std::uint8_t> serialize(const PeerMessage& msg);
 
 /// Deserialize a byte buffer into a PeerMessage.
 PeerMessage deserialize_peer(std::span<const std::uint8_t> buf);
+
+// ── Convenience utilities ───────────────────────────────────────
+
+/// Drive the Master/Replica handshake protocol to completion when both
+/// are in the same process. Exchanges messages until no more remain.
+void sync_handshake(Master& master, Replica& replica);
+
+/// Drive the Peer handshake protocol to completion when both peers are
+/// in the same process. The client initiates; messages are exchanged
+/// until both peers reach Live state or no more messages remain.
+void sync_handshake(Peer& client, Peer& server);
 
 } // namespace sqlpipe

@@ -1,15 +1,20 @@
 // Copyright 2026 The sqlpipe Authors
 // SPDX-License-Identifier: Apache-2.0
 #include "sqlpipe.h"
+#include <sqlift.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <map>
-#include <spdlog/spdlog.h>
+#include <format>
 #include <lz4.h>
 #include <unordered_map>
 #include <unordered_set>
+
+// ── Logging macro ───────────────────────────────────────────────
+#define SQLPIPE_LOG(cb, level, ...) \
+    do { if (cb) (cb)(level, std::format(__VA_ARGS__)); } while(0)
 
 // ── sqlite_util.h ───────────────────────────────────────────────
 namespace sqlpipe::detail {
@@ -135,7 +140,8 @@ SchemaVersion compute_schema_fingerprint(
 /// Rejects WITHOUT ROWID tables.
 /// If filter is non-null, only include tables in the filter.
 std::vector<std::string> get_tracked_tables(
-    sqlite3* db, const std::set<std::string>* filter = nullptr);
+    sqlite3* db, const std::set<std::string>* filter = nullptr,
+    const LogCallback* on_log = nullptr);
 
 /// Get the CREATE TABLE SQL for all tracked user tables.
 /// If filter is non-null, only include tables in the filter.
@@ -667,10 +673,26 @@ void write_seq(sqlite3* db, Seq seq, const std::string& key) {
 
 SchemaVersion compute_schema_fingerprint(
         sqlite3* db, const std::set<std::string>* filter) {
-    auto sql = get_schema_sql(db, filter);
-    // FNV-1a 32-bit.
+    auto tracked = get_tracked_tables(db, filter);
+    auto schema = sqlift::extract(db);
+
+    // Keep only tracked tables.
+    std::map<std::string, sqlift::Table> filtered;
+    for (const auto& name : tracked) {
+        auto it = schema.tables.find(name);
+        if (it != schema.tables.end())
+            filtered.insert(*it);
+    }
+    schema.tables = std::move(filtered);
+    schema.indexes.clear();
+    schema.views.clear();
+    schema.triggers.clear();
+
+    auto hex = schema.hash();
+
+    // FNV-1a 32-bit of the structural hash.
     std::uint32_t hash = 2166136261u;
-    for (char c : sql) {
+    for (char c : hex) {
         hash ^= static_cast<std::uint8_t>(c);
         hash *= 16777619u;
     }
@@ -687,7 +709,8 @@ bool is_without_rowid(sqlite3* db, const std::string& table) {
 }
 
 std::vector<std::string> get_tracked_tables(
-        sqlite3* db, const std::set<std::string>* filter) {
+        sqlite3* db, const std::set<std::string>* filter,
+        const LogCallback* on_log) {
     auto stmt = prepare(db,
         "SELECT name FROM sqlite_master "
         "WHERE type='table' "
@@ -717,7 +740,8 @@ std::vector<std::string> get_tracked_tables(
         }
 
         if (!has_pk) {
-            SPDLOG_WARN("table '{}' has no explicit PRIMARY KEY, skipping", name);
+            SQLPIPE_LOG(on_log ? *on_log : LogCallback{}, LogLevel::Warn,
+                       "table '{}' has no explicit PRIMARY KEY, skipping", name);
             continue;
         }
 
@@ -1270,12 +1294,13 @@ struct Master::Impl {
         cached_sv = detail::compute_schema_fingerprint(db, filter());
         scan_tables();
         recreate_session();
-        SPDLOG_INFO("master initialized at seq={}", seq);
+        SQLPIPE_LOG(config.on_log, LogLevel::Info, "master initialized at seq={}", seq);
     }
 
     void scan_tables() {
-        tracked_tables = detail::get_tracked_tables(db, filter());
-        SPDLOG_INFO("tracking {} tables", tracked_tables.size());
+        tracked_tables = detail::get_tracked_tables(db, filter(),
+            config.on_log ? &config.on_log : nullptr);
+        SQLPIPE_LOG(config.on_log, LogLevel::Info, "tracking {} tables", tracked_tables.size());
     }
 
     void recreate_session() {
@@ -1336,7 +1361,8 @@ struct Master::Impl {
                 my_sv = cached_sv;
             }
             if (hello.schema_version != my_sv) {
-                SPDLOG_INFO("schema mismatch (replica={}, master={})",
+                SQLPIPE_LOG(config.on_log, LogLevel::Info,
+                            "schema mismatch (replica={}, master={})",
                             hello.schema_version, my_sv);
                 return {ErrorMsg{ErrorCode::SchemaMismatch,
                     "schema mismatch: replica=" +
@@ -1348,7 +1374,7 @@ struct Master::Impl {
         }
 
         hs_state = HSState::WaitBucketHashes;
-        SPDLOG_INFO("hello ok, waiting for bucket hashes");
+        SQLPIPE_LOG(config.on_log, LogLevel::Info, "hello ok, waiting for bucket hashes");
         return {HelloMsg{kProtocolVersion, my_sv, {}}};
     }
 
@@ -1442,14 +1468,14 @@ struct Master::Impl {
         if (need.ranges.empty()) {
             // All buckets match. Skip row-hash exchange.
             hs_state = HSState::Live;
-            SPDLOG_INFO("all buckets match, entering live at seq={}", seq);
+            SQLPIPE_LOG(config.on_log, LogLevel::Info, "all buckets match, entering live at seq={}", seq);
             return {NeedBucketsMsg{},
                     DiffReadyMsg{seq, {}, {}}};
         }
 
         pending_ranges = need.ranges;
         hs_state = HSState::WaitRowHashes;
-        SPDLOG_INFO("{} mismatched bucket ranges", need.ranges.size());
+        SQLPIPE_LOG(config.on_log, LogLevel::Info, "{} mismatched bucket ranges", need.ranges.size());
         return {std::move(need)};
     }
 
@@ -1562,7 +1588,7 @@ struct Master::Impl {
 
         hs_state = HSState::Live;
         pending_ranges.clear();
-        SPDLOG_INFO("diff computed, entering live at seq={}", seq);
+        SQLPIPE_LOG(config.on_log, LogLevel::Info, "diff computed, entering live at seq={}", seq);
 
         return {DiffReadyMsg{seq, std::move(combined), std::move(deletes)}};
     }
@@ -1598,7 +1624,7 @@ std::vector<Message> Master::flush() {
     impl_->seq++;
     detail::write_seq(impl_->db, impl_->seq, impl_->config.seq_key);
 
-    SPDLOG_DEBUG("flushed changeset seq={} ({} bytes)", impl_->seq, cs.size());
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "flushed changeset seq={} ({} bytes)", impl_->seq, cs.size());
 
     return {ChangesetMsg{impl_->seq, std::move(cs)}};
 }
@@ -1617,7 +1643,7 @@ std::vector<Message> Master::handle_message(const Message& msg) {
             return impl_->handle_row_hashes(m);
         }
         else if constexpr (std::is_same_v<T, AckMsg>) {
-            SPDLOG_DEBUG("replica acked seq={}", m.seq);
+            SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "replica acked seq={}", m.seq);
             return {};
         }
         else {
@@ -1747,7 +1773,7 @@ struct Replica::Impl {
     void init() {
         detail::ensure_meta_table(db);
         seq = detail::read_seq(db, config.seq_key);
-        SPDLOG_INFO("replica initialized at seq={}", seq);
+        SQLPIPE_LOG(config.on_log, LogLevel::Info, "replica initialized at seq={}", seq);
     }
 
     std::vector<ChangeEvent> apply_changeset(const Changeset& data, Seq new_seq) {
@@ -1817,7 +1843,7 @@ struct Replica::Impl {
                static_cast<std::int64_t>(buckets.size()),
                static_cast<std::int64_t>(buckets.size()));
         state = Replica::State::DiffBuckets;
-        SPDLOG_INFO("sending {} bucket hashes", buckets.size());
+        SQLPIPE_LOG(config.on_log, LogLevel::Info, "sending {} bucket hashes", buckets.size());
         return {{BucketHashesMsg{std::move(buckets)}}, {}, {}};
     }
 
@@ -1832,7 +1858,7 @@ struct Replica::Impl {
 
         if (m.ranges.empty()) {
             // All buckets match; waiting for DiffReadyMsg.
-            SPDLOG_INFO("all buckets match, waiting for DiffReady");
+            SQLPIPE_LOG(config.on_log, LogLevel::Info, "all buckets match, waiting for DiffReady");
             return {};
         }
 
@@ -1880,7 +1906,7 @@ struct Replica::Impl {
             ++ranges_done;
         }
 
-        SPDLOG_INFO("sending row hashes for {} ranges", m.ranges.size());
+        SQLPIPE_LOG(config.on_log, LogLevel::Info, "sending row hashes for {} ranges", m.ranges.size());
         return {{std::move(rh)}, {}, {}};
     }
 
@@ -1976,7 +2002,7 @@ struct Replica::Impl {
         }
 
         state = Replica::State::Live;
-        SPDLOG_INFO("diff applied, entering live at seq={}", seq);
+        SQLPIPE_LOG(config.on_log, LogLevel::Info, "diff applied, entering live at seq={}", seq);
 
         return {{AckMsg{m.seq}}, std::move(events), {}};
     }
@@ -2023,7 +2049,7 @@ HandleResult Replica::handle_message(const Message& msg) {
                     "received ChangesetMsg in unexpected state"}}, {}, {}};
             }
             auto events = impl_->apply_changeset(m.data, m.seq);
-            SPDLOG_DEBUG("applied changeset seq={}", m.seq);
+            SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "applied changeset seq={}", m.seq);
             return {{AckMsg{m.seq}}, std::move(events), {}};
         }
         else if constexpr (std::is_same_v<T, ErrorMsg>) {
@@ -2035,7 +2061,8 @@ HandleResult Replica::handle_message(const Message& msg) {
                         m.remote_schema_sql)) {
                     // Callback modified the local schema. Reset to Init
                     // so the caller can retry the handshake.
-                    SPDLOG_INFO("schema mismatch resolved by callback, "
+                    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info,
+                                "schema mismatch resolved by callback, "
                                 "resetting to Init");
                     impl_->state = State::Init;
                     impl_->seq = detail::read_seq(
@@ -2044,7 +2071,7 @@ HandleResult Replica::handle_message(const Message& msg) {
                 }
             }
             impl_->state = State::Error;
-            SPDLOG_ERROR("received error from master: {}", m.detail);
+            SQLPIPE_LOG(impl_->config.on_log, LogLevel::Error, "received error from master: {}", m.detail);
             return {};
         }
         else {
@@ -2089,7 +2116,7 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
                         "received ChangesetMsg in unexpected state"}}, {}, {}};
                 }
                 auto events = impl_->apply_changeset(m.data, m.seq);
-                SPDLOG_DEBUG("applied changeset seq={}", m.seq);
+                SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "applied changeset seq={}", m.seq);
                 return {{AckMsg{m.seq}}, std::move(events), {}};
             }
             else if constexpr (std::is_same_v<T, ErrorMsg>) {
@@ -2099,7 +2126,8 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
                     if (impl_->config.on_schema_mismatch(
                             m.remote_schema_version, my_sv,
                             m.remote_schema_sql)) {
-                        SPDLOG_INFO("schema mismatch resolved by callback, "
+                        SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info,
+                                    "schema mismatch resolved by callback, "
                                     "resetting to Init");
                         impl_->state = State::Init;
                         impl_->seq = detail::read_seq(
@@ -2108,7 +2136,7 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
                     }
                 }
                 impl_->state = State::Error;
-                SPDLOG_ERROR("received error from master: {}", m.detail);
+                SQLPIPE_LOG(impl_->config.on_log, LogLevel::Error, "received error from master: {}", m.detail);
                 return {};
             }
             else {
@@ -2182,7 +2210,7 @@ void Replica::unsubscribe(SubscriptionId id) {
 void Replica::reset() {
     impl_->state = State::Init;
     impl_->seq = detail::read_seq(impl_->db, impl_->config.seq_key);
-    SPDLOG_INFO("replica reset to Init at seq={}", impl_->seq);
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info, "replica reset to Init at seq={}", impl_->seq);
 }
 
 Seq Replica::current_seq() const { return impl_->seq; }
@@ -2294,6 +2322,7 @@ struct Peer::Impl {
         mc.seq_key = "master_seq";
         mc.on_progress = config.on_progress;
         mc.on_schema_mismatch = config.on_schema_mismatch;
+        mc.on_log = config.on_log;
         master = std::make_unique<Master>(db, mc);
     }
 
@@ -2304,13 +2333,15 @@ struct Peer::Impl {
         rc.seq_key = "replica_seq";
         rc.on_progress = config.on_progress;
         rc.on_schema_mismatch = config.on_schema_mismatch;
+        rc.on_log = config.on_log;
         replica = std::make_unique<Replica>(db, rc);
     }
 
     void check_live() {
         if (master_handshake_done && replica_handshake_done) {
             state = Peer::State::Live;
-            SPDLOG_INFO("peer is live: owning {} tables, replicating {} tables",
+            SQLPIPE_LOG(config.on_log, LogLevel::Info,
+                        "peer is live: owning {} tables, replicating {} tables",
                         my_tables.size(), their_tables.size());
         }
     }
@@ -2480,7 +2511,7 @@ Peer::Peer(sqlite3* db, PeerConfig config)
     impl_->db = db;
     impl_->config = std::move(config);
     detail::ensure_meta_table(db);
-    SPDLOG_INFO("peer created ({})",
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info, "peer created ({})",
                 impl_->is_server() ? "server" : "client");
 }
 
@@ -2550,7 +2581,7 @@ void Peer::reset() {
     impl_->replica.reset();
     impl_->master_handshake_done = false;
     impl_->replica_handshake_done = false;
-    SPDLOG_INFO("peer reset to Init");
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info, "peer reset to Init");
 }
 
 Peer::State Peer::state() const { return impl_->state; }
@@ -2561,6 +2592,50 @@ const std::set<std::string>& Peer::owned_tables() const {
 
 const std::set<std::string>& Peer::remote_tables() const {
     return impl_->their_tables;
+}
+
+// ── Convenience utilities ────────────────────────────────────────
+
+void sync_handshake(Master& master, Replica& replica) {
+    auto pending = master.handle_message(replica.hello());
+    while (!pending.empty()) {
+        std::vector<Message> for_master;
+        for (const auto& msg : pending) {
+            auto hr = replica.handle_message(msg);
+            for_master.insert(for_master.end(),
+                              hr.messages.begin(), hr.messages.end());
+        }
+        pending.clear();
+        for (const auto& msg : for_master) {
+            auto resp = master.handle_message(msg);
+            pending.insert(pending.end(), resp.begin(), resp.end());
+        }
+    }
+}
+
+void sync_handshake(Peer& client, Peer& server) {
+    auto pending_for_server = client.start();
+    while (!pending_for_server.empty() ||
+           client.state() != Peer::State::Live ||
+           server.state() != Peer::State::Live) {
+        std::vector<PeerMessage> pending_for_client;
+        for (const auto& msg : pending_for_server) {
+            auto hr = server.handle_message(msg);
+            pending_for_client.insert(pending_for_client.end(),
+                                      hr.messages.begin(), hr.messages.end());
+        }
+        pending_for_server.clear();
+        for (const auto& msg : pending_for_client) {
+            auto hr = client.handle_message(msg);
+            pending_for_server.insert(pending_for_server.end(),
+                                      hr.messages.begin(), hr.messages.end());
+        }
+        if (pending_for_server.empty() &&
+            (client.state() != Peer::State::Live ||
+             server.state() != Peer::State::Live)) {
+            break;
+        }
+    }
 }
 
 } // namespace sqlpipe
