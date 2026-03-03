@@ -1,3 +1,0 @@
-[submodule "vendor/github.com/gabime/spdlog"]
-	path = vendor/github.com/gabime/spdlog
-	url = https://github.com/gabime/spdlog.git

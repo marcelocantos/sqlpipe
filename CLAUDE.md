@@ -1,7 +1,7 @@
 # sqlpipe
 
-Streaming replication protocol for SQLite. Two-file library: `sqlpipe.h`
-(public API) and `sqlpipe.cpp` (implementation).
+Streaming replication protocol for SQLite. Two-file library: `dist/sqlpipe.h`
+(public API) and `dist/sqlpipe.cpp` (implementation).
 
 ## Build
 
@@ -11,7 +11,17 @@ mk example  # build and run examples/loopback.cpp
 mk clean    # remove build/
 ```
 
-Requires C++20. Uses [mk](https://github.com/marcelocantos/mk) as the build
+### Go wrapper
+
+```sh
+cd go/sqlpipe
+go test -tags libsqlite3 ./...
+```
+
+The `-tags libsqlite3` flag is required — it tells mattn/go-sqlite3 to link
+against the vendored SQLite rather than its bundled copy.
+
+Requires C++23. Uses [mk](https://github.com/marcelocantos/mk) as the build
 system (`mkfile`).
 
 SQLite must be compiled with `-DSQLITE_ENABLE_SESSION
@@ -22,6 +32,7 @@ SQLite must be compiled with `-DSQLITE_ENABLE_SESSION
 - **SQLite3** — vendored in `vendor/src/sqlite3.c` + `vendor/include/sqlite3.h`
 - **LZ4** — vendored in `vendor/src/lz4.c` + `vendor/include/lz4.h` (changeset compression)
 - **spdlog** — git submodule at `vendor/github.com/gabime/spdlog` (header-only)
+- **sqlift** — git submodule at `vendor/github.com/marcelocantos/sqlift` (structural schema diffing)
 - **doctest** — vendored in `vendor/include/doctest.h` (test only)
 
 ## Architecture
@@ -49,9 +60,11 @@ Two sync modes:
 
 ### Key internals
 
-- **Schema fingerprinting** (`compute_schema_fingerprint`): FNV-1a hash of
-  sorted CREATE TABLE SQL. Used instead of `PRAGMA schema_version` because the
-  pragma changes on every DDL, even if the logical schema is unchanged.
+- **Schema fingerprinting** (`compute_schema_fingerprint`): Uses sqlift to
+  extract a structural schema, then hashes it (SHA-256 → FNV-1a 32-bit).
+  Structural hashing means logically equivalent schemas produce the same
+  fingerprint even after ALTER TABLE ADD COLUMN (which doesn't update
+  `sqlite_master.sql` text).
 - **Session extension**: `sqlite3session_create/attach/changeset` for change
   tracking. `sqlite3changeset_apply` on the replica side.
 - **Pimpl**: `Master`, `Replica`, and `Peer` use `struct Impl` behind
@@ -78,11 +91,14 @@ Two sync modes:
   updated result appears in `HandleResult::subscriptions`. Table dependencies
   discovered via `sqlite3_set_authorizer` during prepare. Invalidation is
   table-level (any change to an overlapping table triggers re-evaluation).
+- **`sync_handshake`**: Convenience functions that drive the handshake loop
+  to completion — `sync_handshake(Master&, Replica&)` and
+  `sync_handshake(Peer&, Peer&)`. Used by tests and examples.
 
 ### Wire format
 
 `[4-byte LE length][1-byte tag][payload...]` — see `MessageTag` enum and
-`serialize`/`deserialize` in `sqlpipe.cpp`. Changeset blobs within messages
+`serialize`/`deserialize` in `dist/sqlpipe.cpp`. Changeset blobs within messages
 use a compression framing: `[u32 len][u8 type][data...]` where type `0x00` =
 uncompressed, `0x01` = LZ4. Blobs < 64 bytes are stored uncompressed.
 
@@ -110,8 +126,8 @@ Replica                              Master
 ## File layout
 
 ```
-sqlpipe.h           Public header (types, messages, Master, Replica, Peer)
-sqlpipe.cpp         Implementation (all internals)
+dist/sqlpipe.h      Public header (types, messages, Master, Replica, Peer)
+dist/sqlpipe.cpp    Implementation (all internals)
 tests/              doctest test files
 examples/           loopback.cpp demo
 vendor/             Third-party dependencies
