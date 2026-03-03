@@ -47,3 +47,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `dd51d28`
 - **Outcome**: Tagged v0.6.0 (via bump commit). Includes schema mismatch callback redesign, settling period principle added to STABILITY.md, and various stability fixes from PR #1.
+
+## 2026-03-04 — /release v0.7.0
+
+- **Commit**: `c98b843`
+- **Outcome**: Released v0.7.0. Protocol v5 (sqlift structural schema hashing), callback logging replacing spdlog, Go CGo wrapper, dist/ layout, sync_handshake API. NOTICES updated with doctest and sqlift attribution.

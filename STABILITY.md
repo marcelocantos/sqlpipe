@@ -40,9 +40,9 @@ Snapshot as of v0.7.0. Items annotated with stability assessments.
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.6.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.7.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `6` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `7` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 
 ### Type aliases
