@@ -29,12 +29,12 @@ The project is eligible for 1.0 when **either** of these conditions is met:
 - **N consecutive minor releases** with zero breaking changes to the surface, OR
 - **N months** since the last breaking change.
 
-Current surface: ~65 items → N = 4. Last breaking change: v0.6.0 (protocol v4,
-callback signature change). Clock starts from that release.
+Current surface: ~72 items → N = 4. Last breaking change: v0.7.0 (protocol v5,
+structural schema hashing via sqlift). Clock starts from that release.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.6.0. Items annotated with stability assessments.
+Snapshot as of v0.7.0. Items annotated with stability assessments.
 
 ### Version macros
 
@@ -56,6 +56,7 @@ Snapshot as of v0.6.0. Items annotated with stability assessments.
 | `SubscriptionId` | `std::uint64_t` | **Stable** |
 | `ConflictCallback` | `std::function<ConflictAction(ConflictType, const ChangeEvent&)>` | **Stable** |
 | `ProgressCallback` | `std::function<void(const DiffProgress&)>` | **Stable** |
+| `LogCallback` | `std::function<void(LogLevel, std::string_view)>` | **Stable** |
 | `SchemaMismatchCallback` | `std::function<bool(SchemaVersion remote, SchemaVersion local, const std::string& remote_schema_sql)>` | **Stable** |
 | `ApproveOwnershipCallback` | `std::function<bool(const std::set<std::string>&)>` | **Stable** |
 
@@ -68,6 +69,7 @@ Snapshot as of v0.6.0. Items annotated with stability assessments.
 | `ConflictType` | `Data, NotFound, Conflict, Constraint, ForeignKey` | **Stable** |
 | `ErrorCode` | `Ok=0, SqliteError, ProtocolError, SchemaMismatch, InvalidState, OwnershipRejected, WithoutRowidTable` | **Stable** |
 | `DiffPhase` | `ComputingBuckets, ComparingBuckets, ComputingRowHashes, BuildingPatchset, ApplyingPatchset` | **Stable** |
+| `LogLevel` | `Debug=0, Info, Warn, Error` | **Stable** |
 | `MessageTag` | `Hello=0x01, Changeset=0x03, Ack=0x08, Error=0x09, BucketHashes=0x0A, NeedBuckets=0x0B, RowHashes=0x0C, DiffReady=0x0D` | **Stable** |
 | `SenderRole` | `AsMaster=0, AsReplica=1` | **Stable** |
 | `Replica::State` | `Init, Handshake, DiffBuckets, DiffRows, Live, Error` | **Stable** |
@@ -107,15 +109,15 @@ Snapshot as of v0.6.0. Items annotated with stability assessments.
 
 | Struct | Fields | Stability |
 |---|---|---|
-| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch` | **Stable** |
-| `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch` | **Stable** |
-| `PeerConfig` | `owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch` | **Stable** |
+| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log` | **Stable** |
+| `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log` | **Stable** |
+| `PeerConfig` | `owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch, on_log` | **Stable** |
 
 ### Constants
 
 | Name | Value | Stability |
 |---|---|---|
-| `kProtocolVersion` | `4` | **Stable** (will increment with breaking wire changes) |
+| `kProtocolVersion` | `5` | **Stable** (will increment with breaking wire changes) |
 | `kDefaultBucketSize` | `1024` | **Stable** |
 | `kMaxMessageSize` | `64 * 1024 * 1024` (64 MB) | **Stable** |
 | `kMaxArrayCount` | `10'000'000` (10 M) | **Stable** |
@@ -201,6 +203,8 @@ class Peer {
 | `Message deserialize(std::span<const uint8_t>)` | **Stable** |
 | `std::vector<uint8_t> serialize(const PeerMessage&)` | **Stable** |
 | `PeerMessage deserialize_peer(std::span<const uint8_t>)` | **Stable** |
+| `void sync_handshake(Master&, Replica&)` | **Stable** |
+| `void sync_handshake(Peer& client, Peer& server)` | **Stable** |
 
 ### Wire format
 
