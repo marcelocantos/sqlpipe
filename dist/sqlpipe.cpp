@@ -1667,17 +1667,13 @@ SchemaVersion Master::schema_version() const {
 
 } // namespace sqlpipe
 
-// ── replica.cpp ─────────────────────────────────────────────────
+// ── query_watch.cpp ─────────────────────────────────────────────
 
 namespace sqlpipe {
 
-struct Replica::Impl {
-    sqlite3*       db;
-    ReplicaConfig  config;
-    Seq            seq = 0;
-    Replica::State state = Replica::State::Init;
+struct QueryWatch::Impl {
+    sqlite3* db;
 
-    // Subscription state.
     struct Subscription {
         SubscriptionId               id;
         std::string                  sql;
@@ -1690,17 +1686,6 @@ struct Replica::Impl {
     // Reverse index: table name → subscription IDs that depend on it.
     std::unordered_map<std::string, std::set<SubscriptionId>> table_subs;
     SubscriptionId next_sub_id = 1;
-
-    const std::set<std::string>* filter() const {
-        return config.table_filter ? &*config.table_filter : nullptr;
-    }
-
-    void report(DiffPhase phase, const std::string& table,
-                std::int64_t done, std::int64_t total) {
-        if (config.on_progress) {
-            config.on_progress(DiffProgress{phase, table, done, total});
-        }
-    }
 
     std::set<std::string> discover_tables(const std::string& sql) {
         std::set<std::string> tables;
@@ -1774,6 +1759,95 @@ struct Replica::Impl {
             }
         }
         return results;
+    }
+};
+
+QueryWatch::QueryWatch(sqlite3* db)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->db = db;
+}
+
+QueryWatch::~QueryWatch() = default;
+QueryWatch::QueryWatch(QueryWatch&&) noexcept = default;
+QueryWatch& QueryWatch::operator=(QueryWatch&&) noexcept = default;
+
+QueryResult QueryWatch::subscribe(const std::string& sql) {
+    auto tables = impl_->discover_tables(sql);
+    auto id = impl_->next_sub_id++;
+
+    // Prepare statement once and cache column names.
+    auto stmt = detail::prepare(impl_->db, sql.c_str());
+    int ncols = sqlite3_column_count(stmt.get());
+    std::vector<std::string> columns;
+    columns.reserve(static_cast<std::size_t>(ncols));
+    for (int i = 0; i < ncols; ++i) {
+        const char* name = sqlite3_column_name(stmt.get(), i);
+        columns.push_back(name ? name : "");
+    }
+
+    // Build reverse index entries.
+    for (const auto& t : tables) {
+        impl_->table_subs[t].insert(id);
+    }
+
+    impl_->subscriptions[id] = {id, sql, std::move(tables),
+                                std::move(stmt), std::move(columns), 0};
+    auto [result, hash] = impl_->evaluate_query(impl_->subscriptions[id]);
+    impl_->subscriptions[id].result_hash = hash;
+    return result;
+}
+
+void QueryWatch::unsubscribe(SubscriptionId id) {
+    auto it = impl_->subscriptions.find(id);
+    if (it != impl_->subscriptions.end()) {
+        // Remove reverse index entries.
+        for (const auto& t : it->second.tables) {
+            auto ts_it = impl_->table_subs.find(t);
+            if (ts_it != impl_->table_subs.end()) {
+                ts_it->second.erase(id);
+                if (ts_it->second.empty()) {
+                    impl_->table_subs.erase(ts_it);
+                }
+            }
+        }
+        impl_->subscriptions.erase(it);
+    }
+}
+
+std::vector<QueryResult> QueryWatch::notify(
+        const std::set<std::string>& affected_tables) {
+    return impl_->evaluate_invalidated(affected_tables);
+}
+
+bool QueryWatch::empty() const {
+    return impl_->subscriptions.empty();
+}
+
+} // namespace sqlpipe
+
+// ── replica.cpp ─────────────────────────────────────────────────
+
+namespace sqlpipe {
+
+struct Replica::Impl {
+    sqlite3*       db;
+    ReplicaConfig  config;
+    Seq            seq = 0;
+    Replica::State state = Replica::State::Init;
+    QueryWatch     watch;
+
+    Impl(sqlite3* db_, ReplicaConfig cfg)
+        : db(db_), config(std::move(cfg)), watch(db_) {}
+
+    const std::set<std::string>* filter() const {
+        return config.table_filter ? &*config.table_filter : nullptr;
+    }
+
+    void report(DiffPhase phase, const std::string& table,
+                std::int64_t done, std::int64_t total) {
+        if (config.on_progress) {
+            config.on_progress(DiffProgress{phase, table, done, total});
+        }
     }
 
     void init() {
@@ -2017,9 +2091,7 @@ struct Replica::Impl {
 // ── Public API ──────────────────────────────────────────────────────
 
 Replica::Replica(sqlite3* db, ReplicaConfig config)
-    : impl_(std::make_unique<Impl>()) {
-    impl_->db = db;
-    impl_->config = std::move(config);
+    : impl_(std::make_unique<Impl>(db, std::move(config))) {
     impl_->init();
 }
 
@@ -2087,12 +2159,12 @@ HandleResult Replica::handle_message(const Message& msg) {
     }, msg);
 
     // Evaluate invalidated subscriptions.
-    if (!result.changes.empty() && !impl_->subscriptions.empty()) {
+    if (!result.changes.empty() && !impl_->watch.empty()) {
         std::set<std::string> affected;
         for (const auto& ev : result.changes) {
             if (!ev.table.empty()) affected.insert(ev.table);
         }
-        result.subscriptions = impl_->evaluate_invalidated(affected);
+        result.subscriptions = impl_->watch.notify(affected);
     }
 
     return result;
@@ -2163,54 +2235,19 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
     }
 
     // Evaluate subscriptions once for all accumulated changes.
-    if (!affected.empty() && !impl_->subscriptions.empty()) {
-        combined.subscriptions = impl_->evaluate_invalidated(affected);
+    if (!affected.empty() && !impl_->watch.empty()) {
+        combined.subscriptions = impl_->watch.notify(affected);
     }
 
     return combined;
 }
 
 QueryResult Replica::subscribe(const std::string& sql) {
-    auto tables = impl_->discover_tables(sql);
-    auto id = impl_->next_sub_id++;
-
-    // Prepare statement once and cache column names.
-    auto stmt = detail::prepare(impl_->db, sql.c_str());
-    int ncols = sqlite3_column_count(stmt.get());
-    std::vector<std::string> columns;
-    columns.reserve(static_cast<std::size_t>(ncols));
-    for (int i = 0; i < ncols; ++i) {
-        const char* name = sqlite3_column_name(stmt.get(), i);
-        columns.push_back(name ? name : "");
-    }
-
-    // Build reverse index entries.
-    for (const auto& t : tables) {
-        impl_->table_subs[t].insert(id);
-    }
-
-    impl_->subscriptions[id] = {id, sql, std::move(tables),
-                                std::move(stmt), std::move(columns), 0};
-    auto [result, hash] = impl_->evaluate_query(impl_->subscriptions[id]);
-    impl_->subscriptions[id].result_hash = hash;
-    return result;
+    return impl_->watch.subscribe(sql);
 }
 
 void Replica::unsubscribe(SubscriptionId id) {
-    auto it = impl_->subscriptions.find(id);
-    if (it != impl_->subscriptions.end()) {
-        // Remove reverse index entries.
-        for (const auto& t : it->second.tables) {
-            auto ts_it = impl_->table_subs.find(t);
-            if (ts_it != impl_->table_subs.end()) {
-                ts_it->second.erase(id);
-                if (ts_it->second.empty()) {
-                    impl_->table_subs.erase(ts_it);
-                }
-            }
-        }
-        impl_->subscriptions.erase(it);
-    }
+    impl_->watch.unsubscribe(id);
 }
 
 void Replica::reset() {

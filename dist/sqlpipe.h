@@ -139,6 +139,53 @@ using SchemaMismatchCallback = std::function<bool(
 
 } // namespace sqlpipe
 
+// ── query_watch.h ───────────────────────────────────────────────
+namespace sqlpipe {
+
+/// Standalone query subscription engine for a single sqlite3* handle.
+///
+/// Monitors registered SQL queries and detects when their results change.
+/// Result-change detection uses FNV-1a hashing — queries are only reported
+/// as changed when the actual result set differs, not on every call to
+/// notify().
+///
+/// Usage:
+///   QueryWatch w(db);
+///   auto result = w.subscribe("SELECT * FROM items WHERE active = 1");
+///   // ... perform writes ...
+///   auto changed = w.notify({"items"});  // re-evaluates affected queries
+///
+/// Does NOT own the sqlite3* handle.
+class QueryWatch {
+public:
+    explicit QueryWatch(sqlite3* db);
+    ~QueryWatch();
+
+    QueryWatch(const QueryWatch&) = delete;
+    QueryWatch& operator=(const QueryWatch&) = delete;
+    QueryWatch(QueryWatch&&) noexcept;
+    QueryWatch& operator=(QueryWatch&&) noexcept;
+
+    /// Register a query. Returns the current result immediately.
+    QueryResult subscribe(const std::string& sql);
+
+    /// Remove a subscription.
+    void unsubscribe(SubscriptionId id);
+
+    /// Re-evaluate subscriptions that depend on any of the given tables.
+    /// Returns results only for subscriptions whose output actually changed.
+    std::vector<QueryResult> notify(const std::set<std::string>& affected_tables);
+
+    /// Returns true if there are no active subscriptions.
+    bool empty() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace sqlpipe
+
 // ── error.h ─────────────────────────────────────────────────────
 namespace sqlpipe {
 
