@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sqlpipe Pixel Grid</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    gap: 16px;
+  }
+  h1 { font-size: 1.4rem; font-weight: 400; opacity: 0.8; }
+  #status {
+    font-size: 0.85rem;
+    opacity: 0.6;
+    min-height: 1.2em;
+  }
+  #grid {
+    display: grid;
+    gap: 1px;
+    background: #333;
+    border: 2px solid #444;
+    border-radius: 4px;
+    cursor: crosshair;
+  }
+  .cell {
+    width: 28px;
+    height: 28px;
+    background: #2a2a3e;
+    transition: background-color 0.15s ease;
+  }
+  .cell:hover {
+    outline: 2px solid rgba(255,255,255,0.4);
+    outline-offset: -2px;
+    z-index: 1;
+  }
+  #info {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 0.85rem;
+    opacity: 0.7;
+  }
+  #my-color {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.3);
+  }
+</style>
+</head>
+<body>
+
+<h1>sqlpipe Pixel Grid</h1>
+<div id="status">Loading Wasm...</div>
+<div id="grid"></div>
+<div id="info">
+  <div id="my-color"></div>
+  <span id="my-label">Your color</span>
+</div>
+
+<script src="/sqlpipe.js"></script>
+<script type="module">
+// ── Load Wasm module ────────────────────────────────────────────
+
+const M = await createSqlpipeModule({ locateFile: (f) => '/' + f });
+document.getElementById('status').textContent = 'Connecting...';
+
+// ── Helpers ─────────────────────────────────────────────────────
+
+function stackStr(s) { return M.stringToUTF8OnStack(s); }
+function readU32(buf, off) {
+  return buf[off] | (buf[off+1] << 8) | (buf[off+2] << 16) | (buf[off+3] << 24);
+}
+function checkErr(errPtr) {
+  const code = M.getValue(errPtr, 'i32');
+  if (code !== 0) {
+    const msgPtr = M.getValue(errPtr + 4, 'i32');
+    const msg = msgPtr ? M.UTF8ToString(msgPtr) : 'error';
+    M._sqlpipe_free_error(msgPtr);
+    throw new Error(`sqlpipe error ${code}: ${msg}`);
+  }
+}
+function readBuf(bufPtr) {
+  const data = M.getValue(bufPtr, 'i32');
+  const len = M.getValue(bufPtr + 4, 'i32');
+  if (!data || !len) return null;
+  const copy = new Uint8Array(M.HEAPU8.buffer, data, len).slice();
+  M._sqlpipe_free_buf(data);
+  return copy;
+}
+
+const errPtr = M._malloc(8);
+const bufPtr = M._malloc(8);
+const outPtr = M._malloc(4);
+
+// ── Create database + replica ───────────────────────────────────
+
+const db = M._sqlpipe_db_open(stackStr(':memory:'));
+M._sqlpipe_db_exec(db, stackStr(`
+  CREATE TABLE pixels (
+    x INTEGER NOT NULL,
+    y INTEGER NOT NULL,
+    color TEXT NOT NULL,
+    player TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (x, y)
+  );
+`));
+
+// Create Replica with default config.
+M._sqlpipe_replica_new(db,
+  0, 0,     // on_conflict, ctx
+  0, 0,     // table_filter, count
+  0, 0n,    // seq_key, bucket_size
+  0, 0,     // on_progress, ctx
+  0, 0,     // on_schema_mismatch, ctx
+  0, 0,     // on_log, ctx
+  outPtr, errPtr);
+checkErr(errPtr);
+const replica = M.getValue(outPtr, 'i32');
+
+// ── State ───────────────────────────────────────────────────────
+
+let gridSize = 16;
+let myColor = '#888';
+let ws = null;
+let live = false;
+
+const statusEl = document.getElementById('status');
+const gridEl = document.getElementById('grid');
+const colorEl = document.getElementById('my-color');
+
+// ── Grid rendering ──────────────────────────────────────────────
+
+function buildGrid() {
+  gridEl.style.gridTemplateColumns = `repeat(${gridSize}, 28px)`;
+  gridEl.innerHTML = '';
+  for (let y = 0; y < gridSize; y++) {
+    for (let x = 0; x < gridSize; x++) {
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      cell.addEventListener('click', () => onCellClick(x, y));
+      gridEl.appendChild(cell);
+    }
+  }
+}
+
+function setPixel(x, y, color) {
+  const idx = y * gridSize + x;
+  const cell = gridEl.children[idx];
+  if (cell) cell.style.backgroundColor = color;
+}
+
+function renderFromDb() {
+  // Read all pixels via a temporary QueryWatch subscribe.
+  const watch = M._sqlpipe_query_watch_new(db);
+  M._sqlpipe_query_watch_subscribe(
+    watch, stackStr('SELECT x, y, color FROM pixels'), bufPtr, errPtr);
+  checkErr(errPtr);
+  const raw = readBuf(bufPtr);
+  M._sqlpipe_query_watch_free(watch);
+
+  if (!raw || raw.length === 0) return;
+
+  // Parse QueryResult: [u64 id][u32 colCount][cols...][u32 rowCount][rows...]
+  let pos = 8; // skip id
+  const colCount = readU32(raw, pos); pos += 4;
+  for (let i = 0; i < colCount; i++) {
+    const slen = readU32(raw, pos); pos += 4 + slen;
+  }
+  const rowCount = readU32(raw, pos); pos += 4;
+  for (let i = 0; i < rowCount; i++) {
+    // x: integer (tag=1, 8 bytes LE)
+    pos++; const x = raw[pos] | (raw[pos+1] << 8); pos += 8;
+    // y: integer
+    pos++; const y = raw[pos] | (raw[pos+1] << 8); pos += 8;
+    // color: string (tag=3, u32 len, bytes)
+    pos++; const clen = readU32(raw, pos); pos += 4;
+    const color = new TextDecoder().decode(raw.slice(pos, pos + clen)); pos += clen;
+    setPixel(x, y, color);
+  }
+}
+
+// ── Click handler ───────────────────────────────────────────────
+
+function onCellClick(x, y) {
+  if (!live || !ws || ws.readyState !== 1) return;
+
+  // Optimistic local render.
+  setPixel(x, y, myColor);
+
+  // Send action as JSON.
+  ws.send(JSON.stringify({ type: 'paint', x, y }));
+}
+
+// ── Handle incoming sqlpipe messages ────────────────────────────
+
+function handleReplicaMsg(data) {
+  const msg = new Uint8Array(data);
+  const msgPtr = M._malloc(msg.length);
+  M.HEAPU8.set(msg, msgPtr);
+
+  M._sqlpipe_replica_handle_message(replica, msgPtr, msg.length, bufPtr, errPtr);
+  M._free(msgPtr);
+  checkErr(errPtr);
+
+  const hrRaw = readBuf(bufPtr);
+  if (!hrRaw || hrRaw.length === 0) return;
+
+  // HandleResult: [u32 msg_count][msgs...][u32 change_count][changes...]...
+  // Extract and send response messages back to server.
+  const msgCount = readU32(hrRaw, 0);
+  let pos = 4;
+  for (let i = 0; i < msgCount; i++) {
+    const len = readU32(hrRaw, pos);
+    const total = 4 + len;
+    ws.send(hrRaw.slice(pos, pos + total));
+    pos += total;
+  }
+
+  // Re-render from database.
+  renderFromDb();
+
+  // Check state.
+  const state = M._sqlpipe_replica_state(replica);
+  if (state === 4 && !live) { // ReplicaState.Live
+    live = true;
+    statusEl.textContent = 'Live — click to paint!';
+    renderFromDb();
+  }
+}
+
+// ── WebSocket connection ────────────────────────────────────────
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    statusEl.textContent = 'Connected, syncing...';
+  };
+
+  ws.onmessage = (event) => {
+    if (typeof event.data === 'string') {
+      // JSON control message.
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'init') {
+        myColor = msg.color;
+        gridSize = msg.gridSize;
+        colorEl.style.backgroundColor = myColor;
+        buildGrid();
+
+        // Send hello to start the handshake.
+        M._sqlpipe_replica_hello(replica, bufPtr, errPtr);
+        checkErr(errPtr);
+        const helloRaw = readBuf(bufPtr);
+        if (helloRaw) ws.send(helloRaw);
+      }
+    } else {
+      // Binary = sqlpipe message from master.
+      handleReplicaMsg(event.data);
+    }
+  };
+
+  ws.onclose = () => {
+    live = false;
+    statusEl.textContent = 'Disconnected. Reconnecting...';
+    // Reset replica for reconnection.
+    M._sqlpipe_replica_reset(replica);
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => {};
+}
+
+buildGrid();
+connect();
+</script>
+</body>
+</html>

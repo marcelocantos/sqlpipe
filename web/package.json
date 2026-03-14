@@ -1,0 +1,20 @@
+{
+  "name": "sqlpipe",
+  "version": "0.8.0",
+  "description": "Streaming SQLite replication for the browser",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --experimental-vm-modules dist/test/smoke.test.js"
+  },
+  "keywords": ["sqlite", "replication", "wasm", "sqlpipe"],
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "typescript": "^5.7"
+  }
+}

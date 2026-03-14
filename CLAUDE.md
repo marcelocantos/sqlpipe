@@ -21,6 +21,16 @@ go test -tags libsqlite3 ./...
 The `-tags libsqlite3` flag is required — it tells mattn/go-sqlite3 to link
 against the vendored SQLite rather than its bundled copy.
 
+### Wasm (browser)
+
+```sh
+mk wasm                              # build Wasm module (requires emscripten)
+cd web && npx tsc && node dist/test/smoke.test.js  # TypeScript wrapper test
+```
+
+Builds sqlpipe + sqldeep + SQLite + LZ4 + sqlift into a single Wasm module.
+The `sqldeep` variable in the mkfile defaults to `../sqldeep` (sibling directory).
+
 Requires C++23. Uses [mk](https://github.com/marcelocantos/mk) as the build
 system (`mkfile`).
 
@@ -131,6 +141,15 @@ dist/sqlpipe.cpp    Implementation (all internals)
 tests/              doctest test files
 examples/           loopback.cpp demo
 vendor/             Third-party dependencies
+go/sqlpipe/         Go CGo wrapper
+web/                Wasm/TypeScript wrapper
+  sqlpipe_wapi.cpp  Emscripten C API shim (Master, Replica, Peer, QueryWatch)
+  sqldeep_wapi.cpp  Emscripten wrapper for sqldeep transpiler
+  src/              TypeScript wrapper source
+    index.ts        Public API (createSqlpipe, Database, Master, Replica, Peer, QueryWatch)
+    types.ts        Type definitions
+    decode.ts       Binary result decoder
+    wasm.ts         Low-level Wasm bindings
 mkfile              Build system (mk)
 ```
 

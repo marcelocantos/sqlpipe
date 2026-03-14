@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#define SQLPIPE_VERSION       "0.7.0"
+#define SQLPIPE_VERSION       "0.8.0"
 #define SQLPIPE_VERSION_MAJOR 0
-#define SQLPIPE_VERSION_MINOR 7
+#define SQLPIPE_VERSION_MINOR 8
 #define SQLPIPE_VERSION_PATCH 0
 
 #include <cstdint>
@@ -563,8 +563,9 @@ struct PeerMessage {
 
 /// Return type for Peer::handle_message.
 struct PeerHandleResult {
-    std::vector<PeerMessage>  messages;  ///< Protocol responses to send back.
-    std::vector<ChangeEvent>  changes;   ///< Row-level changes applied.
+    std::vector<PeerMessage>  messages;       ///< Protocol responses to send back.
+    std::vector<ChangeEvent>  changes;        ///< Row-level changes applied.
+    std::vector<QueryResult>  subscriptions;  ///< Invalidated subscription results.
 };
 
 /// Bidirectional replication peer.
@@ -593,6 +594,15 @@ public:
 
     /// Process an incoming PeerMessage from the remote peer.
     PeerHandleResult handle_message(const PeerMessage& msg);
+
+    /// Subscribe to a SQL query on the replica side. Returns the current
+    /// result immediately. After each handle_message that changes a table
+    /// the query reads from, the updated result appears in
+    /// PeerHandleResult::subscriptions.
+    QueryResult subscribe(const std::string& sql);
+
+    /// Remove a subscription.
+    void unsubscribe(SubscriptionId id);
 
     /// Reset to Init state for reconnection. Call start() again to
     /// re-handshake. Table ownership is preserved from the previous session.

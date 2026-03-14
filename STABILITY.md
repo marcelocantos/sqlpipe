@@ -34,15 +34,15 @@ structural schema hashing via sqlift). Clock starts from that release.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.7.0. Items annotated with stability assessments.
+Snapshot as of v0.8.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.7.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.8.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `7` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `8` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 
 ### Type aliases
@@ -83,7 +83,7 @@ Snapshot as of v0.7.0. Items annotated with stability assessments.
 | `QueryResult` | `id, columns, rows` | **Stable** |
 | `DiffProgress` | `phase, table, items_done, items_total` | **Stable** |
 | `HandleResult` | `messages, changes, subscriptions` | **Stable** |
-| `PeerHandleResult` | `messages, changes` | **Stable** |
+| `PeerHandleResult` | `messages, changes, subscriptions` | **Stable** |
 | `PeerMessage` | `sender_role, payload` | **Stable** |
 
 ### Message structs
@@ -188,8 +188,28 @@ class Peer {
     PeerHandleResult handle_message(const PeerMessage& msg);
     void reset();
     State state() const;
+    QueryResult subscribe(const std::string& sql);
+    void unsubscribe(SubscriptionId id);
     const std::set<std::string>& owned_tables() const;
     const std::set<std::string>& remote_tables() const;
+};
+```
+
+**Stability**: **Stable**
+
+### QueryWatch class
+
+```cpp
+class QueryWatch {
+    explicit QueryWatch(sqlite3* db);
+    ~QueryWatch();
+    QueryWatch(QueryWatch&&) noexcept;
+    QueryWatch& operator=(QueryWatch&&) noexcept;
+
+    QueryResult subscribe(const std::string& sql);
+    void unsubscribe(SubscriptionId id);
+    std::vector<QueryResult> notify(const std::set<std::string>& affected_tables);
+    bool empty() const;
 };
 ```
 

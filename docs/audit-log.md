@@ -52,3 +52,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `c98b843`
 - **Outcome**: Released v0.7.0. Protocol v5 (sqlift structural schema hashing), callback logging replacing spdlog, Go CGo wrapper, dist/ layout, sync_handshake API. NOTICES updated with doctest and sqlift attribution.
+
+## 2026-03-15 — /release v0.8.0
+
+- **Commit**: `4d2bb83`
+- **Outcome**: Released v0.8.0. Emscripten/Wasm build with TypeScript wrapper, Peer subscribe/unsubscribe, database serialize/deserialize, sqldeep bundled in Wasm, web demo app.

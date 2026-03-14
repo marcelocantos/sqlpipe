@@ -555,3 +555,65 @@ TEST_CASE("peer: client owned_tables must be subset of table_filter") {
 
     CHECK_THROWS_AS(peer.start(), Error);
 }
+
+TEST_CASE("peer: subscribe receives updates through handle_message") {
+    DB client_db, server_db;
+    const char* schema =
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);"
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)";
+    client_db.exec(schema);
+    server_db.exec(schema);
+
+    PeerConfig client_cfg;
+    client_cfg.owned_tables = {"t1"};
+    Peer client(client_db.db, client_cfg);
+
+    PeerConfig server_cfg;
+    server_cfg.approve_ownership =
+        [](const std::set<std::string>&) { return true; };
+    Peer server(server_db.db, server_cfg);
+
+    sync_handshake(client, server);
+    CHECK(client.state() == Peer::State::Live);
+
+    // Client subscribes to t2 (server-owned, replicated to client).
+    auto qr = client.subscribe("SELECT count(*) AS cnt FROM t2");
+    CHECK(qr.columns.size() == 1);
+    CHECK(qr.columns[0] == "cnt");
+    CHECK(qr.rows.size() == 1);
+    CHECK(std::get<int64_t>(qr.rows[0][0]) == 0);
+
+    // Server inserts into t2 and flushes.
+    server_db.exec("INSERT INTO t2 VALUES (1, 'hello')");
+    auto msgs = server.flush();
+    CHECK(!msgs.empty());
+
+    // Client handles the changeset — subscription should fire.
+    PeerHandleResult result;
+    for (auto& m : msgs) {
+        auto r = client.handle_message(m);
+        result.messages.insert(result.messages.end(),
+            r.messages.begin(), r.messages.end());
+        result.changes.insert(result.changes.end(),
+            r.changes.begin(), r.changes.end());
+        result.subscriptions.insert(result.subscriptions.end(),
+            r.subscriptions.begin(), r.subscriptions.end());
+    }
+
+    CHECK(result.changes.size() == 1);
+    CHECK(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].id == qr.id);
+    CHECK(std::get<int64_t>(result.subscriptions[0].rows[0][0]) == 1);
+
+    // Unsubscribe and verify no more notifications.
+    client.unsubscribe(qr.id);
+    server_db.exec("INSERT INTO t2 VALUES (2, 'world')");
+    msgs = server.flush();
+    PeerHandleResult result2;
+    for (auto& m : msgs) {
+        auto r = client.handle_message(m);
+        result2.subscriptions.insert(result2.subscriptions.end(),
+            r.subscriptions.begin(), r.subscriptions.end());
+    }
+    CHECK(result2.subscriptions.empty());
+}

@@ -2536,6 +2536,7 @@ struct Peer::Impl {
                 PeerMessage{SenderRole::AsReplica, std::move(m)});
         }
         result.changes = std::move(hr.changes);
+        result.subscriptions = std::move(hr.subscriptions);
 
         // Check if replica just went live.
         if (replica->state() == Replica::State::Live) {
@@ -2616,6 +2617,22 @@ PeerHandleResult Peer::handle_message(const PeerMessage& msg) {
     } else {
         return impl_->handle_as_master(msg);
     }
+}
+
+QueryResult Peer::subscribe(const std::string& sql) {
+    if (!impl_->replica) {
+        throw Error(ErrorCode::InvalidState,
+                    "subscribe() requires replica to be initialized");
+    }
+    return impl_->replica->subscribe(sql);
+}
+
+void Peer::unsubscribe(SubscriptionId id) {
+    if (!impl_->replica) {
+        throw Error(ErrorCode::InvalidState,
+                    "unsubscribe() requires replica to be initialized");
+    }
+    impl_->replica->unsubscribe(id);
 }
 
 void Peer::reset() {

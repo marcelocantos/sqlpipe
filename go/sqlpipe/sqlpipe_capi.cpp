@@ -158,6 +158,9 @@ Buf encode_peer_handle_result(const sqlpipe::PeerHandleResult& phr) {
     // Changes.
     put_u32(b, static_cast<uint32_t>(phr.changes.size()));
     for (auto& ce : phr.changes) encode_change_event(b, ce);
+    // Subscriptions.
+    put_u32(b, static_cast<uint32_t>(phr.subscriptions.size()));
+    for (auto& qr : phr.subscriptions) encode_query_result(b, qr);
     return b;
 }
 
@@ -569,6 +572,26 @@ sqlpipe_error sqlpipe_peer_handle_message(
             std::span<const uint8_t>(msg_data, msg_len));
         auto phr = p->impl.handle_message(msg);
         *out = to_buf(encode_peer_handle_result(phr));
+        return ok();
+    } catch (const sqlpipe::Error& e) { return make_error(e); }
+      catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+
+sqlpipe_error sqlpipe_peer_subscribe(
+    sqlpipe_peer* p, const char* sql, sqlpipe_buf* out) {
+    try {
+        auto qr = p->impl.subscribe(sql);
+        Buf b;
+        encode_query_result(b, qr);
+        *out = to_buf(std::move(b));
+        return ok();
+    } catch (const sqlpipe::Error& e) { return make_error(e); }
+      catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+
+sqlpipe_error sqlpipe_peer_unsubscribe(sqlpipe_peer* p, uint64_t id) {
+    try {
+        p->impl.unsubscribe(id);
         return ok();
     } catch (const sqlpipe::Error& e) { return make_error(e); }
       catch (const std::exception& e) { return make_error(1, e.what()); }

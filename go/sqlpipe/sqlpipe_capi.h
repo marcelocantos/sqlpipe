@@ -180,6 +180,10 @@ void sqlpipe_peer_free(sqlpipe_peer* p);
 sqlpipe_error sqlpipe_peer_start(sqlpipe_peer* p, sqlpipe_buf* out);
 sqlpipe_error sqlpipe_peer_flush(sqlpipe_peer* p, sqlpipe_buf* out);
 
+// Subscribe to a query on the peer's replica side. Returns encoded QueryResult.
+sqlpipe_error sqlpipe_peer_subscribe(sqlpipe_peer* p, const char* sql, sqlpipe_buf* out);
+sqlpipe_error sqlpipe_peer_unsubscribe(sqlpipe_peer* p, uint64_t id);
+
 // Returns encoded PeerHandleResult:
 //   [u32 msg_count][pmsgs...][u32 change_count][changes...]
 sqlpipe_error sqlpipe_peer_handle_message(
