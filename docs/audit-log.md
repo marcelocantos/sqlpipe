@@ -55,5 +55,10 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 ## 2026-03-15 — /release v0.8.0
 
-- **Commit**: `4d2bb83`
+- **Commit**: `ab2cfee`
 - **Outcome**: Released v0.8.0. Emscripten/Wasm build with TypeScript wrapper, Peer subscribe/unsubscribe, database serialize/deserialize, sqldeep bundled in Wasm, web demo app.
+
+## 2026-03-15 — /release v0.9.0
+
+- **Commit**: `53cf4b1`
+- **Outcome**: Released v0.9.0. Automatic schema migration via sqlift, one-shot query() API, sqlift borrowing constructor.

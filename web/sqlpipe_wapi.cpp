@@ -463,6 +463,22 @@ void sqlpipe_db_free_serialized(uint8_t* data) {
     sqlite3_free(data);
 }
 
+// ── One-shot query ──────────────────────────────────────────────
+
+EMSCRIPTEN_KEEPALIVE
+int sqlpipe_db_query(sqlite3* db, const char* sql,
+                     sqlpipe_buf* out, sqlpipe_error* err) {
+    try {
+        auto qr = sqlpipe::query(db, sql);
+        Buf b;
+        encode_query_result(b, qr);
+        *out = to_buf(std::move(b));
+        *err = ok();
+        return 0;
+    } catch (const sqlpipe::Error& e) { *err = make_error(e); return static_cast<int>(e.code()); }
+      catch (const std::exception& e) { *err = make_error(1, e.what()); return 1; }
+}
+
 // ── Result accessors ────────────────────────────────────────────
 // These let JS read fields from heap-allocated result structs.
 

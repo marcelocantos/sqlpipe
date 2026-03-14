@@ -112,6 +112,24 @@ export class Database {
     }
   }
 
+  /** Execute a one-shot SQL query and return the result set. */
+  query(sql: string): QueryResult {
+    const errPtr = this._M._malloc(8);
+    const bufPtr = this._M._malloc(8);
+    try {
+      withStack(this._M, () => {
+        this._M._sqlpipe_db_query(this._ptr, this._M.stringToUTF8OnStack(sql),
+                                   bufPtr, errPtr);
+      });
+      checkError(this._M, errPtr);
+      const raw = readBuf(this._M, bufPtr);
+      return decodeQueryResult(new Reader(raw));
+    } finally {
+      this._M._free(errPtr);
+      this._M._free(bufPtr);
+    }
+  }
+
   /** Serialize the database to a byte array. */
   serialize(): Uint8Array {
     const dataPtr = this._M._malloc(4);

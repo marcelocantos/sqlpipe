@@ -640,3 +640,38 @@ TEST_CASE("integration: crash recovery after aborted changeset") {
     std::remove(master_path.c_str());
     std::remove(replica_path.c_str());
 }
+
+TEST_CASE("query: one-shot query returns results") {
+    DB d;
+    d.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, value REAL);"
+           "INSERT INTO items VALUES (1, 'hello', 3.14);"
+           "INSERT INTO items VALUES (2, 'world', 2.72);");
+
+    auto result = query(d.db, "SELECT id, name, value FROM items ORDER BY id");
+    CHECK(result.id == 0);
+    CHECK(result.columns.size() == 3);
+    CHECK(result.columns[0] == "id");
+    CHECK(result.columns[1] == "name");
+    CHECK(result.columns[2] == "value");
+    CHECK(result.rows.size() == 2);
+    CHECK(std::get<int64_t>(result.rows[0][0]) == 1);
+    CHECK(std::get<std::string>(result.rows[0][1]) == "hello");
+    CHECK(std::get<double>(result.rows[0][2]) == doctest::Approx(3.14));
+    CHECK(std::get<int64_t>(result.rows[1][0]) == 2);
+    CHECK(std::get<std::string>(result.rows[1][1]) == "world");
+}
+
+TEST_CASE("query: empty result set") {
+    DB d;
+    d.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)");
+
+    auto result = query(d.db, "SELECT * FROM items");
+    CHECK(result.id == 0);
+    CHECK(result.columns.size() == 2);
+    CHECK(result.rows.empty());
+}
+
+TEST_CASE("query: invalid SQL throws") {
+    DB d;
+    CHECK_THROWS_AS(query(d.db, "SELECT * FROM nonexistent"), Error);
+}

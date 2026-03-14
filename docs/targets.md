@@ -109,6 +109,21 @@
 - **Discovered**: 2026-03-15
 - **Achieved**: 2026-03-15
 
+### 🎯T6 Go wrapper is self-contained (no mattn/go-sqlite3 dependency)
+- **Weight**: 5 (value 8 / cost 2)
+- **Estimated-cost**: 2
+- **Acceptance**:
+  - `go test ./...` works without build tags or system SQLite
+  - Wrapper compiles vendored SQLite with session/preupdate flags internally
+  - No dependency on mattn/go-sqlite3 in go.mod
+  - No `database/sql`, `*sql.DB`, `*sql.Conn`, or `extractDBHandle` in the API
+  - `Database.Query(sql)` returns rows for one-shot read queries (wraps prepare/step/column/finalize internally)
+  - Public API surface: Database, Master, Replica, Peer, QueryWatch (mirrors the Wasm/TypeScript wrapper)
+  - `go get github.com/marcelocantos/sqlpipe/go/sqlpipe` works from outside the monorepo
+- **Context**: Users interact exclusively with the sqlpipe API, never with raw SQLite. The mattn dependency creates confusing build failures, requires `-tags libsqlite3`, and exposes implementation details. The Wasm wrapper already demonstrates the right pattern — own the sqlite3* handles internally.
+- **Status**: identified
+- **Discovered**: 2026-03-15
+
 ### 🎯T4 Reconnect skips diff sync when seq matches
 - **Weight**: 3 (value 5 / cost 2)
 - **Estimated-cost**: 2

@@ -34,15 +34,15 @@ structural schema hashing via sqlift). Clock starts from that release.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.8.0. Items annotated with stability assessments.
+Snapshot as of v0.9.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.8.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.9.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `8` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `9` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 
 ### Type aliases
@@ -225,6 +225,7 @@ class QueryWatch {
 | `PeerMessage deserialize_peer(std::span<const uint8_t>)` | **Stable** |
 | `void sync_handshake(Master&, Replica&)` | **Stable** |
 | `void sync_handshake(Peer& client, Peer& server)` | **Stable** |
+| `QueryResult query(sqlite3* db, const std::string& sql)` | **Stable** |
 
 ### Wire format
 

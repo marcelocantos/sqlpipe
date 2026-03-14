@@ -221,3 +221,65 @@ TEST_CASE("diff sync: then live streaming continues") {
     REQUIRE(!result.changes.empty());
     CHECK(result.changes[0].op == OpType::Insert);
 }
+
+TEST_CASE("diff sync: auto-migrate empty replica to master schema") {
+    DB master_db, replica_db;
+
+    // Master has schema and data; replica is completely empty.
+    master_db.exec(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL);"
+        "INSERT INTO items VALUES (1, 'hello', 3.14);"
+        "INSERT INTO items VALUES (2, 'world', 2.72)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);  // no schema, no tables
+
+    // First handshake attempt: schema mismatch → auto-migration → reset.
+    auto pending = master.handle_message(replica.hello());
+    REQUIRE(pending.size() == 1);  // ErrorMsg with schema SQL
+
+    auto result = replica.handle_message(pending[0]);
+    // Auto-migration should have resolved the mismatch and reset to Init.
+    CHECK(replica.state() == Replica::State::Init);
+
+    // Second handshake: schemas now match → proceed to diff sync → live.
+    sync_handshake(master, replica);
+    CHECK(replica.state() == Replica::State::Live);
+
+    // Verify data was replicated.
+    CHECK(replica_db.count("items") == 2);
+    CHECK(replica_db.query_val("SELECT name FROM items WHERE id=1") == "hello");
+}
+
+TEST_CASE("diff sync: auto-migrate adds new column") {
+    DB master_db, replica_db;
+
+    // Both start with same schema.
+    master_db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    replica_db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+
+    // Initial sync.
+    sync_handshake(master, replica);
+    CHECK(replica.state() == Replica::State::Live);
+
+    // Master evolves schema — add a column and insert data.
+    master_db.exec("ALTER TABLE t ADD COLUMN score REAL DEFAULT 0");
+    master_db.exec("INSERT INTO t VALUES (1, 'alice', 95.5)");
+
+    // Replica reconnects with old schema.
+    replica.reset();
+    Master master2(master_db.db);  // new master with evolved schema
+
+    auto pending = master2.handle_message(replica.hello());
+    REQUIRE(pending.size() == 1);  // ErrorMsg
+
+    auto result = replica.handle_message(pending[0]);
+    CHECK(replica.state() == Replica::State::Init);  // auto-migrated
+
+    sync_handshake(master2, replica);
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t") == 1);
+}
