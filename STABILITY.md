@@ -13,24 +13,21 @@ usage over time is the only reliable way to discover API design mistakes that
 aren't obvious from tests and documentation alone. Once 1.0 ships, fixing those
 mistakes becomes extremely costly. Think twice, cut once.
 
-The settling threshold scales with API surface area: count every public function,
-type, enum, constant, wire format, and config field in the interaction surface
-catalogue below, then look up N:
+The settling threshold is purely time-based — new releases don't accelerate it,
+because new code is inherently destabilising. The minimum period scales with
+API surface complexity:
 
-| Surface items | N |
+| Surface items | Minimum settling period |
 |---|---|
-| < 20 | 2 |
-| 20–50 | 3 |
-| 50–100 | 4 |
-| > 100 | 5 |
+| < 20 | 1 month |
+| 20–50 | 2 months |
+| 50–100 | 3 months |
+| > 100 | 4 months |
 
-The project is eligible for 1.0 when **either** of these conditions is met:
+The clock starts from the last breaking change to the interaction surface.
 
-- **N consecutive minor releases** with zero breaking changes to the surface, OR
-- **N months** since the last breaking change.
-
-Current surface: ~72 items → N = 4. Last breaking change: v0.7.0 (protocol v5,
-structural schema hashing via sqlift). Clock starts from that release.
+Current surface: ~75 items → 3 months. Last breaking change: v0.7.0 (protocol
+v5, structural schema hashing via sqlift, 2026-03-04). Eligible: 2026-06-04.
 
 ## Interaction surface catalogue
 
