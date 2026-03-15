@@ -239,6 +239,14 @@ sqlpipe::MasterConfig to_master_config(sqlpipe_master_config cfg) {
                std::string(msg).c_str());
         };
     }
+    if (cfg.on_flush) {
+        auto fn = cfg.on_flush;
+        auto ctx = cfg.flush_ctx;
+        mc.on_flush = [fn, ctx](const std::vector<sqlpipe::Message>& msgs) {
+            auto encoded = encode_messages(msgs);
+            fn(ctx, encoded.data(), encoded.size());
+        };
+    }
     return mc;
 }
 
@@ -409,6 +417,14 @@ sqlpipe_error sqlpipe_master_flush(sqlpipe_master* m, sqlpipe_buf* out) {
     try {
         auto msgs = m->impl.flush();
         *out = to_buf(encode_messages(msgs));
+        return ok();
+    } catch (const sqlpipe::Error& e) { return make_error(e); }
+      catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+
+sqlpipe_error sqlpipe_master_exec(sqlpipe_master* m, const char* sql) {
+    try {
+        m->impl.exec(sql);
         return ok();
     } catch (const sqlpipe::Error& e) { return make_error(e); }
       catch (const std::exception& e) { return make_error(1, e.what()); }
@@ -613,6 +629,30 @@ void sqlpipe_peer_owned_tables(
 void sqlpipe_peer_remote_tables(
     sqlpipe_peer* p, char*** out_tables, size_t* out_count) {
     set_to_string_array(p->impl.remote_tables(), out_tables, out_count);
+}
+
+// ── Database utilities ──────────────────────────────────────────
+
+sqlpipe_error sqlpipe_db_query(sqlite3* db, const char* sql, sqlpipe_buf* out) {
+    try {
+        auto qr = sqlpipe::query(db, sql);
+        Buf b;
+        encode_query_result(b, qr);
+        *out = to_buf(std::move(b));
+        return ok();
+    } catch (const sqlpipe::Error& e) { return make_error(e); }
+      catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+
+sqlpipe_error sqlpipe_db_exec(sqlite3* db, const char* sql) {
+    char* err = nullptr;
+    int rc = sqlite3_exec(db, sql, nullptr, nullptr, &err);
+    if (rc != SQLITE_OK) {
+        std::string msg = err ? err : "sqlite3_exec failed";
+        if (err) sqlite3_free(err);
+        return make_error(1, msg.c_str());
+    }
+    return ok();
 }
 
 } // extern "C"

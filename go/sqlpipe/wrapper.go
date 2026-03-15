@@ -8,6 +8,7 @@ package sqlpipe
 #cgo CFLAGS: -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -I${SRCDIR}/../../vendor/include
 
 #include <stdlib.h>
+#include "../../vendor/include/sqlite3.h"
 #include "sqlpipe_capi.h"
 
 // Forward-declare Go callback trampolines (defined in cgo_exports.go).
@@ -16,6 +17,7 @@ extern int goSchemaMismatchTrampoline(uintptr_t, int32_t, int32_t, const char*);
 extern uint8_t goConflictTrampoline(uintptr_t, uint8_t, const uint8_t*, size_t);
 extern int goApproveOwnershipTrampoline(uintptr_t, const char**, size_t);
 extern void goLogTrampoline(uintptr_t, uint8_t, const char*);
+extern void goFlushTrampoline(uintptr_t, const uint8_t*, size_t);
 
 // C trampolines that cast void* ctx to uintptr_t for Go.
 // These cannot be static because CGo needs them as exported symbols.
@@ -34,33 +36,78 @@ int cApproveOwnershipTrampoline(void* ctx, const char** tables, size_t count) {
 void cLogTrampoline(void* ctx, uint8_t level, const char* message) {
 	goLogTrampoline((uintptr_t)ctx, level, message);
 }
+void cFlushTrampoline(void* ctx, const uint8_t* data, size_t len) {
+	goFlushTrampoline((uintptr_t)ctx, data, len);
+}
 */
 import "C"
 
 import (
-	"database/sql"
 	"encoding/binary"
 	"math"
-	"reflect"
 	"runtime/cgo"
 	"unsafe"
-
-	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
-// ── DB handle extraction ────────────────────────────────────────
+// ── Database ─────────────────────────────────────────────────────
 
-func extractDBHandle(driverConn any) *C.sqlite3 {
-	v := reflect.ValueOf(driverConn).Elem()
-	f := v.FieldByName("db")
-	return (*C.sqlite3)(*(*unsafe.Pointer)(unsafe.Pointer(f.UnsafeAddr())))
+// Database wraps a raw sqlite3* handle. It provides a self-contained
+// SQLite connection without depending on database/sql or mattn/go-sqlite3.
+type Database struct {
+	db *C.sqlite3
 }
 
-func withDBHandle(conn *sql.Conn, fn func(db *C.sqlite3) error) error {
-	return conn.Raw(func(driverConn any) error {
-		_ = driverConn.(*sqlite3.SQLiteConn)
-		return fn(extractDBHandle(driverConn))
-	})
+// OpenDatabase opens a SQLite database at the given path.
+// Use ":memory:" for an in-memory database.
+func OpenDatabase(path string) (*Database, error) {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	var db *C.sqlite3
+	rc := C.sqlite3_open(cpath, &db)
+	if rc != C.SQLITE_OK {
+		msg := C.GoString(C.sqlite3_errmsg(db))
+		C.sqlite3_close(db)
+		return nil, &Error{Code: ErrSqlite, Msg: msg}
+	}
+	return &Database{db: db}, nil
+}
+
+// Close closes the database connection.
+func (d *Database) Close() error {
+	if d.db != nil {
+		rc := C.sqlite3_close(d.db)
+		if rc != C.SQLITE_OK {
+			return &Error{Code: ErrSqlite, Msg: C.GoString(C.sqlite3_errmsg(d.db))}
+		}
+		d.db = nil
+	}
+	return nil
+}
+
+// Exec executes one or more SQL statements without returning results.
+func (d *Database) Exec(sql string) error {
+	csql := C.CString(sql)
+	defer C.free(unsafe.Pointer(csql))
+	return convertError(C.sqlpipe_db_exec(d.db, csql))
+}
+
+// Query executes a one-shot SQL query and returns the result set.
+func (d *Database) Query(sql string) (QueryResult, error) {
+	csql := C.CString(sql)
+	defer C.free(unsafe.Pointer(csql))
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_db_query(d.db, csql, &buf)); err != nil {
+		return QueryResult{}, err
+	}
+	defer C.sqlpipe_free_buf(buf)
+	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
+	dec := &decoder{data: data}
+	return decodeQueryResult(dec), nil
+}
+
+// Handle returns the raw sqlite3* pointer for use with CGo.
+func (d *Database) Handle() unsafe.Pointer {
+	return unsafe.Pointer(d.db)
 }
 
 // ── Error conversion ────────────────────────────────────────────
@@ -340,7 +387,14 @@ func decodePeerHandleResult(buf C.sqlpipe_buf) (PeerHandleResult, error) {
 		})
 	}
 
-	return PeerHandleResult{Messages: msgs, Changes: changes}, nil
+	// Subscriptions.
+	subCount := d.u32()
+	var subs []QueryResult
+	for i := uint32(0); i < subCount; i++ {
+		subs = append(subs, decodeQueryResult(d))
+	}
+
+	return PeerHandleResult{Messages: msgs, Changes: changes, Subscriptions: subs}, nil
 }
 
 // ── Callback handle management ──────────────────────────────────
@@ -400,13 +454,13 @@ func tableFilterToCStrings(tf *TableFilter) (**C.char, C.size_t) {
 // Master is the sending side of the replication protocol.
 type Master struct {
 	ptr     *C.sqlpipe_master
-	conn    *sql.Conn
+	db      *Database
 	handles callbackHandles
 }
 
-// NewMaster creates a Master that tracks changes on conn.
-func NewMaster(conn *sql.Conn, config MasterConfig) (*Master, error) {
-	m := &Master{conn: conn}
+// NewMaster creates a Master that tracks changes on the database.
+func NewMaster(db *Database, config MasterConfig) (*Master, error) {
+	m := &Master{db: db}
 	var cfg C.sqlpipe_master_config
 
 	tfPtrs, tfCount := tableFilterToCStrings(config.TableFilter)
@@ -436,15 +490,25 @@ func NewMaster(conn *sql.Conn, config MasterConfig) (*Master, error) {
 		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
 		cfg.log_ctx = unsafe.Pointer(uintptr(h))
 	}
+	if config.OnFlush != nil {
+		h := m.handles.add(config.OnFlush)
+		cfg.on_flush = C.sqlpipe_flush_fn(C.cFlushTrampoline)
+		cfg.flush_ctx = unsafe.Pointer(uintptr(h))
+	}
 
-	err := withDBHandle(conn, func(db *C.sqlite3) error {
-		return convertError(C.sqlpipe_master_new(db, cfg, &m.ptr))
-	})
-	if err != nil {
+	if err := convertError(C.sqlpipe_master_new(db.db, cfg, &m.ptr)); err != nil {
 		m.handles.free()
 		return nil, err
 	}
 	return m, nil
+}
+
+// Exec executes SQL on the master's database. If OnFlush is set, any
+// committed changes are automatically delivered via the callback.
+func (m *Master) Exec(sql string) error {
+	csql := C.CString(sql)
+	defer C.free(unsafe.Pointer(csql))
+	return convertError(C.sqlpipe_master_exec(m.ptr, csql))
 }
 
 // Flush extracts the changeset since the last flush and returns messages to send.
@@ -495,13 +559,13 @@ func (m *Master) Close() error {
 // Replica is the receiving side of the replication protocol.
 type Replica struct {
 	ptr     *C.sqlpipe_replica
-	conn    *sql.Conn
+	db      *Database
 	handles callbackHandles
 }
 
 // NewReplica creates a Replica.
-func NewReplica(conn *sql.Conn, config ReplicaConfig) (*Replica, error) {
-	r := &Replica{conn: conn}
+func NewReplica(db *Database, config ReplicaConfig) (*Replica, error) {
+	r := &Replica{db: db}
 	var cfg C.sqlpipe_replica_config
 
 	if config.OnConflict != nil {
@@ -538,10 +602,7 @@ func NewReplica(conn *sql.Conn, config ReplicaConfig) (*Replica, error) {
 		cfg.log_ctx = unsafe.Pointer(uintptr(h))
 	}
 
-	err := withDBHandle(conn, func(db *C.sqlite3) error {
-		return convertError(C.sqlpipe_replica_new(db, cfg, &r.ptr))
-	})
-	if err != nil {
+	if err := convertError(C.sqlpipe_replica_new(db.db, cfg, &r.ptr)); err != nil {
 		r.handles.free()
 		return nil, err
 	}
@@ -645,13 +706,13 @@ func (r *Replica) Close() error {
 // Peer is a bidirectional replication peer.
 type Peer struct {
 	ptr     *C.sqlpipe_peer
-	conn    *sql.Conn
+	db      *Database
 	handles callbackHandles
 }
 
 // NewPeer creates a Peer.
-func NewPeer(conn *sql.Conn, config PeerConfig) (*Peer, error) {
-	p := &Peer{conn: conn}
+func NewPeer(db *Database, config PeerConfig) (*Peer, error) {
+	p := &Peer{db: db}
 	var cfg C.sqlpipe_peer_config
 
 	otPtrs, otCount := toCStrings(config.OwnedTables)
@@ -690,10 +751,7 @@ func NewPeer(conn *sql.Conn, config PeerConfig) (*Peer, error) {
 		cfg.log_ctx = unsafe.Pointer(uintptr(h))
 	}
 
-	err := withDBHandle(conn, func(db *C.sqlite3) error {
-		return convertError(C.sqlpipe_peer_new(db, cfg, &p.ptr))
-	})
-	if err != nil {
+	if err := convertError(C.sqlpipe_peer_new(db.db, cfg, &p.ptr)); err != nil {
 		p.handles.free()
 		return nil, err
 	}
@@ -716,6 +774,25 @@ func (p *Peer) Flush() ([]PeerMessage, error) {
 		return nil, err
 	}
 	return decodePeerMessages(buf)
+}
+
+// Subscribe registers a query on the peer's replica side.
+func (p *Peer) Subscribe(sql string) (QueryResult, error) {
+	csql := C.CString(sql)
+	defer C.free(unsafe.Pointer(csql))
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_peer_subscribe(p.ptr, csql, &buf)); err != nil {
+		return QueryResult{}, err
+	}
+	defer C.sqlpipe_free_buf(buf)
+	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
+	d := &decoder{data: data}
+	return decodeQueryResult(d), nil
+}
+
+// Unsubscribe removes a subscription from the peer's replica side.
+func (p *Peer) Unsubscribe(id SubscriptionID) error {
+	return convertError(C.sqlpipe_peer_unsubscribe(p.ptr, C.uint64_t(id)))
 }
 
 // HandleMessage processes an incoming PeerMessage.

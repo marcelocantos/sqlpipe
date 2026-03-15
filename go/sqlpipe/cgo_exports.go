@@ -54,6 +54,18 @@ func goLogTrampoline(handle C.uintptr_t, level C.uint8_t, message *C.char) {
 	fn(LogLevel(level), C.GoString(message))
 }
 
+//export goFlushTrampoline
+func goFlushTrampoline(handle C.uintptr_t, data *C.uint8_t, dataLen C.size_t) {
+	h := cgo.Handle(handle)
+	fn := h.Value().(FlushCallback)
+	buf := C.GoBytes(unsafe.Pointer(data), C.int(dataLen))
+	msgs, err := decodeMessagesFromBytes(buf)
+	if err != nil {
+		return // Best-effort: silently drop on decode error.
+	}
+	fn(msgs)
+}
+
 //export goApproveOwnershipTrampoline
 func goApproveOwnershipTrampoline(handle C.uintptr_t, tables **C.char, count C.size_t) C.int {
 	h := cgo.Handle(handle)

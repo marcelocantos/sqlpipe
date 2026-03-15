@@ -72,6 +72,9 @@ typedef int (*sqlpipe_approve_ownership_fn)(
 typedef void (*sqlpipe_log_fn)(
     void* ctx, uint8_t level, const char* message);
 
+// Flush callback. data/len is encoded messages buffer [u32 count][msg1][msg2]...
+typedef void (*sqlpipe_flush_fn)(void* ctx, const uint8_t* data, size_t len);
+
 // ── Config structs ──────────────────────────────────────────────
 
 typedef struct {
@@ -85,6 +88,8 @@ typedef struct {
     void*                       schema_mismatch_ctx;
     sqlpipe_log_fn              on_log;
     void*                       log_ctx;
+    sqlpipe_flush_fn            on_flush;
+    void*                       flush_ctx;
 } sqlpipe_master_config;
 
 typedef struct {
@@ -133,6 +138,10 @@ sqlpipe_error sqlpipe_master_handle_message(
     sqlpipe_master* m,
     const uint8_t* msg_data, size_t msg_len,
     sqlpipe_buf* out);
+
+// Execute SQL on the master's database. If on_flush is set, changes
+// are delivered via the callback automatically.
+sqlpipe_error sqlpipe_master_exec(sqlpipe_master* m, const char* sql);
 
 int64_t sqlpipe_master_current_seq(sqlpipe_master* m);
 int32_t sqlpipe_master_schema_version(sqlpipe_master* m);
@@ -200,6 +209,14 @@ void sqlpipe_peer_owned_tables(
 void sqlpipe_peer_remote_tables(
     sqlpipe_peer* p, char*** out_tables, size_t* out_count);
 void sqlpipe_free_string_array(char** arr, size_t count);
+
+// ── Database utilities ──────────────────────────────────────────
+
+// Execute a one-shot query. Returns encoded QueryResult in out.
+sqlpipe_error sqlpipe_db_query(sqlite3* db, const char* sql, sqlpipe_buf* out);
+
+// Execute SQL statement(s) without returning results.
+sqlpipe_error sqlpipe_db_exec(sqlite3* db, const char* sql);
 
 #ifdef __cplusplus
 }

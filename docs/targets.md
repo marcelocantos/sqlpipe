@@ -8,13 +8,14 @@
 - **Weight**: 1 (value 8 / cost 8)
 - **Estimated-cost**: 8
 - **Acceptance**:
-  - `go test -tags libsqlite3 ./...` passes with coverage of Master, Replica, Peer, and QueryWatch APIs
-  - All callback types (log, progress, schema mismatch, table filter) work through CGo trampolines
+  - `go test ./...` passes (no build tags) with coverage of Master, Replica, Peer, and QueryWatch APIs
+  - All callback types (log, progress, schema mismatch, table filter, flush) work through CGo trampolines
   - Integration tests demonstrate live streaming, diff sync, and peer bidirectional replication from Go
   - Wire-compatible with C++ (same protocol v5 messages cross the boundary)
-- **Context**: Go is a major adoption vector for sqlpipe. The CGo wrapper lets Go consumers use sqlpipe without reimplementing the protocol. Foundation exists (~2200 lines, serialization tests pass) but needs full API coverage.
-- **Status**: converging
+- **Context**: Go is a major adoption vector for sqlpipe. The CGo wrapper lets Go consumers use sqlpipe without reimplementing the protocol.
+- **Status**: achieved
 - **Discovered**: 2026-03-12
+- **Achieved**: 2026-03-15
 
 ### 🎯T2 sqlpipe reaches 1.0
 - **Weight**: 4 (value 13 / cost 3)
@@ -120,8 +121,9 @@
   - Public API surface: Database, Master, Replica, Peer, QueryWatch (mirrors the Wasm/TypeScript wrapper)
   - `go get github.com/marcelocantos/sqlpipe/go/sqlpipe` works from outside the monorepo
 - **Context**: Users interact exclusively with the sqlpipe API, never with raw SQLite. The mattn dependency creates confusing build failures, requires `-tags libsqlite3`, and exposes implementation details. The Wasm wrapper already demonstrates the right pattern — own the sqlite3* handles internally.
-- **Status**: identified
+- **Status**: achieved
 - **Discovered**: 2026-03-15
+- **Achieved**: 2026-03-15
 
 ### 🎯T4 Reconnect skips diff sync when seq matches
 - **Weight**: 3 (value 5 / cost 2)
