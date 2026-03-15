@@ -15,11 +15,29 @@ mk clean    # remove build/
 
 ```sh
 cd go/sqlpipe
-go test -tags libsqlite3 ./...
+go test ./...
 ```
 
-The `-tags libsqlite3` flag is required — it tells mattn/go-sqlite3 to link
-against the vendored SQLite rather than its bundled copy.
+The Go wrapper is self-contained — it compiles vendored SQLite with the
+required session/preupdate flags via CGo. No build tags or system SQLite
+needed.
+
+### Version strings
+
+When bumping the version, update all of these:
+
+1. `dist/sqlpipe.h` — `SQLPIPE_VERSION` + `_MAJOR`/`_MINOR`/`_PATCH`
+2. `go/sqlpipe/types.go` — `Version` + `VersionMajor`/`VersionMinor`/`VersionPatch`
+3. `web/package.json` — `"version"`
+4. `STABILITY.md` — snapshot line + version macro table
+
+After tagging the release, also create the Go module subdirectory tag:
+```sh
+git tag go/sqlpipe/v<VERSION> v<VERSION>
+git push origin go/sqlpipe/v<VERSION>
+```
+This is required for `go get github.com/marcelocantos/sqlpipe/go/sqlpipe@v<VERSION>`
+to resolve correctly (Go modules in subdirectories need path-prefixed tags).
 
 ### Wasm (browser)
 
