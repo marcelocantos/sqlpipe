@@ -34,15 +34,15 @@ structural schema hashing via sqlift). Clock starts from that release.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.9.0. Items annotated with stability assessments.
+Snapshot as of v0.10.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.9.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.10.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `9` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `10` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 
 ### Type aliases
@@ -59,6 +59,7 @@ Snapshot as of v0.9.0. Items annotated with stability assessments.
 | `LogCallback` | `std::function<void(LogLevel, std::string_view)>` | **Stable** |
 | `SchemaMismatchCallback` | `std::function<bool(SchemaVersion remote, SchemaVersion local, const std::string& remote_schema_sql)>` | **Stable** |
 | `ApproveOwnershipCallback` | `std::function<bool(const std::set<std::string>&)>` | **Stable** |
+| `FlushCallback` | `std::function<void(const std::vector<Message>&)>` | **Stable** |
 
 ### Enums
 
@@ -109,7 +110,7 @@ Snapshot as of v0.9.0. Items annotated with stability assessments.
 
 | Struct | Fields | Stability |
 |---|---|---|
-| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log` | **Stable** |
+| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, on_flush` | **Stable** |
 | `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log` | **Stable** |
 | `PeerConfig` | `owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch, on_log` | **Stable** |
 
@@ -142,6 +143,7 @@ class Master {
     Master(Master&&) noexcept;
     Master& operator=(Master&&) noexcept;
 
+    void exec(const std::string& sql);
     std::vector<Message> flush();
     std::vector<Message> handle_message(const Message& msg);
     Seq current_seq() const;

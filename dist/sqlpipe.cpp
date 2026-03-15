@@ -1364,12 +1364,55 @@ struct Master::Impl {
         }
     }
 
+    bool flush_pending = false;
+    bool in_auto_flush = false;
+
+    static int commit_hook_cb(void* ctx) {
+        auto* self = static_cast<Impl*>(ctx);
+        if (!self->in_auto_flush) {
+            self->flush_pending = true;
+        }
+        return 0;
+    }
+
+    void auto_flush() {
+        in_auto_flush = true;
+
+        // Check for schema changes.
+        auto sv = detail::compute_schema_fingerprint(db, filter());
+        if (sv != cached_sv) {
+            cached_sv = sv;
+            scan_tables();
+            recreate_session();
+        }
+
+        auto cs = extract_changeset();
+        if (!cs.empty()) {
+            recreate_session();
+            seq++;
+            detail::write_seq(db, seq, config.seq_key);
+
+            SQLPIPE_LOG(config.on_log, LogLevel::Debug,
+                        "auto-flushed changeset seq={} ({} bytes)", seq, cs.size());
+
+            std::vector<Message> msgs = {ChangesetMsg{seq, std::move(cs)}};
+            config.on_flush(msgs);
+        }
+
+        in_auto_flush = false;
+    }
+
     void init() {
         detail::ensure_meta_table(db);
         seq = detail::read_seq(db, config.seq_key);
         cached_sv = detail::compute_schema_fingerprint(db, filter());
         scan_tables();
         recreate_session();
+
+        if (config.on_flush) {
+            sqlite3_commit_hook(db, &Impl::commit_hook_cb, this);
+        }
+
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "master initialized at seq={}", seq);
     }
 
@@ -1679,9 +1722,20 @@ Master::Master(sqlite3* db, MasterConfig config)
     impl_->init();
 }
 
-Master::~Master() = default;
+Master::~Master() {
+    if (impl_ && impl_->config.on_flush) {
+        sqlite3_commit_hook(impl_->db, nullptr, nullptr);
+    }
+}
 Master::Master(Master&&) noexcept = default;
 Master& Master::operator=(Master&&) noexcept = default;
+
+void Master::exec(const std::string& sql) {
+    detail::exec(impl_->db, sql.c_str());
+    if (impl_->config.on_flush && impl_->flush_pending) {
+        impl_->auto_flush();
+    }
+}
 
 std::vector<Message> Master::flush() {
     // If DDL ran since last flush, the tracked table set may have changed.

@@ -155,3 +155,81 @@ TEST_CASE("master: bucket hashes all match produces empty DiffReady") {
     CHECK(dr.patchset.empty());
     CHECK(dr.deletes.empty());
 }
+
+TEST_CASE("master: on_flush fires automatically on commit") {
+    DB d;
+    d.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+
+    std::vector<std::vector<Message>> received;
+    MasterConfig cfg;
+    cfg.on_flush = [&](const std::vector<Message>& msgs) {
+        received.push_back(msgs);
+    };
+    Master master(d.db, cfg);
+
+    CHECK(received.empty());
+
+    // Single insert via master.exec — auto-flush fires.
+    master.exec("INSERT INTO t VALUES (1, 'hello')");
+    REQUIRE(received.size() == 1);
+    REQUIRE(received[0].size() == 1);
+    CHECK(std::holds_alternative<ChangesetMsg>(received[0][0]));
+    CHECK(std::get<ChangesetMsg>(received[0][0]).seq == 1);
+
+    // Another insert — seq increments.
+    master.exec("INSERT INTO t VALUES (2, 'world')");
+    REQUIRE(received.size() == 2);
+    CHECK(std::get<ChangesetMsg>(received[1][0]).seq == 2);
+
+    // No-op — on_flush should NOT fire.
+    master.exec("SELECT 1");
+    CHECK(received.size() == 2);
+}
+
+TEST_CASE("master: on_flush delivers to replica") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Replica replica(replica_db.db);
+
+    // Accumulate messages from on_flush.
+    std::vector<Message> pending;
+    MasterConfig cfg;
+    cfg.on_flush = [&](const std::vector<Message>& msgs) {
+        pending.insert(pending.end(), msgs.begin(), msgs.end());
+    };
+    Master master(master_db.db, cfg);
+
+    // Handshake (manual — on_flush only fires on data commits).
+    sync_handshake(master, replica);
+    CHECK(replica.state() == Replica::State::Live);
+
+    // Write via master.exec triggers auto-flush.
+    master.exec("INSERT INTO t VALUES (1, 'hello')");
+    REQUIRE(pending.size() == 1);
+
+    // Feed to replica.
+    auto result = replica.handle_message(pending[0]);
+    CHECK(result.changes.size() == 1);
+    CHECK(result.changes[0].table == "t");
+    CHECK(replica.current_seq() == 1);
+}
+
+TEST_CASE("master: on_flush transaction rollback produces nothing") {
+    DB d;
+    d.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+
+    std::vector<std::vector<Message>> received;
+    MasterConfig cfg;
+    cfg.on_flush = [&](const std::vector<Message>& msgs) {
+        received.push_back(msgs);
+    };
+    Master master(d.db, cfg);
+
+    master.exec("BEGIN");
+    master.exec("INSERT INTO t VALUES (1, 'hello')");
+    master.exec("ROLLBACK");
+    CHECK(received.empty());  // nothing committed, no flush
+}

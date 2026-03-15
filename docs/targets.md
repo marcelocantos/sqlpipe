@@ -1,6 +1,6 @@
 # Targets
 
-<!-- last-evaluated: e95a27f -->
+<!-- last-evaluated: ae18ee5 -->
 
 ## Active
 
@@ -40,7 +40,7 @@
   - Integration test demonstrates live streaming replication between two in-browser instances
   - Published as npm package with bundled Wasm
 - **Context**: Browser support opens web apps, collaborative editors, offline-first PWAs. The message-in/message-out architecture is naturally suited — JS just needs to handle transport (WebSocket, WebRTC, etc.).
-- **Status**: converging (🎯T3.1 and 🎯T3.2 achieved, 🎯T3.3 remaining)
+- **Status**: converging (🎯T3.1, 🎯T3.2, 🎯T3.3 achieved; 🎯T3.4 remaining)
 - **Discovered**: 2026-03-14
 
 ### 🎯T3.1 C++ compiles to Wasm via Emscripten
@@ -105,9 +105,8 @@
   - Tests verify subscriptions fire through Peer after bidirectional sync
   - Go wrapper, Wasm C API, and TypeScript wrapper updated
 - **Context**: Discovered by an agent using sqlpipe. Peer wraps Master+Replica but doesn't expose the Replica's subscription API, forcing users to manage a separate QueryWatch.
-- **Status**: achieved
+- **Status**: close — C++ API, Wasm C API, and TypeScript wrapper done; Go wrapper missing Peer.Subscribe/Unsubscribe and PeerHandleResult.Subscriptions
 - **Discovered**: 2026-03-15
-- **Achieved**: 2026-03-15
 
 ### 🎯T6 Go wrapper is self-contained (no mattn/go-sqlite3 dependency)
 - **Weight**: 5 (value 8 / cost 2)
@@ -136,5 +135,17 @@
 - **Context**: Common case is normal disconnect with near-instant reconnect. Currently triggers full diff sync (O(b) bucket hashes) even when nothing changed. Seq comparison makes this O(1).
 - **Status**: identified
 - **Discovered**: 2026-03-14
+
+### 🎯T7 Peer role is explicit rather than inferred from callback presence
+- **Weight**: 2 (value 3 / cost 2)
+- **Estimated-cost**: 2
+- **Acceptance**:
+  - PeerConfig has an explicit role field (e.g., `PeerRole::Client` / `PeerRole::Server`)
+  - `approve_ownership` callback is only valid on Server peers
+  - `start()` is only valid on Client peers (already enforced, but tied to role not callback)
+  - Existing implicit behavior preserved as default for backwards compatibility during pre-1.0
+- **Context**: Currently the server role is inferred from whether `approve_ownership` is set. This is subtle and easy to misconfigure. An explicit role makes the API self-documenting. Breaking change — must be done before 1.0.
+- **Status**: identified
+- **Discovered**: 2026-03-15
 
 ## Achieved

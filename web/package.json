@@ -1,6 +1,6 @@
 {
   "name": "sqlpipe",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Streaming SQLite replication for the browser",
   "type": "module",
   "main": "dist/index.js",

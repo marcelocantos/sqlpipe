@@ -62,3 +62,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `53cf4b1`
 - **Outcome**: Released v0.9.0. Automatic schema migration via sqlift, one-shot query() API, sqlift borrowing constructor.
+
+## 2026-03-15 — /release v0.10.0
+
+- **Commit**: `e0c17b6`
+- **Outcome**: Released v0.10.0. FlushCallback auto-flush, Master::exec.
