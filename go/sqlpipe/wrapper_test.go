@@ -691,3 +691,149 @@ func TestPeerSubscribe(t *testing.T) {
 		}
 	}
 }
+
+func TestExecWithParams(t *testing.T) {
+	db := openMemory(t)
+	mustExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL)")
+
+	if err := db.Exec("INSERT INTO t VALUES (?, ?, ?)", 1, "alice", 95.5); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("INSERT INTO t VALUES (?, ?, ?)", 2, "bob", 87.3); err != nil {
+		t.Fatal(err)
+	}
+
+	qr, err := db.Query("SELECT name, score FROM t WHERE score > ?", 90.0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qr.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(qr.Rows))
+	}
+	if qr.Rows[0][0] != "alice" {
+		t.Errorf("expected alice, got %v", qr.Rows[0][0])
+	}
+}
+
+func TestRows(t *testing.T) {
+	db := openMemory(t)
+	mustExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL)")
+	mustExec(t, db, "INSERT INTO t VALUES (1, 'alice', 95.5)")
+	mustExec(t, db, "INSERT INTO t VALUES (2, 'bob', 87.3)")
+	mustExec(t, db, "INSERT INTO t VALUES (3, 'carol', 92.1)")
+
+	var names []string
+	var scores []float64
+	for row := range db.Rows("SELECT name, score FROM t WHERE score > ? ORDER BY name", 90.0) {
+		if row.Err() != nil {
+			t.Fatal(row.Err())
+		}
+		names = append(names, row.Text(0))
+		scores = append(scores, row.Float64(1))
+	}
+	if len(names) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(names))
+	}
+	if names[0] != "alice" || names[1] != "carol" {
+		t.Errorf("expected [alice carol], got %v", names)
+	}
+}
+
+func TestRowsEarlyBreak(t *testing.T) {
+	db := openMemory(t)
+	mustExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+	for i := range 100 {
+		if err := db.Exec("INSERT INTO t VALUES (?)", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	count := 0
+	for row := range db.Rows("SELECT id FROM t") {
+		if row.Err() != nil {
+			t.Fatal(row.Err())
+		}
+		count++
+		if count == 5 {
+			break // early exit — statement should be finalized
+		}
+	}
+	if count != 5 {
+		t.Errorf("expected 5, got %d", count)
+	}
+
+	// Verify the database is still usable after early break.
+	qr, err := db.Query("SELECT count(*) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qr.Rows[0][0] != int64(100) {
+		t.Errorf("expected 100, got %v", qr.Rows[0][0])
+	}
+}
+
+func TestTransaction(t *testing.T) {
+	db := openMemory(t)
+	mustExec(t, db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+
+	// Successful transaction.
+	err := db.Tx(func(tx *Tx) error {
+		if err := tx.Exec("INSERT INTO t VALUES (?, ?)", 1, "a"); err != nil {
+			return err
+		}
+		return tx.Exec("INSERT INTO t VALUES (?, ?)", 2, "b")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qr, _ := db.Query("SELECT count(*) FROM t")
+	if qr.Rows[0][0] != int64(2) {
+		t.Errorf("expected 2 rows after commit, got %v", qr.Rows[0][0])
+	}
+
+	// Rolled-back transaction.
+	err = db.Tx(func(tx *Tx) error {
+		if err := tx.Exec("INSERT INTO t VALUES (?, ?)", 3, "c"); err != nil {
+			return err
+		}
+		return &Error{Code: ErrSqlite, Msg: "simulated error"}
+	})
+	if err == nil {
+		t.Fatal("expected error from rolled-back tx")
+	}
+	qr, _ = db.Query("SELECT count(*) FROM t")
+	if qr.Rows[0][0] != int64(2) {
+		t.Errorf("expected 2 rows after rollback, got %v", qr.Rows[0][0])
+	}
+}
+
+func TestRowValueTypes(t *testing.T) {
+	db := openMemory(t)
+	mustExec(t, db, "CREATE TABLE t (i INTEGER, r REAL, s TEXT, b BLOB, n)")
+	if err := db.Exec("INSERT INTO t VALUES (?, ?, ?, ?, ?)",
+		42, 3.14, "hello", []byte{0xDE, 0xAD}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	for row := range db.Rows("SELECT i, r, s, b, n FROM t") {
+		if row.Err() != nil {
+			t.Fatal(row.Err())
+		}
+		if row.Int64(0) != 42 {
+			t.Errorf("int64: got %d", row.Int64(0))
+		}
+		if row.Float64(1) != 3.14 {
+			t.Errorf("float64: got %f", row.Float64(1))
+		}
+		if row.Text(2) != "hello" {
+			t.Errorf("text: got %s", row.Text(2))
+		}
+		blob := row.Blob(3)
+		if len(blob) != 2 || blob[0] != 0xDE || blob[1] != 0xAD {
+			t.Errorf("blob: got %v", blob)
+		}
+		if !row.IsNull(4) {
+			t.Errorf("expected null at column 4")
+		}
+	}
+}

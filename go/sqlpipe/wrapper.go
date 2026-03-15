@@ -11,6 +11,17 @@ package sqlpipe
 #include "../../vendor/include/sqlite3.h"
 #include "sqlpipe_capi.h"
 
+// SQLITE_TRANSIENT is a macro casting -1 to a function pointer,
+// which CGo can't handle. Provide a C wrapper.
+#define SQLPIPE_TRANSIENT ((sqlite3_destructor_type)-1)
+
+static int sqlpipe_bind_text(sqlite3_stmt* s, int i, const char* v, int n) {
+	return sqlite3_bind_text(s, i, v, n, SQLPIPE_TRANSIENT);
+}
+static int sqlpipe_bind_blob(sqlite3_stmt* s, int i, const void* v, int n) {
+	return sqlite3_bind_blob(s, i, v, n, SQLPIPE_TRANSIENT);
+}
+
 // Forward-declare Go callback trampolines (defined in cgo_exports.go).
 extern void goProgressTrampoline(uintptr_t, uint8_t, const char*, int64_t, int64_t);
 extern int goSchemaMismatchTrampoline(uintptr_t, int32_t, int32_t, const char*);
@@ -44,6 +55,8 @@ import "C"
 
 import (
 	"encoding/binary"
+	"fmt"
+	"iter"
 	"math"
 	"runtime/cgo"
 	"unsafe"
@@ -85,29 +98,348 @@ func (d *Database) Close() error {
 }
 
 // Exec executes one or more SQL statements without returning results.
-func (d *Database) Exec(sql string) error {
-	csql := C.CString(sql)
-	defer C.free(unsafe.Pointer(csql))
-	return convertError(C.sqlpipe_db_exec(d.db, csql))
+// Use ? placeholders for parameters to avoid SQL injection.
+func (d *Database) Exec(sql string, args ...any) error {
+	if len(args) == 0 {
+		csql := C.CString(sql)
+		defer C.free(unsafe.Pointer(csql))
+		return convertError(C.sqlpipe_db_exec(d.db, csql))
+	}
+	stmt, err := d.prepare(sql)
+	if err != nil {
+		return err
+	}
+	defer C.sqlite3_finalize(stmt)
+	if err := bindArgs(d.db, stmt, args); err != nil {
+		return err
+	}
+	rc := C.sqlite3_step(stmt)
+	if rc != C.SQLITE_DONE && rc != C.SQLITE_ROW {
+		return d.sqliteErr()
+	}
+	return nil
 }
 
-// Query executes a one-shot SQL query and returns the result set.
-func (d *Database) Query(sql string) (QueryResult, error) {
-	csql := C.CString(sql)
-	defer C.free(unsafe.Pointer(csql))
-	var buf C.sqlpipe_buf
-	if err := convertError(C.sqlpipe_db_query(d.db, csql, &buf)); err != nil {
+// Query executes a SQL query and returns the full result set in memory.
+// Use ? placeholders for parameters. Suitable for small result sets.
+func (d *Database) Query(sql string, args ...any) (QueryResult, error) {
+	if len(args) == 0 {
+		csql := C.CString(sql)
+		defer C.free(unsafe.Pointer(csql))
+		var buf C.sqlpipe_buf
+		if err := convertError(C.sqlpipe_db_query(d.db, csql, &buf)); err != nil {
+			return QueryResult{}, err
+		}
+		defer C.sqlpipe_free_buf(buf)
+		data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
+		dec := &decoder{data: data}
+		return decodeQueryResult(dec), nil
+	}
+	// Parameterized query — use prepared statement.
+	stmt, err := d.prepare(sql)
+	if err != nil {
 		return QueryResult{}, err
 	}
-	defer C.sqlpipe_free_buf(buf)
-	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
-	dec := &decoder{data: data}
-	return decodeQueryResult(dec), nil
+	defer C.sqlite3_finalize(stmt)
+	if err := bindArgs(d.db, stmt, args); err != nil {
+		return QueryResult{}, err
+	}
+	return stmtToQueryResult(stmt), nil
+}
+
+// Rows executes a SQL query and returns an iterator over the result rows.
+// Use ? placeholders for parameters. The iterator streams rows one at a
+// time — suitable for large result sets. The statement is finalized when
+// the iterator is exhausted or the loop breaks early.
+//
+// Check Row.Err() after the loop to detect errors during iteration.
+//
+//	for row := range db.Rows("SELECT id, name FROM t WHERE score > ?", 90) {
+//	    fmt.Println(row.Int64(0), row.Text(1))
+//	}
+func (d *Database) Rows(sql string, args ...any) iter.Seq[*Row] {
+	return func(yield func(*Row) bool) {
+		stmt, err := d.prepare(sql)
+		if err != nil {
+			yield(&Row{err: err})
+			return
+		}
+		defer C.sqlite3_finalize(stmt)
+		if err := bindArgs(d.db, stmt, args); err != nil {
+			yield(&Row{err: err})
+			return
+		}
+		ncols := int(C.sqlite3_column_count(stmt))
+		for {
+			rc := C.sqlite3_step(stmt)
+			if rc == C.SQLITE_DONE {
+				return
+			}
+			if rc != C.SQLITE_ROW {
+				yield(&Row{err: d.sqliteErr()})
+				return
+			}
+			if !yield(&Row{stmt: stmt, ncols: ncols}) {
+				return
+			}
+		}
+	}
+}
+
+// Begin starts a transaction. Call Commit() or Rollback() on the
+// returned Tx to end it. For convenience, use Database.Tx() instead.
+func (d *Database) Begin() (*Tx, error) {
+	if err := d.Exec("BEGIN"); err != nil {
+		return nil, err
+	}
+	return &Tx{db: d}, nil
+}
+
+// Tx runs fn inside a transaction. If fn returns nil, the transaction
+// is committed. If fn returns an error (or panics), it is rolled back.
+func (d *Database) Tx(fn func(tx *Tx) error) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			_ = tx.Rollback()
+			panic(r)
+		}
+	}()
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // Handle returns the raw sqlite3* pointer for use with CGo.
 func (d *Database) Handle() unsafe.Pointer {
 	return unsafe.Pointer(d.db)
+}
+
+func (d *Database) prepare(sql string) (*C.sqlite3_stmt, error) {
+	csql := C.CString(sql)
+	defer C.free(unsafe.Pointer(csql))
+	var stmt *C.sqlite3_stmt
+	rc := C.sqlite3_prepare_v2(d.db, csql, -1, &stmt, nil)
+	if rc != C.SQLITE_OK {
+		return nil, d.sqliteErr()
+	}
+	return stmt, nil
+}
+
+func (d *Database) sqliteErr() error {
+	return &Error{Code: ErrSqlite, Msg: C.GoString(C.sqlite3_errmsg(d.db))}
+}
+
+// ── Tx ──────────────────────────────────────────────────────────
+
+// Tx represents an active database transaction.
+type Tx struct {
+	db   *Database
+	done bool
+}
+
+// Exec executes a parameterized SQL statement within the transaction.
+func (tx *Tx) Exec(sql string, args ...any) error {
+	if tx.done {
+		return &Error{Code: ErrInvalidState, Msg: "transaction already ended"}
+	}
+	return tx.db.Exec(sql, args...)
+}
+
+// Query executes a parameterized SQL query within the transaction.
+func (tx *Tx) Query(sql string, args ...any) (QueryResult, error) {
+	if tx.done {
+		return QueryResult{}, &Error{Code: ErrInvalidState, Msg: "transaction already ended"}
+	}
+	return tx.db.Query(sql, args...)
+}
+
+// Rows returns a row iterator within the transaction.
+func (tx *Tx) Rows(sql string, args ...any) iter.Seq[*Row] {
+	if tx.done {
+		return func(yield func(*Row) bool) {
+			yield(&Row{err: &Error{Code: ErrInvalidState, Msg: "transaction already ended"}})
+		}
+	}
+	return tx.db.Rows(sql, args...)
+}
+
+// Commit commits the transaction.
+func (tx *Tx) Commit() error {
+	if tx.done {
+		return &Error{Code: ErrInvalidState, Msg: "transaction already ended"}
+	}
+	tx.done = true
+	return tx.db.Exec("COMMIT")
+}
+
+// Rollback rolls back the transaction.
+func (tx *Tx) Rollback() error {
+	if tx.done {
+		return &Error{Code: ErrInvalidState, Msg: "transaction already ended"}
+	}
+	tx.done = true
+	return tx.db.Exec("ROLLBACK")
+}
+
+// ── Row ─────────────────────────────────────────────────────────
+
+// Row provides access to column values of the current result row.
+// Column accessors use zero-based indices.
+type Row struct {
+	stmt  *C.sqlite3_stmt
+	ncols int
+	err   error
+}
+
+// Err returns any error that occurred during iteration.
+func (r *Row) Err() error { return r.err }
+
+// ColumnCount returns the number of columns in the result.
+func (r *Row) ColumnCount() int { return r.ncols }
+
+// IsNull returns true if the column value is NULL.
+func (r *Row) IsNull(col int) bool {
+	return C.sqlite3_column_type(r.stmt, C.int(col)) == C.SQLITE_NULL
+}
+
+// Int64 returns the column value as int64.
+func (r *Row) Int64(col int) int64 {
+	return int64(C.sqlite3_column_int64(r.stmt, C.int(col)))
+}
+
+// Float64 returns the column value as float64.
+func (r *Row) Float64(col int) float64 {
+	return float64(C.sqlite3_column_double(r.stmt, C.int(col)))
+}
+
+// Text returns the column value as string.
+func (r *Row) Text(col int) string {
+	p := C.sqlite3_column_text(r.stmt, C.int(col))
+	if p == nil {
+		return ""
+	}
+	return C.GoString((*C.char)(unsafe.Pointer(p)))
+}
+
+// Blob returns the column value as []byte.
+func (r *Row) Blob(col int) []byte {
+	p := C.sqlite3_column_blob(r.stmt, C.int(col))
+	n := C.sqlite3_column_bytes(r.stmt, C.int(col))
+	if p == nil || n == 0 {
+		return nil
+	}
+	return C.GoBytes(p, n)
+}
+
+// Value returns the column value using SQLite's type affinity.
+// Returns nil (NULL), int64, float64, string, or []byte.
+func (r *Row) Value(col int) any {
+	switch C.sqlite3_column_type(r.stmt, C.int(col)) {
+	case C.SQLITE_NULL:
+		return nil
+	case C.SQLITE_INTEGER:
+		return r.Int64(col)
+	case C.SQLITE_FLOAT:
+		return r.Float64(col)
+	case C.SQLITE_TEXT:
+		return r.Text(col)
+	case C.SQLITE_BLOB:
+		return r.Blob(col)
+	default:
+		return nil
+	}
+}
+
+// ── Bind helpers ────────────────────────────────────────────────
+
+func bindArgs(db *C.sqlite3, stmt *C.sqlite3_stmt, args []any) error {
+	for i, arg := range args {
+		idx := C.int(i + 1) // SQLite bind indices are 1-based
+		var rc C.int
+		switch v := arg.(type) {
+		case nil:
+			rc = C.sqlite3_bind_null(stmt, idx)
+		case int:
+			rc = C.sqlite3_bind_int64(stmt, idx, C.sqlite3_int64(v))
+		case int64:
+			rc = C.sqlite3_bind_int64(stmt, idx, C.sqlite3_int64(v))
+		case float64:
+			rc = C.sqlite3_bind_double(stmt, idx, C.double(v))
+		case string:
+			cs := C.CString(v)
+			rc = C.sqlpipe_bind_text(stmt, idx, cs, C.int(len(v)))
+			C.free(unsafe.Pointer(cs))
+		case []byte:
+			if len(v) == 0 {
+				rc = C.sqlite3_bind_zeroblob(stmt, idx, 0)
+			} else {
+				rc = C.sqlpipe_bind_blob(stmt, idx, unsafe.Pointer(&v[0]), C.int(len(v)))
+			}
+		case bool:
+			if v {
+				rc = C.sqlite3_bind_int64(stmt, idx, 1)
+			} else {
+				rc = C.sqlite3_bind_int64(stmt, idx, 0)
+			}
+		default:
+			return fmt.Errorf("unsupported bind type %T at index %d", arg, i)
+		}
+		if rc != C.SQLITE_OK {
+			return &Error{Code: ErrSqlite, Msg: C.GoString(C.sqlite3_errmsg(db))}
+		}
+	}
+	return nil
+}
+
+func stmtToQueryResult(stmt *C.sqlite3_stmt) QueryResult {
+	ncols := int(C.sqlite3_column_count(stmt))
+	columns := make([]string, ncols)
+	for i := range ncols {
+		name := C.sqlite3_column_name(stmt, C.int(i))
+		if name != nil {
+			columns[i] = C.GoString(name)
+		}
+	}
+	var rows [][]Value
+	for {
+		rc := C.sqlite3_step(stmt)
+		if rc == C.SQLITE_DONE {
+			break
+		}
+		if rc != C.SQLITE_ROW {
+			break
+		}
+		row := make([]Value, ncols)
+		for i := range ncols {
+			switch C.sqlite3_column_type(stmt, C.int(i)) {
+			case C.SQLITE_NULL:
+				row[i] = nil
+			case C.SQLITE_INTEGER:
+				row[i] = int64(C.sqlite3_column_int64(stmt, C.int(i)))
+			case C.SQLITE_FLOAT:
+				row[i] = float64(C.sqlite3_column_double(stmt, C.int(i)))
+			case C.SQLITE_TEXT:
+				p := C.sqlite3_column_text(stmt, C.int(i))
+				row[i] = C.GoString((*C.char)(unsafe.Pointer(p)))
+			case C.SQLITE_BLOB:
+				p := C.sqlite3_column_blob(stmt, C.int(i))
+				n := C.sqlite3_column_bytes(stmt, C.int(i))
+				if p != nil && n > 0 {
+					row[i] = C.GoBytes(p, n)
+				} else {
+					row[i] = []byte(nil)
+				}
+			}
+		}
+		rows = append(rows, row)
+	}
+	return QueryResult{Columns: columns, Rows: rows}
 }
 
 // ── Error conversion ────────────────────────────────────────────

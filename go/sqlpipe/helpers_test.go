@@ -7,6 +7,13 @@ import (
 	"testing"
 )
 
+func mustExec(t *testing.T, db *Database, sql string) {
+	t.Helper()
+	if err := db.Exec(sql); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func openMemory(t *testing.T) *Database {
 	t.Helper()
 	db, err := OpenDatabase(":memory:")
