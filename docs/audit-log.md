@@ -65,5 +65,10 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 ## 2026-03-15 — /release v0.10.0
 
-- **Commit**: `e0c17b6`
+- **Commit**: `5eebeeb`
 - **Outcome**: Released v0.10.0. FlushCallback auto-flush, Master::exec.
+
+## 2026-03-16 — /release v0.11.0
+
+- **Commit**: `9f09b0e`
+- **Outcome**: Released v0.11.0. Self-contained Go wrapper (dropped mattn/go-sqlite3), Database type with params/transactions/iter.Seq, Peer.Subscribe/Unsubscribe in Go.

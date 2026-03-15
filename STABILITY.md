@@ -34,15 +34,15 @@ structural schema hashing via sqlift). Clock starts from that release.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.10.0. Items annotated with stability assessments.
+Snapshot as of v0.11.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.10.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.11.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `10` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `11` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 
 ### Type aliases
