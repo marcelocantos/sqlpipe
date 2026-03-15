@@ -138,8 +138,9 @@ type HandleResult struct {
 
 // PeerHandleResult is the return type for Peer.HandleMessage.
 type PeerHandleResult struct {
-	Messages []PeerMessage
-	Changes  []ChangeEvent
+	Messages      []PeerMessage
+	Changes       []ChangeEvent
+	Subscriptions []QueryResult
 }
 
 // Config structs.
@@ -152,6 +153,7 @@ type MasterConfig struct {
 	OnProgress       ProgressCallback        // nil = no reporting.
 	OnSchemaMismatch SchemaMismatchCallback  // nil = default behaviour.
 	OnLog            LogCallback             // nil = discard log output.
+	OnFlush          FlushCallback           // nil = manual flush only.
 }
 
 // ReplicaConfig configures a Replica.

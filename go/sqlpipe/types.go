@@ -4,9 +4,9 @@
 package sqlpipe
 
 const (
-	Version      = "0.6.0"
+	Version      = "0.10.0"
 	VersionMajor = 0
-	VersionMinor = 6
+	VersionMinor = 10
 	VersionPatch = 0
 )
 
@@ -153,6 +153,11 @@ type SchemaMismatchCallback func(remoteSV, localSV SchemaVersion, remoteSchemaSQ
 // ApproveOwnershipCallback validates a client's ownership request (server-side).
 // Return true to approve, false to reject.
 type ApproveOwnershipCallback func(requestedTables map[string]bool) bool
+
+// FlushCallback is called when the Master auto-flushes after a write
+// transaction committed via Master.Exec. It receives the changeset messages
+// ready to send to replicas.
+type FlushCallback func(messages []Message)
 
 // Protocol constants.
 const (
