@@ -20,7 +20,17 @@ go test ./...
 
 The Go wrapper is self-contained — it compiles vendored SQLite with the
 required session/preupdate flags via CGo. No build tags or system SQLite
-needed.
+needed. Sources are copied into `go/sqlpipe/internal/c/` so the module
+works standalone via `go get`.
+
+When `dist/sqlpipe.h`, `dist/sqlpipe.cpp`, or vendored dependencies change,
+re-copy them into `go/sqlpipe/internal/c/`:
+```sh
+cp dist/sqlpipe.{h,cpp} go/sqlpipe/internal/c/
+cp vendor/src/{sqlite3.c,lz4.c,sqlift.cpp} go/sqlpipe/internal/c/
+cp vendor/include/{sqlite3.h,lz4.h,sqlift.h} go/sqlpipe/internal/c/
+cp vendor/include/nlohmann/json.hpp go/sqlpipe/internal/c/nlohmann/
+```
 
 ### Version strings
 

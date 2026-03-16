@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "sqlpipe_capi.h"
-#include "../../dist/sqlpipe.h"
+#include "internal/c/sqlpipe.h"
 
 #include <cstring>
 #include <new>

@@ -4,11 +4,11 @@
 package sqlpipe
 
 /*
-#cgo CXXFLAGS: -std=c++23 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -I${SRCDIR}/../../dist -I${SRCDIR}/../../vendor/include
-#cgo CFLAGS: -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -I${SRCDIR}/../../vendor/include
+#cgo CXXFLAGS: -std=c++23 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE -I${SRCDIR}/internal/c
+#cgo CFLAGS: -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE -I${SRCDIR}/internal/c
 
 #include <stdlib.h>
-#include "../../vendor/include/sqlite3.h"
+#include "internal/c/sqlite3.h"
 #include "sqlpipe_capi.h"
 
 // SQLITE_TRANSIENT is a macro casting -1 to a function pointer,
