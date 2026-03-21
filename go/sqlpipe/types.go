@@ -4,10 +4,10 @@
 package sqlpipe
 
 const (
-	Version      = "0.11.1"
+	Version      = "0.12.0"
 	VersionMajor = 0
-	VersionMinor = 11
-	VersionPatch = 1
+	VersionMinor = 12
+	VersionPatch = 0
 )
 
 // Seq is a monotonically increasing sequence number for changesets.

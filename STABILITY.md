@@ -26,20 +26,21 @@ API surface complexity:
 
 The clock starts from the last breaking change to the interaction surface.
 
-Current surface: ~75 items → 3 months. Last breaking change: v0.7.0 (protocol
-v5, structural schema hashing via sqlift, 2026-03-04). Eligible: 2026-06-04.
+Current surface: ~75 items → 3 months. Last breaking change: v0.12.0
+(subscribe() returns SubscriptionId instead of QueryResult, 2026-03-21).
+Eligible: 2026-06-21.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.11.0. Items annotated with stability assessments.
+Snapshot as of v0.12.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.11.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.12.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `11` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `12` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 
 ### Type aliases

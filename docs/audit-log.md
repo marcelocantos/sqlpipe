@@ -72,3 +72,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `9f09b0e`
 - **Outcome**: Released v0.11.0. Self-contained Go wrapper (dropped mattn/go-sqlite3), Database type with params/transactions/iter.Seq, Peer.Subscribe/Unsubscribe in Go.
+
+## 2026-03-21 — /release v0.12.0
+
+- **Commit**: `3d24e09`
+- **Outcome**: Released v0.12.0. Breaking: subscribe() returns SubscriptionId. Fix subscriptions not firing after diff sync. Defer eval until Live. Settling clock reset.
