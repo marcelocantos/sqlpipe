@@ -77,3 +77,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `3d24e09`
 - **Outcome**: Released v0.12.0. Breaking: subscribe() returns SubscriptionId. Fix subscriptions not firing after diff sync. Defer eval until Live. Settling clock reset.
+
+## 2026-03-21 — /release v0.13.0
+
+- **Commit**: `dfcc5aa`
+- **Outcome**: Released v0.13.0. Swift SPM package with SyncPeer wrapper.
