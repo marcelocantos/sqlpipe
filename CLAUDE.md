@@ -32,6 +32,28 @@ cp vendor/include/{sqlite3.h,lz4.h,sqlift.h} go/sqlpipe/internal/c/
 cp vendor/include/nlohmann/json.hpp go/sqlpipe/internal/c/nlohmann/
 ```
 
+Also update the Swift package (`swift/Sources/CSqlpipe/`):
+```sh
+cp dist/sqlpipe.{h,cpp} swift/Sources/CSqlpipe/ && cp dist/sqlpipe.h swift/Sources/CSqlpipe/include/
+cp vendor/src/{sqlite3.c,lz4.c,sqlift.cpp} swift/Sources/CSqlpipe/
+cp vendor/include/{sqlite3.h,lz4.h,sqlift.h} swift/Sources/CSqlpipe/include/
+cp vendor/include/nlohmann/json.hpp swift/Sources/CSqlpipe/include/nlohmann/
+cp go/sqlpipe/sqlpipe_capi.{h,cpp} swift/Sources/CSqlpipe/ && cp go/sqlpipe/sqlpipe_capi.h swift/Sources/CSqlpipe/include/
+```
+Note: `sqlpipe_capi.cpp` in the Swift package uses `#include "include/..."` paths
+(different from the Go copy which uses `#include "internal/c/..."`).
+
+### Swift wrapper
+
+```sh
+cd swift && swift build                    # build SPM package
+```
+
+The Swift package (`swift/`) provides `SyncPeer` — a bidirectional sync
+wrapper with binary decoding, sqldeep transpilation, and query support.
+SPM package with two targets: `CSqlpipe` (C/C++ sources) and `Sqlpipe`
+(Swift wrapper).
+
 ### Version strings
 
 When bumping the version, update all of these:

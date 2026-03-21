@@ -1,0 +1,6 @@
+module CSqlpipe {
+    header "sqlite3.h"
+    header "sqlpipe_capi.h"
+    header "sqldeep.h"
+    export *
+}
