@@ -675,3 +675,50 @@ TEST_CASE("query: invalid SQL throws") {
     DB d;
     CHECK_THROWS_AS(query(d.db, "SELECT * FROM nonexistent"), Error);
 }
+
+TEST_CASE("integration: subscriptions fire after diff sync with no changes") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    // Insert data and sync so both sides are identical.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+    CHECK(replica.state() == Replica::State::Live);
+
+    auto msgs = master.flush();
+    for (auto& m : msgs) replica.handle_message(m);
+
+    // Verify data is on both sides.
+    CHECK(replica_db.count("t1") == 1);
+
+    // Simulate reconnect: new Master/Replica, same databases.
+    // Data is identical — diff sync will find "all buckets match".
+    Master master2(master_db.db);
+    Replica replica2(replica_db.db);
+
+    // Subscribe BEFORE the handshake.
+    auto qr = replica2.subscribe("SELECT count(*) AS cnt FROM t1");
+    CHECK(qr.rows.size() == 1);
+    CHECK(std::get<int64_t>(qr.rows[0][0]) == 1);  // data is there
+
+    // Handshake — diff sync finds no differences ("all buckets match").
+    // Use the handshake helper which drives the full exchange.
+    sync_handshake(master2, replica2);
+    CHECK(replica2.state() == Replica::State::Live);
+
+    // Now send a no-op flush to trigger subscription evaluation.
+    // Actually, the entering-Live transition should have already
+    // evaluated subscriptions. Verify by making a change and checking
+    // the subscription fires (proving it's still registered and active).
+    master_db.exec("INSERT INTO t1 VALUES (2, 'world')");
+    auto msgs2 = master2.flush();
+    REQUIRE(!msgs2.empty());
+    auto result = replica2.handle_message(msgs2[0]);
+    REQUIRE(!result.subscriptions.empty());
+    CHECK(result.subscriptions[0].id == qr.id);
+    CHECK(std::get<int64_t>(result.subscriptions[0].rows[0][0]) == 2);
+}

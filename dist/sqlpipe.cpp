@@ -2258,6 +2258,7 @@ Message Replica::hello() const {
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
+    auto prev_state = impl_->state;
     auto result = std::visit([&](const auto& m) -> HandleResult {
         using T = std::decay_t<decltype(m)>;
 
@@ -2315,19 +2316,31 @@ HandleResult Replica::handle_message(const Message& msg) {
         }
     }, msg);
 
-    // Evaluate invalidated subscriptions.
-    if (!result.changes.empty() && !impl_->watch.empty()) {
-        std::set<std::string> affected;
-        for (const auto& ev : result.changes) {
-            if (!ev.table.empty()) affected.insert(ev.table);
+    // Evaluate subscriptions only when Live — never during handshake or
+    // diff sync, where schema may be incomplete or data in flux.
+    if (impl_->state == State::Live && !impl_->watch.empty()) {
+        if (!result.changes.empty()) {
+            std::set<std::string> affected;
+            for (const auto& ev : result.changes) {
+                if (!ev.table.empty()) affected.insert(ev.table);
+            }
+            result.subscriptions = impl_->watch.notify(affected);
+        } else if (prev_state != State::Live) {
+            // Just entered Live (e.g., diff sync found no differences).
+            // Force-evaluate all subscriptions so clients that subscribed
+            // before sync get current data.
+            auto all_tables = detail::get_tracked_tables(
+                impl_->db, impl_->filter());
+            std::set<std::string> all(all_tables.begin(), all_tables.end());
+            result.subscriptions = impl_->watch.notify(all);
         }
-        result.subscriptions = impl_->watch.notify(affected);
     }
 
     return result;
 }
 
 HandleResult Replica::handle_messages(std::span<const Message> msgs) {
+    auto prev_state = impl_->state;
     HandleResult combined;
     std::set<std::string> affected;
 
@@ -2398,9 +2411,16 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
                                 result.changes.end());
     }
 
-    // Evaluate subscriptions once for all accumulated changes.
-    if (!affected.empty() && !impl_->watch.empty()) {
-        combined.subscriptions = impl_->watch.notify(affected);
+    // Evaluate subscriptions only when Live.
+    if (impl_->state == State::Live && !impl_->watch.empty()) {
+        if (!affected.empty()) {
+            combined.subscriptions = impl_->watch.notify(affected);
+        } else if (prev_state != State::Live) {
+            auto all_tables = detail::get_tracked_tables(
+                impl_->db, impl_->filter());
+            std::set<std::string> all(all_tables.begin(), all_tables.end());
+            combined.subscriptions = impl_->watch.notify(all);
+        }
     }
 
     return combined;
