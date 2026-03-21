@@ -26,19 +26,23 @@ struct DB {
 
 } // namespace
 
-TEST_CASE("QueryWatch standalone — subscribe returns current result") {
+TEST_CASE("QueryWatch standalone — subscribe returns subscription id") {
     DB d;
     d.exec("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)");
     d.exec("INSERT INTO items VALUES(1, 'alpha')");
     d.exec("INSERT INTO items VALUES(2, 'beta')");
 
     QueryWatch w(d.db);
-    auto result = w.subscribe("SELECT name FROM items ORDER BY id");
+    auto sub_id = w.subscribe("SELECT name FROM items ORDER BY id");
 
-    CHECK(result.columns == std::vector<std::string>{"name"});
-    REQUIRE(result.rows.size() == 2);
-    CHECK(std::get<std::string>(result.rows[0][0]) == "alpha");
-    CHECK(std::get<std::string>(result.rows[1][0]) == "beta");
+    // Initial result arrives on next notify().
+    CHECK(sub_id != 0);
+    auto results = w.notify({"items"});
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].columns == std::vector<std::string>{"name"});
+    REQUIRE(results[0].rows.size() == 2);
+    CHECK(std::get<std::string>(results[0].rows[0][0]) == "alpha");
+    CHECK(std::get<std::string>(results[0].rows[1][0]) == "beta");
 }
 
 TEST_CASE("QueryWatch standalone — notify detects changes") {
@@ -49,7 +53,12 @@ TEST_CASE("QueryWatch standalone — notify detects changes") {
     QueryWatch w(d.db);
     w.subscribe("SELECT name FROM items ORDER BY id");
 
-    // No change yet — notify should return nothing.
+    // First notify delivers the initial result.
+    auto initial = w.notify({"items"});
+    REQUIRE(initial.size() == 1);
+    CHECK(std::get<std::string>(initial[0].rows[0][0]) == "alpha");
+
+    // No change yet — notify again returns nothing.
     auto unchanged = w.notify({"items"});
     CHECK(unchanged.empty());
 
@@ -70,6 +79,10 @@ TEST_CASE("QueryWatch standalone — unrelated table does not fire") {
     QueryWatch w(d.db);
     w.subscribe("SELECT name FROM items ORDER BY id");
 
+    // Drain the initial result delivery.
+    w.notify({"items"});
+
+    // Now an unrelated table change should not fire the items subscription.
     d.exec("INSERT INTO other VALUES(1, 42)");
     auto result = w.notify({"other"});
     CHECK(result.empty());
@@ -81,8 +94,8 @@ TEST_CASE("QueryWatch standalone — unsubscribe stops notifications") {
     d.exec("INSERT INTO items VALUES(1, 'alpha')");
 
     QueryWatch w(d.db);
-    auto result = w.subscribe("SELECT name FROM items ORDER BY id");
-    w.unsubscribe(result.id);
+    auto sub_id = w.subscribe("SELECT name FROM items ORDER BY id");
+    w.unsubscribe(sub_id);
 
     d.exec("INSERT INTO items VALUES(2, 'beta')");
     auto changed = w.notify({"items"});
@@ -99,6 +112,9 @@ TEST_CASE("QueryWatch standalone — multiple subscriptions on same table") {
     QueryWatch w(d.db);
     w.subscribe("SELECT name FROM items ORDER BY id");
     w.subscribe("SELECT name FROM items WHERE active = 1");
+
+    // Drain initial results for both subscriptions.
+    w.notify({"items"});
 
     // Change that affects both queries.
     d.exec("UPDATE items SET active = 1 WHERE id = 2");
@@ -140,9 +156,9 @@ TEST_CASE("QueryWatch standalone — empty() reflects state") {
     QueryWatch w(d.db);
     CHECK(w.empty());
 
-    auto result = w.subscribe("SELECT * FROM items");
+    auto sub_id = w.subscribe("SELECT * FROM items");
     CHECK_FALSE(w.empty());
 
-    w.unsubscribe(result.id);
+    w.unsubscribe(sub_id);
     CHECK(w.empty());
 }

@@ -1809,6 +1809,8 @@ struct QueryWatch::Impl {
     std::map<SubscriptionId, Subscription> subscriptions;
     // Reverse index: table name → subscription IDs that depend on it.
     std::unordered_map<std::string, std::set<SubscriptionId>> table_subs;
+    // Subscriptions registered since last notify — need initial evaluation.
+    std::set<SubscriptionId> pending_new;
     SubscriptionId next_sub_id = 1;
 
     std::set<std::string> discover_tables(const std::string& sql) {
@@ -1870,6 +1872,10 @@ struct QueryWatch::Impl {
                 ids.insert(it->second.begin(), it->second.end());
             }
         }
+        // Also include any newly registered subscriptions that haven't
+        // been evaluated yet (their initial result delivery).
+        ids.insert(pending_new.begin(), pending_new.end());
+        pending_new.clear();
 
         std::vector<QueryResult> results;
         for (auto id : ids) {
@@ -1895,7 +1901,7 @@ QueryWatch::~QueryWatch() = default;
 QueryWatch::QueryWatch(QueryWatch&&) noexcept = default;
 QueryWatch& QueryWatch::operator=(QueryWatch&&) noexcept = default;
 
-QueryResult QueryWatch::subscribe(const std::string& sql) {
+SubscriptionId QueryWatch::subscribe(const std::string& sql) {
     auto tables = impl_->discover_tables(sql);
     auto id = impl_->next_sub_id++;
 
@@ -1914,11 +1920,12 @@ QueryResult QueryWatch::subscribe(const std::string& sql) {
         impl_->table_subs[t].insert(id);
     }
 
+    // Register with hash=0 (never evaluated). The next notify() will
+    // evaluate and deliver the initial result.
     impl_->subscriptions[id] = {id, sql, std::move(tables),
                                 std::move(stmt), std::move(columns), 0};
-    auto [result, hash] = impl_->evaluate_query(impl_->subscriptions[id]);
-    impl_->subscriptions[id].result_hash = hash;
-    return result;
+    impl_->pending_new.insert(id);
+    return id;
 }
 
 void QueryWatch::unsubscribe(SubscriptionId id) {
@@ -1934,6 +1941,7 @@ void QueryWatch::unsubscribe(SubscriptionId id) {
                 }
             }
         }
+        impl_->pending_new.erase(id);
         impl_->subscriptions.erase(it);
     }
 }
@@ -2426,7 +2434,7 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
     return combined;
 }
 
-QueryResult Replica::subscribe(const std::string& sql) {
+SubscriptionId Replica::subscribe(const std::string& sql) {
     return impl_->watch.subscribe(sql);
 }
 
@@ -2803,7 +2811,7 @@ PeerHandleResult Peer::handle_message(const PeerMessage& msg) {
     }
 }
 
-QueryResult Peer::subscribe(const std::string& sql) {
+SubscriptionId Peer::subscribe(const std::string& sql) {
     if (!impl_->replica) {
         throw Error(ErrorCode::InvalidState,
                     "subscribe() requires replica to be initialized");

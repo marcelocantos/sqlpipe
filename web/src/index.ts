@@ -326,15 +326,23 @@ export class Replica {
     }
   }
 
-  /** Subscribe to a SQL query. Returns the current result. */
-  subscribe(sql: string): QueryResult {
-    withStack(this.M, () => {
-      this.M._sqlpipe_replica_subscribe(
-        this.ptr, this.M.stringToUTF8OnStack(sql), this.bufPtr, this.errPtr);
-    });
-    checkError(this.M, this.errPtr);
-    const raw = readBuf(this.M, this.bufPtr);
-    return decodeQueryResult(new Reader(raw));
+  /** Subscribe to a SQL query. Returns the subscription ID.
+   *  Results arrive via HandleResult.subscriptions. */
+  subscribe(sql: string): bigint {
+    const idPtr = this.M._malloc(8);
+    try {
+      withStack(this.M, () => {
+        this.M._sqlpipe_replica_subscribe(
+          this.ptr, this.M.stringToUTF8OnStack(sql), idPtr, this.errPtr);
+      });
+      checkError(this.M, this.errPtr);
+      // Read uint64 as two 32-bit halves (little-endian).
+      const lo = this.M.getValue(idPtr, 'i32') >>> 0;
+      const hi = this.M.getValue(idPtr + 4, 'i32') >>> 0;
+      return BigInt(lo) | (BigInt(hi) << 32n);
+    } finally {
+      this.M._free(idPtr);
+    }
   }
 
   /** Remove a subscription. */
@@ -442,15 +450,22 @@ export class Peer {
     }
   }
 
-  /** Subscribe to a query on the replica side. Returns current result. */
-  subscribe(sql: string): QueryResult {
-    withStack(this.M, () => {
-      this.M._sqlpipe_peer_subscribe(
-        this.ptr, this.M.stringToUTF8OnStack(sql), this.bufPtr, this.errPtr);
-    });
-    checkError(this.M, this.errPtr);
-    const raw = readBuf(this.M, this.bufPtr);
-    return decodeQueryResult(new Reader(raw));
+  /** Subscribe to a query on the replica side. Returns subscription ID.
+   *  Results arrive via PeerHandleResult.subscriptions. */
+  subscribe(sql: string): bigint {
+    const idPtr = this.M._malloc(8);
+    try {
+      withStack(this.M, () => {
+        this.M._sqlpipe_peer_subscribe(
+          this.ptr, this.M.stringToUTF8OnStack(sql), idPtr, this.errPtr);
+      });
+      checkError(this.M, this.errPtr);
+      const lo = this.M.getValue(idPtr, 'i32') >>> 0;
+      const hi = this.M.getValue(idPtr + 4, 'i32') >>> 0;
+      return BigInt(lo) | (BigInt(hi) << 32n);
+    } finally {
+      this.M._free(idPtr);
+    }
   }
 
   /** Remove a subscription. */
@@ -489,15 +504,22 @@ export class QueryWatch {
     this.bufPtr = M._malloc(8);
   }
 
-  /** Subscribe to a query. Returns the current result. */
-  subscribe(sql: string): QueryResult {
-    withStack(this.M, () => {
-      this.M._sqlpipe_query_watch_subscribe(
-        this.ptr, this.M.stringToUTF8OnStack(sql), this.bufPtr, this.errPtr);
-    });
-    checkError(this.M, this.errPtr);
-    const raw = readBuf(this.M, this.bufPtr);
-    return decodeQueryResult(new Reader(raw));
+  /** Subscribe to a query. Returns the subscription ID.
+   *  Results arrive via notify(). */
+  subscribe(sql: string): bigint {
+    const idPtr = this.M._malloc(8);
+    try {
+      withStack(this.M, () => {
+        this.M._sqlpipe_query_watch_subscribe(
+          this.ptr, this.M.stringToUTF8OnStack(sql), idPtr, this.errPtr);
+      });
+      checkError(this.M, this.errPtr);
+      const lo = this.M.getValue(idPtr, 'i32') >>> 0;
+      const hi = this.M.getValue(idPtr + 4, 'i32') >>> 0;
+      return BigInt(lo) | (BigInt(hi) << 32n);
+    } finally {
+      this.M._free(idPtr);
+    }
   }
 
   unsubscribe(id: bigint): void {

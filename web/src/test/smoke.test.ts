@@ -59,17 +59,18 @@ console.log(`seq: master=${master.currentSeq}, replica=${replica.currentSeq}`);
 // ── QueryWatch ──────────────────────────────────────────────────
 
 const watch = sp.createQueryWatch(replicaDb);
-const qr = watch.subscribe('SELECT count(*) as cnt FROM items');
-assert(qr.columns.length === 1, `expected 1 column, got ${qr.columns.length}`);
-assert(qr.columns[0] === 'cnt', `expected column "cnt", got "${qr.columns[0]}"`);
-assert(qr.rows.length === 1, `expected 1 row, got ${qr.rows.length}`);
-assert(qr.rows[0][0] === 2n, `expected count=2, got ${qr.rows[0][0]}`);
-console.log(`QueryWatch: count=${qr.rows[0][0]}`);
+const subId1 = watch.subscribe('SELECT count(*) as cnt FROM items');
+const subId2 = watch.subscribe('SELECT id, name, value FROM items ORDER BY id');
+assert(typeof subId1 === 'bigint', `expected bigint, got ${typeof subId1}`);
+assert(typeof subId2 === 'bigint', `expected bigint, got ${typeof subId2}`);
 
-// Subscribe to detailed query, then replicate more data.
-const detail = watch.subscribe('SELECT id, name, value FROM items ORDER BY id');
-assert(detail.rows.length === 2, `expected 2 rows, got ${detail.rows.length}`);
-assert(detail.rows[0][1] === 'hello', `expected "hello", got "${detail.rows[0][1]}"`);
+// First notify delivers initial results for both subscriptions.
+const initial = watch.notify(['items']);
+assert(initial.length === 2, `expected 2 initial results, got ${initial.length}`);
+const countResult = initial.find(r => r.id === subId1);
+assert(countResult !== undefined, 'count subscription not found in initial results');
+assert(countResult.rows[0][0] === 2n, `expected count=2, got ${countResult.rows[0][0]}`);
+console.log(`QueryWatch: count=${countResult!.rows[0][0]}`);
 
 // Insert another row on master and replicate.
 masterDb.exec("INSERT INTO items VALUES (3, 'sqlpipe', 1.0)");
@@ -77,13 +78,13 @@ const msgs2 = master.flush();
 const result2 = replica.handleMessage(msgs2[0]);
 assert(result2.changes.length === 1, `expected 1 change`);
 
-// Notify the watch — both subscriptions should fire.
+// Notify the watch — both subscriptions should fire (data changed).
 const changed = watch.notify(['items']);
 assert(changed.length === 2, `expected 2 changed subscriptions, got ${changed.length}`);
 console.log('QueryWatch notified after replication');
 
-watch.unsubscribe(qr.id);
-watch.unsubscribe(detail.id);
+watch.unsubscribe(subId1);
+watch.unsubscribe(subId2);
 assert(watch.empty, 'watch should be empty after unsubscribe');
 
 // ── Serialize / Deserialize ──────────────────────────────────────
@@ -99,8 +100,12 @@ restoredDb.deserialize(snapshot);
 
 // Verify data via QueryWatch on the restored database.
 const rWatch = sp.createQueryWatch(restoredDb);
-const rQr = rWatch.subscribe('SELECT count(*) FROM items');
-assert(rQr.rows[0][0] === 3n, `expected 3 rows after restore, got ${rQr.rows[0][0]}`);
+const rSubId = rWatch.subscribe('SELECT count(*) FROM items');
+// notify to get the initial result
+const rInitial = rWatch.notify(['items']);
+assert(rInitial.length === 1, `expected 1 result, got ${rInitial.length}`);
+assert(rInitial[0].rows[0][0] === 3n, `expected 3 rows after restore, got ${rInitial[0].rows[0][0]}`);
+rWatch.unsubscribe(rSubId);
 rWatch.close();
 restoredDb.close();
 console.log('serialize/deserialize round-trip OK');

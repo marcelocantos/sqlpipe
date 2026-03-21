@@ -630,12 +630,9 @@ int sqlpipe_replica_handle_message(
 EMSCRIPTEN_KEEPALIVE
 int sqlpipe_replica_subscribe(
     sqlpipe_replica* r, const char* sql,
-    sqlpipe_buf* out, sqlpipe_error* err) {
+    uint64_t* out_id, sqlpipe_error* err) {
     try {
-        auto qr = r->impl.subscribe(sql);
-        Buf b;
-        encode_query_result(b, qr);
-        *out = to_buf(std::move(b));
+        *out_id = r->impl.subscribe(sql);
         *err = ok();
         return 0;
     } catch (const sqlpipe::Error& e) { *err = make_error(e); return static_cast<int>(e.code()); }
@@ -751,12 +748,9 @@ int sqlpipe_peer_handle_message(
 EMSCRIPTEN_KEEPALIVE
 int sqlpipe_peer_subscribe(
     sqlpipe_peer* p, const char* sql,
-    sqlpipe_buf* out, sqlpipe_error* err) {
+    uint64_t* out_id, sqlpipe_error* err) {
     try {
-        auto qr = p->impl.subscribe(sql);
-        Buf b;
-        encode_query_result(b, qr);
-        *out = to_buf(std::move(b));
+        *out_id = p->impl.subscribe(sql);
         *err = ok();
         return 0;
     } catch (const sqlpipe::Error& e) { *err = make_error(e); return static_cast<int>(e.code()); }
@@ -796,12 +790,9 @@ void sqlpipe_query_watch_free(sqlpipe_query_watch* w) { delete w; }
 EMSCRIPTEN_KEEPALIVE
 int sqlpipe_query_watch_subscribe(
     sqlpipe_query_watch* w, const char* sql,
-    sqlpipe_buf* out, sqlpipe_error* err) {
+    uint64_t* out_id, sqlpipe_error* err) {
     try {
-        auto qr = w->impl.subscribe(sql);
-        Buf b;
-        encode_query_result(b, qr);
-        *out = to_buf(std::move(b));
+        *out_id = w->impl.subscribe(sql);
         *err = ok();
         return 0;
     } catch (const sqlpipe::Error& e) { *err = make_error(e); return static_cast<int>(e.code()); }

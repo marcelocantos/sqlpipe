@@ -168,9 +168,9 @@ sqlpipe_error sqlpipe_replica_handle_messages(
     const uint8_t* msgs_buf, size_t msgs_buf_len,
     sqlpipe_buf* out);
 
-// Returns encoded QueryResult.
+// Returns subscription ID via out parameter.
 sqlpipe_error sqlpipe_replica_subscribe(
-    sqlpipe_replica* r, const char* sql, sqlpipe_buf* out);
+    sqlpipe_replica* r, const char* sql, uint64_t* out);
 
 sqlpipe_error sqlpipe_replica_unsubscribe(sqlpipe_replica* r, uint64_t id);
 
@@ -190,7 +190,7 @@ sqlpipe_error sqlpipe_peer_start(sqlpipe_peer* p, sqlpipe_buf* out);
 sqlpipe_error sqlpipe_peer_flush(sqlpipe_peer* p, sqlpipe_buf* out);
 
 // Subscribe to a query on the peer's replica side. Returns encoded QueryResult.
-sqlpipe_error sqlpipe_peer_subscribe(sqlpipe_peer* p, const char* sql, sqlpipe_buf* out);
+sqlpipe_error sqlpipe_peer_subscribe(sqlpipe_peer* p, const char* sql, uint64_t* out);
 sqlpipe_error sqlpipe_peer_unsubscribe(sqlpipe_peer* p, uint64_t id);
 
 // Returns encoded PeerHandleResult:

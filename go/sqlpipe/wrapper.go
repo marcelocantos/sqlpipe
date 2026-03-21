@@ -986,18 +986,19 @@ func (r *Replica) HandleMessages(msgs []Message) (HandleResult, error) {
 	return decodeHandleResult(buf)
 }
 
-// Subscribe registers a query and returns the current result.
-func (r *Replica) Subscribe(sql string) (QueryResult, error) {
+// Subscribe registers a query subscription. Returns the subscription ID.
+// Results arrive via HandleResult.Subscriptions — subscribe does not
+// evaluate the query. Before Live state, evaluation is deferred until
+// sync completes. After Live, the subscription is evaluated on the next
+// HandleMessage call.
+func (r *Replica) Subscribe(sql string) (SubscriptionID, error) {
 	csql := C.CString(sql)
 	defer C.free(unsafe.Pointer(csql))
-	var buf C.sqlpipe_buf
-	if err := convertError(C.sqlpipe_replica_subscribe(r.ptr, csql, &buf)); err != nil {
-		return QueryResult{}, err
+	var id C.uint64_t
+	if err := convertError(C.sqlpipe_replica_subscribe(r.ptr, csql, &id)); err != nil {
+		return 0, err
 	}
-	defer C.sqlpipe_free_buf(buf)
-	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
-	d := &decoder{data: data}
-	return decodeQueryResult(d), nil
+	return SubscriptionID(id), nil
 }
 
 // Unsubscribe removes a subscription.
@@ -1108,18 +1109,16 @@ func (p *Peer) Flush() ([]PeerMessage, error) {
 	return decodePeerMessages(buf)
 }
 
-// Subscribe registers a query on the peer's replica side.
-func (p *Peer) Subscribe(sql string) (QueryResult, error) {
+// Subscribe registers a query on the peer's replica side. Returns the
+// subscription ID. Results arrive via PeerHandleResult.Subscriptions.
+func (p *Peer) Subscribe(sql string) (SubscriptionID, error) {
 	csql := C.CString(sql)
 	defer C.free(unsafe.Pointer(csql))
-	var buf C.sqlpipe_buf
-	if err := convertError(C.sqlpipe_peer_subscribe(p.ptr, csql, &buf)); err != nil {
-		return QueryResult{}, err
+	var id C.uint64_t
+	if err := convertError(C.sqlpipe_peer_subscribe(p.ptr, csql, &id)); err != nil {
+		return 0, err
 	}
-	defer C.sqlpipe_free_buf(buf)
-	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
-	d := &decoder{data: data}
-	return decodeQueryResult(d), nil
+	return SubscriptionID(id), nil
 }
 
 // Unsubscribe removes a subscription from the peer's replica side.

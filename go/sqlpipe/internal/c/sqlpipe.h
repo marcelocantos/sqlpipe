@@ -172,8 +172,9 @@ public:
     QueryWatch(QueryWatch&&) noexcept;
     QueryWatch& operator=(QueryWatch&&) noexcept;
 
-    /// Register a query. Returns the current result immediately.
-    QueryResult subscribe(const std::string& sql);
+    /// Register a query subscription. Returns the subscription ID.
+    /// Results arrive via notify() — subscribe does not evaluate the query.
+    SubscriptionId subscribe(const std::string& sql);
 
     /// Remove a subscription.
     void unsubscribe(SubscriptionId id);
@@ -497,10 +498,12 @@ public:
     /// loop when processing a burst of messages.
     HandleResult handle_messages(std::span<const Message> msgs);
 
-    /// Subscribe to a SQL query. Returns the current result immediately.
-    /// After each handle_message that changes a table the query reads from,
-    /// the updated result appears in HandleResult::subscriptions.
-    QueryResult subscribe(const std::string& sql);
+    /// Subscribe to a SQL query. Returns the subscription ID.
+    /// The initial result and subsequent updates arrive via
+    /// HandleResult::subscriptions — subscribe does not evaluate the query.
+    /// Before Live state, evaluation is deferred until sync completes.
+    /// After Live, the subscription is evaluated on the next handle_message.
+    SubscriptionId subscribe(const std::string& sql);
 
     /// Remove a subscription.
     void unsubscribe(SubscriptionId id);
@@ -617,11 +620,9 @@ public:
     /// Process an incoming PeerMessage from the remote peer.
     PeerHandleResult handle_message(const PeerMessage& msg);
 
-    /// Subscribe to a SQL query on the replica side. Returns the current
-    /// result immediately. After each handle_message that changes a table
-    /// the query reads from, the updated result appears in
-    /// PeerHandleResult::subscriptions.
-    QueryResult subscribe(const std::string& sql);
+    /// Subscribe to a SQL query on the replica side. Returns the
+    /// subscription ID. Results arrive via PeerHandleResult::subscriptions.
+    SubscriptionId subscribe(const std::string& sql);
 
     /// Remove a subscription.
     void unsubscribe(SubscriptionId id);

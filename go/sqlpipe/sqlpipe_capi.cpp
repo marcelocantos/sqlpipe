@@ -508,12 +508,9 @@ sqlpipe_error sqlpipe_replica_handle_messages(
 }
 
 sqlpipe_error sqlpipe_replica_subscribe(
-    sqlpipe_replica* r, const char* sql, sqlpipe_buf* out) {
+    sqlpipe_replica* r, const char* sql, uint64_t* out) {
     try {
-        auto qr = r->impl.subscribe(sql);
-        Buf b;
-        encode_query_result(b, qr);
-        *out = to_buf(std::move(b));
+        *out = r->impl.subscribe(sql);
         return ok();
     } catch (const sqlpipe::Error& e) { return make_error(e); }
       catch (const std::exception& e) { return make_error(1, e.what()); }
@@ -594,12 +591,9 @@ sqlpipe_error sqlpipe_peer_handle_message(
 }
 
 sqlpipe_error sqlpipe_peer_subscribe(
-    sqlpipe_peer* p, const char* sql, sqlpipe_buf* out) {
+    sqlpipe_peer* p, const char* sql, uint64_t* out) {
     try {
-        auto qr = p->impl.subscribe(sql);
-        Buf b;
-        encode_query_result(b, qr);
-        *out = to_buf(std::move(b));
+        *out = p->impl.subscribe(sql);
         return ok();
     } catch (const sqlpipe::Error& e) { return make_error(e); }
       catch (const std::exception& e) { return make_error(1, e.what()); }

@@ -297,13 +297,10 @@ func TestSubscriptions(t *testing.T) {
 	}
 	defer r.Close()
 
-	// Subscribe before handshake.
-	qr, err := r.Subscribe("SELECT * FROM t1 ORDER BY id")
+	// Subscribe before handshake — no evaluation yet.
+	subID, err := r.Subscribe("SELECT * FROM t1 ORDER BY id")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if len(qr.Rows) != 0 {
-		t.Errorf("expected 0 rows, got %d", len(qr.Rows))
 	}
 
 	if err := SyncHandshake(m, r); err != nil {
@@ -328,15 +325,15 @@ func TestSubscriptions(t *testing.T) {
 		t.Fatalf("expected 1 subscription update, got %d", len(hr.Subscriptions))
 	}
 	sub := hr.Subscriptions[0]
-	if sub.ID != qr.ID {
-		t.Errorf("subscription id = %d, want %d", sub.ID, qr.ID)
+	if sub.ID != subID {
+		t.Errorf("subscription id = %d, want %d", sub.ID, subID)
 	}
 	if len(sub.Rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(sub.Rows))
 	}
 
 	// Unsubscribe.
-	if err := r.Unsubscribe(qr.ID); err != nil {
+	if err := r.Unsubscribe(subID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -632,12 +629,9 @@ func TestPeerSubscribe(t *testing.T) {
 	}
 
 	// Subscribe on client after handshake (t1 is owned by server).
-	qr, err := client.Subscribe("SELECT * FROM t1 ORDER BY id")
+	subID, err := client.Subscribe("SELECT * FROM t1 ORDER BY id")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if len(qr.Rows) != 0 {
-		t.Errorf("expected 0 rows initially, got %d", len(qr.Rows))
 	}
 
 	// Insert on server's t1, flush, apply on client.
@@ -661,15 +655,15 @@ func TestPeerSubscribe(t *testing.T) {
 	if len(gotSubs) != 1 {
 		t.Fatalf("expected 1 subscription update, got %d", len(gotSubs))
 	}
-	if gotSubs[0].ID != qr.ID {
-		t.Errorf("subscription id = %d, want %d", gotSubs[0].ID, qr.ID)
+	if gotSubs[0].ID != subID {
+		t.Errorf("subscription id = %d, want %d", gotSubs[0].ID, subID)
 	}
 	if len(gotSubs[0].Rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(gotSubs[0].Rows))
 	}
 
 	// Unsubscribe.
-	if err := client.Unsubscribe(qr.ID); err != nil {
+	if err := client.Unsubscribe(subID); err != nil {
 		t.Fatal(err)
 	}
 

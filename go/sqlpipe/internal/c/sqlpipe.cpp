@@ -1809,6 +1809,8 @@ struct QueryWatch::Impl {
     std::map<SubscriptionId, Subscription> subscriptions;
     // Reverse index: table name → subscription IDs that depend on it.
     std::unordered_map<std::string, std::set<SubscriptionId>> table_subs;
+    // Subscriptions registered since last notify — need initial evaluation.
+    std::set<SubscriptionId> pending_new;
     SubscriptionId next_sub_id = 1;
 
     std::set<std::string> discover_tables(const std::string& sql) {
@@ -1870,6 +1872,10 @@ struct QueryWatch::Impl {
                 ids.insert(it->second.begin(), it->second.end());
             }
         }
+        // Also include any newly registered subscriptions that haven't
+        // been evaluated yet (their initial result delivery).
+        ids.insert(pending_new.begin(), pending_new.end());
+        pending_new.clear();
 
         std::vector<QueryResult> results;
         for (auto id : ids) {
@@ -1895,7 +1901,7 @@ QueryWatch::~QueryWatch() = default;
 QueryWatch::QueryWatch(QueryWatch&&) noexcept = default;
 QueryWatch& QueryWatch::operator=(QueryWatch&&) noexcept = default;
 
-QueryResult QueryWatch::subscribe(const std::string& sql) {
+SubscriptionId QueryWatch::subscribe(const std::string& sql) {
     auto tables = impl_->discover_tables(sql);
     auto id = impl_->next_sub_id++;
 
@@ -1914,11 +1920,12 @@ QueryResult QueryWatch::subscribe(const std::string& sql) {
         impl_->table_subs[t].insert(id);
     }
 
+    // Register with hash=0 (never evaluated). The next notify() will
+    // evaluate and deliver the initial result.
     impl_->subscriptions[id] = {id, sql, std::move(tables),
                                 std::move(stmt), std::move(columns), 0};
-    auto [result, hash] = impl_->evaluate_query(impl_->subscriptions[id]);
-    impl_->subscriptions[id].result_hash = hash;
-    return result;
+    impl_->pending_new.insert(id);
+    return id;
 }
 
 void QueryWatch::unsubscribe(SubscriptionId id) {
@@ -1934,6 +1941,7 @@ void QueryWatch::unsubscribe(SubscriptionId id) {
                 }
             }
         }
+        impl_->pending_new.erase(id);
         impl_->subscriptions.erase(it);
     }
 }
@@ -2258,6 +2266,7 @@ Message Replica::hello() const {
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
+    auto prev_state = impl_->state;
     auto result = std::visit([&](const auto& m) -> HandleResult {
         using T = std::decay_t<decltype(m)>;
 
@@ -2315,19 +2324,31 @@ HandleResult Replica::handle_message(const Message& msg) {
         }
     }, msg);
 
-    // Evaluate invalidated subscriptions.
-    if (!result.changes.empty() && !impl_->watch.empty()) {
-        std::set<std::string> affected;
-        for (const auto& ev : result.changes) {
-            if (!ev.table.empty()) affected.insert(ev.table);
+    // Evaluate subscriptions only when Live — never during handshake or
+    // diff sync, where schema may be incomplete or data in flux.
+    if (impl_->state == State::Live && !impl_->watch.empty()) {
+        if (!result.changes.empty()) {
+            std::set<std::string> affected;
+            for (const auto& ev : result.changes) {
+                if (!ev.table.empty()) affected.insert(ev.table);
+            }
+            result.subscriptions = impl_->watch.notify(affected);
+        } else if (prev_state != State::Live) {
+            // Just entered Live (e.g., diff sync found no differences).
+            // Force-evaluate all subscriptions so clients that subscribed
+            // before sync get current data.
+            auto all_tables = detail::get_tracked_tables(
+                impl_->db, impl_->filter());
+            std::set<std::string> all(all_tables.begin(), all_tables.end());
+            result.subscriptions = impl_->watch.notify(all);
         }
-        result.subscriptions = impl_->watch.notify(affected);
     }
 
     return result;
 }
 
 HandleResult Replica::handle_messages(std::span<const Message> msgs) {
+    auto prev_state = impl_->state;
     HandleResult combined;
     std::set<std::string> affected;
 
@@ -2398,15 +2419,22 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
                                 result.changes.end());
     }
 
-    // Evaluate subscriptions once for all accumulated changes.
-    if (!affected.empty() && !impl_->watch.empty()) {
-        combined.subscriptions = impl_->watch.notify(affected);
+    // Evaluate subscriptions only when Live.
+    if (impl_->state == State::Live && !impl_->watch.empty()) {
+        if (!affected.empty()) {
+            combined.subscriptions = impl_->watch.notify(affected);
+        } else if (prev_state != State::Live) {
+            auto all_tables = detail::get_tracked_tables(
+                impl_->db, impl_->filter());
+            std::set<std::string> all(all_tables.begin(), all_tables.end());
+            combined.subscriptions = impl_->watch.notify(all);
+        }
     }
 
     return combined;
 }
 
-QueryResult Replica::subscribe(const std::string& sql) {
+SubscriptionId Replica::subscribe(const std::string& sql) {
     return impl_->watch.subscribe(sql);
 }
 
@@ -2783,7 +2811,7 @@ PeerHandleResult Peer::handle_message(const PeerMessage& msg) {
     }
 }
 
-QueryResult Peer::subscribe(const std::string& sql) {
+SubscriptionId Peer::subscribe(const std::string& sql) {
     if (!impl_->replica) {
         throw Error(ErrorCode::InvalidState,
                     "subscribe() requires replica to be initialized");

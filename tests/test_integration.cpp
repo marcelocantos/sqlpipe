@@ -219,8 +219,7 @@ TEST_CASE("subscription: fires after live changeset") {
     handshake(master, replica);
 
     // Subscribe to a query on the replica.
-    auto qr = replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
-    CHECK(qr.rows.empty());  // nothing yet
+    auto sub_id = replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
 
     // Master inserts a row.
     master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
@@ -228,7 +227,7 @@ TEST_CASE("subscription: fires after live changeset") {
 
     // Subscription should fire with the updated result.
     REQUIRE(result.subscriptions.size() == 1);
-    CHECK(result.subscriptions[0].id == qr.id);
+    CHECK(result.subscriptions[0].id == sub_id);
     REQUIRE(result.subscriptions[0].rows.size() == 1);
     CHECK(std::get<std::int64_t>(result.subscriptions[0].rows[0][0]) == 1);
     CHECK(std::get<std::string>(result.subscriptions[0].rows[0][1]) == "hello");
@@ -243,16 +242,18 @@ TEST_CASE("subscription: does not fire for unrelated table") {
 
     Master master(master_db.db);
     Replica replica(replica_db.db);
-    handshake(master, replica);
 
-    // Subscribe to t1 only.
+    // Subscribe before handshake — initial result fires on entering Live,
+    // not on subsequent data messages.
     replica.subscribe("SELECT * FROM t1");
+
+    handshake(master, replica);
 
     // Change t2 only.
     master_db.exec("INSERT INTO t2 VALUES (1, 'x')");
     auto result = deliver(master.flush(), replica);
 
-    // Subscription should NOT fire.
+    // Subscription should NOT fire (t1 is unrelated, initial already consumed).
     CHECK(result.subscriptions.empty());
 }
 
@@ -265,10 +266,13 @@ TEST_CASE("subscription: multiple subscriptions, only relevant fires") {
 
     Master master(master_db.db);
     Replica replica(replica_db.db);
-    handshake(master, replica);
 
+    // Subscribe before handshake — initial results fire on entering Live,
+    // not on subsequent data messages.
     auto sub1 = replica.subscribe("SELECT * FROM t1");
-    auto sub2 = replica.subscribe("SELECT * FROM t2");
+    (void)replica.subscribe("SELECT * FROM t2");
+
+    handshake(master, replica);
 
     // Change t1 only.
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
@@ -276,7 +280,7 @@ TEST_CASE("subscription: multiple subscriptions, only relevant fires") {
 
     // Only sub1 should fire.
     REQUIRE(result.subscriptions.size() == 1);
-    CHECK(result.subscriptions[0].id == sub1.id);
+    CHECK(result.subscriptions[0].id == sub1);
 }
 
 TEST_CASE("subscription: JOIN query fires on either table") {
@@ -289,14 +293,16 @@ TEST_CASE("subscription: JOIN query fires on either table") {
 
     Master master(master_db.db);
     Replica replica(replica_db.db);
+
+    // Subscribe before handshake — initial result fires on entering Live,
+    // not on subsequent data messages.
+    auto sub_id = replica.subscribe(
+        "SELECT u.name, o.item FROM users u JOIN orders o ON o.user_id = u.id");
+
     handshake(master, replica);
 
-    auto sub = replica.subscribe(
-        "SELECT u.name, o.item FROM users u JOIN orders o ON o.user_id = u.id");
-    CHECK(sub.rows.empty());
-
     // Insert into users only — JOIN still returns 0 rows (no orders yet),
-    // so the subscription should NOT fire (result unchanged).
+    // so the subscription should NOT fire (result unchanged, initial already consumed).
     master_db.exec("INSERT INTO users VALUES (1, 'Alice')");
     auto result = deliver(master.flush(), replica);
     CHECK(result.subscriptions.empty());
@@ -305,7 +311,7 @@ TEST_CASE("subscription: JOIN query fires on either table") {
     master_db.exec("INSERT INTO orders VALUES (1, 1, 'widget')");
     result = deliver(master.flush(), replica);
     REQUIRE(result.subscriptions.size() == 1);
-    CHECK(result.subscriptions[0].id == sub.id);
+    CHECK(result.subscriptions[0].id == sub_id);
     CHECK(result.subscriptions[0].rows.size() == 1);
     CHECK(std::get<std::string>(result.subscriptions[0].rows[0][0]) == "Alice");
     CHECK(std::get<std::string>(result.subscriptions[0].rows[0][1]) == "widget");
@@ -320,8 +326,8 @@ TEST_CASE("subscription: unsubscribe prevents firing") {
     Replica replica(replica_db.db);
     handshake(master, replica);
 
-    auto sub = replica.subscribe("SELECT * FROM t1");
-    replica.unsubscribe(sub.id);
+    auto sub_id = replica.subscribe("SELECT * FROM t1");
+    replica.unsubscribe(sub_id);
 
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
     auto result = deliver(master.flush(), replica);
@@ -339,8 +345,7 @@ TEST_CASE("subscription: suppressed when result unchanged") {
     handshake(master, replica);
 
     // Subscribe to a filtered query.
-    auto sub = replica.subscribe("SELECT val FROM t1 WHERE id = 1");
-    CHECK(sub.rows.empty());
+    (void)replica.subscribe("SELECT val FROM t1 WHERE id = 1");
 
     // Insert matching row — subscription fires.
     master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
@@ -372,13 +377,12 @@ TEST_CASE("integration: replica reset preserves subscriptions") {
     CHECK(replica.state() == Replica::State::Live);
 
     // Subscribe and deliver a row.
-    auto sub = replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
-    CHECK(sub.rows.empty());
+    auto sub_id = replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
 
     master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
     auto result = deliver(master.flush(), replica);
     REQUIRE(result.subscriptions.size() == 1);
-    CHECK(result.subscriptions[0].id == sub.id);
+    CHECK(result.subscriptions[0].id == sub_id);
 
     // Simulate disconnect: reset replica and re-handshake.
     replica.reset();
@@ -397,7 +401,7 @@ TEST_CASE("integration: replica reset preserves subscriptions") {
     master_db.exec("INSERT INTO t1 VALUES (3, 'again')");
     result = deliver(master.flush(), replica);
     REQUIRE(result.subscriptions.size() == 1);
-    CHECK(result.subscriptions[0].id == sub.id);
+    CHECK(result.subscriptions[0].id == sub_id);
     CHECK(result.subscriptions[0].rows.size() == 3);
 }
 
@@ -542,8 +546,7 @@ TEST_CASE("integration: batched handle_messages defers subscriptions") {
     Replica replica(replica_db.db);
     handshake(master, replica);
 
-    auto sub = replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
-    CHECK(sub.rows.empty());
+    replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
 
     // Generate 3 separate changesets.
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
@@ -701,24 +704,20 @@ TEST_CASE("integration: subscriptions fire after diff sync with no changes") {
     Replica replica2(replica_db.db);
 
     // Subscribe BEFORE the handshake.
-    auto qr = replica2.subscribe("SELECT count(*) AS cnt FROM t1");
-    CHECK(qr.rows.size() == 1);
-    CHECK(std::get<int64_t>(qr.rows[0][0]) == 1);  // data is there
+    auto sub_id = replica2.subscribe("SELECT count(*) AS cnt FROM t1");
 
     // Handshake — diff sync finds no differences ("all buckets match").
     // Use the handshake helper which drives the full exchange.
     sync_handshake(master2, replica2);
     CHECK(replica2.state() == Replica::State::Live);
 
-    // Now send a no-op flush to trigger subscription evaluation.
-    // Actually, the entering-Live transition should have already
-    // evaluated subscriptions. Verify by making a change and checking
-    // the subscription fires (proving it's still registered and active).
+    // Make a change and verify the subscription fires (proving it's
+    // registered and active).
     master_db.exec("INSERT INTO t1 VALUES (2, 'world')");
     auto msgs2 = master2.flush();
     REQUIRE(!msgs2.empty());
     auto result = replica2.handle_message(msgs2[0]);
     REQUIRE(!result.subscriptions.empty());
-    CHECK(result.subscriptions[0].id == qr.id);
+    CHECK(result.subscriptions[0].id == sub_id);
     CHECK(std::get<int64_t>(result.subscriptions[0].rows[0][0]) == 2);
 }

@@ -577,11 +577,7 @@ TEST_CASE("peer: subscribe receives updates through handle_message") {
     CHECK(client.state() == Peer::State::Live);
 
     // Client subscribes to t2 (server-owned, replicated to client).
-    auto qr = client.subscribe("SELECT count(*) AS cnt FROM t2");
-    CHECK(qr.columns.size() == 1);
-    CHECK(qr.columns[0] == "cnt");
-    CHECK(qr.rows.size() == 1);
-    CHECK(std::get<int64_t>(qr.rows[0][0]) == 0);
+    auto sub_id = client.subscribe("SELECT count(*) AS cnt FROM t2");
 
     // Server inserts into t2 and flushes.
     server_db.exec("INSERT INTO t2 VALUES (1, 'hello')");
@@ -602,11 +598,11 @@ TEST_CASE("peer: subscribe receives updates through handle_message") {
 
     CHECK(result.changes.size() == 1);
     CHECK(result.subscriptions.size() == 1);
-    CHECK(result.subscriptions[0].id == qr.id);
+    CHECK(result.subscriptions[0].id == sub_id);
     CHECK(std::get<int64_t>(result.subscriptions[0].rows[0][0]) == 1);
 
     // Unsubscribe and verify no more notifications.
-    client.unsubscribe(qr.id);
+    client.unsubscribe(sub_id);
     server_db.exec("INSERT INTO t2 VALUES (2, 'world')");
     msgs = server.flush();
     PeerHandleResult result2;
