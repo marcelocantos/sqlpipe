@@ -283,3 +283,71 @@ TEST_CASE("diff sync: auto-migrate adds new column") {
     CHECK(replica.state() == Replica::State::Live);
     CHECK(replica_db.count("t") == 1);
 }
+
+TEST_CASE("diff sync: fast reconnect when seq matches (no diff messages)") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    // Initial sync with data.
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    auto msgs = master.flush();
+    for (auto& m : msgs) replica.handle_message(m);
+    CHECK(replica.current_seq() == 1);
+
+    // Simulate reconnect with no changes — seqs match.
+    Master master2(master_db.db);
+    Replica replica2(replica_db.db);
+
+    // Track what messages are exchanged.
+    auto hello = replica2.hello();
+    auto resp = master2.handle_message(hello);
+
+    // Master should respond with a single HelloMsg (fast path).
+    REQUIRE(resp.size() == 1);
+    CHECK(std::holds_alternative<HelloMsg>(resp[0]));
+    auto& hm = std::get<HelloMsg>(resp[0]);
+    CHECK(hm.last_seq == 1);  // confirms fast path
+
+    // Replica receives the HelloMsg and goes straight to Live.
+    auto result = replica2.handle_message(resp[0]);
+    CHECK(replica2.state() == Replica::State::Live);
+
+    // No BucketHashesMsg — just an AckMsg back.
+    REQUIRE(result.messages.size() == 1);
+    CHECK(std::holds_alternative<AckMsg>(result.messages[0]));
+
+    // Data is still there.
+    CHECK(replica_db.count("t1") == 1);
+}
+
+TEST_CASE("diff sync: no fast reconnect when seq differs") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    // Initial sync.
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    auto msgs = master.flush();
+    for (auto& m : msgs) replica.handle_message(m);
+
+    // Master adds more data (seq=2), replica stays at seq=1.
+    {
+        Master m2(master_db.db);
+        master_db.exec("INSERT INTO t1 VALUES (2, 'world')");
+        m2.flush();
+    }
+
+    // Reconnect — seqs don't match, full diff sync.
+    Master master3(master_db.db);
+    Replica replica3(replica_db.db);
+    sync_handshake(master3, replica3);
+    CHECK(replica3.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 2);
+}

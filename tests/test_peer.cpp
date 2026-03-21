@@ -397,9 +397,11 @@ TEST_CASE("peer: diff sync after reconnect") {
         PeerConfig client_cfg;
         client_cfg.owned_tables = {"t1"};
         Peer client(client_db.db, client_cfg);
-        Peer server(server_db.db);
-        auto initial = client.start();
-        exchange(client, server, initial);
+        PeerConfig server_cfg;
+        server_cfg.approve_ownership =
+            [](const std::set<std::string>&) { return true; };
+        Peer server(server_db.db, server_cfg);
+        sync_handshake(client, server);
 
         CHECK(client.state() == Peer::State::Live);
         CHECK(server.state() == Peer::State::Live);
@@ -454,8 +456,7 @@ TEST_CASE("peer: reset and reconnect") {
     }
 
     // Reconnect via reset peers.
-    initial = client.start();
-    exchange(client, server, initial);
+    sync_handshake(client, server);
     CHECK(client.state() == Peer::State::Live);
     CHECK(server.state() == Peer::State::Live);
 

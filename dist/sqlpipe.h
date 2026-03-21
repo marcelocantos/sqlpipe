@@ -224,7 +224,7 @@ private:
 // ── protocol.h ──────────────────────────────────────────────────
 namespace sqlpipe {
 
-inline constexpr std::uint32_t kProtocolVersion = 5;
+inline constexpr std::uint32_t kProtocolVersion = 6;
 
 // ── Message types ───────────────────────────────────────────────────
 
@@ -233,6 +233,9 @@ struct HelloMsg {
     std::uint32_t protocol_version;  ///< Must match kProtocolVersion.
     SchemaVersion schema_version;    ///< Sender's schema fingerprint.
     std::set<std::string> owned_tables;  ///< Tables the sender wants to own (Peer mode).
+    Seq last_seq = -1;  ///< Sender's current seq (-1 = not provided).
+                        ///< When replica's seq matches master's and both > 0,
+                        ///< diff sync is skipped (fast reconnect).
 };
 
 /// A single changeset (one flush() worth of changes). Used in live streaming.

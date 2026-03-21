@@ -610,9 +610,9 @@ TEST_CASE("integration: crash recovery after aborted changeset") {
     }
 
     // Add more data while "disconnected".
-    exec(mdb, "INSERT INTO t1 VALUES (2, 'world')");
     {
         Master m(mdb);
+        exec(mdb, "INSERT INTO t1 VALUES (2, 'world')");
         m.flush();
     }
 

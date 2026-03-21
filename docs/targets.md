@@ -135,8 +135,9 @@
   - Protocol version bumped to v6
   - Test verifies fast-path reconnect (disconnect → reconnect → Live in one round-trip, no diff messages)
 - **Context**: Common case is normal disconnect with near-instant reconnect. Currently triggers full diff sync (O(b) bucket hashes) even when nothing changed. Seq comparison makes this O(1).
-- **Status**: identified
+- **Status**: achieved
 - **Discovered**: 2026-03-14
+- **Achieved**: 2026-03-22
 
 ### 🎯T7 Peer role is explicit rather than inferred from callback presence
 - **Weight**: 2 (value 3 / cost 2)

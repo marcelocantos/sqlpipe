@@ -416,12 +416,11 @@ std::vector<std::uint8_t> serialize(const Message& msg) {
             put_u8(buf, static_cast<std::uint8_t>(MessageTag::Hello));
             put_u32(buf, m.protocol_version);
             put_i32(buf, m.schema_version);
-            if (!m.owned_tables.empty()) {
-                put_u32(buf, static_cast<std::uint32_t>(m.owned_tables.size()));
-                for (const auto& t : m.owned_tables) {
-                    put_string(buf, t);
-                }
+            put_u32(buf, static_cast<std::uint32_t>(m.owned_tables.size()));
+            for (const auto& t : m.owned_tables) {
+                put_string(buf, t);
             }
+            put_i64(buf, m.last_seq);
         }
         else if constexpr (std::is_same_v<T, ChangesetMsg>) {
             put_u8(buf, static_cast<std::uint8_t>(MessageTag::Changeset));
@@ -532,13 +531,14 @@ Message deserialize(std::span<const std::uint8_t> buf) {
         HelloMsg m;
         m.protocol_version = r.read_u32();
         m.schema_version = r.read_i32();
-        if (!r.at_end()) {
+        {
             auto count = r.read_u32();
             check_count(count);
             for (std::uint32_t i = 0; i < count; ++i) {
                 m.owned_tables.insert(r.read_string());
             }
         }
+        m.last_seq = r.read_i64();
         return m;
     }
     case MessageTag::Changeset: {
@@ -1492,9 +1492,18 @@ struct Master::Impl {
             }
         }
 
+        // Fast reconnect: if replica's seq matches ours and both > 0,
+        // skip diff sync entirely.
+        if (hello.last_seq > 0 && hello.last_seq == seq) {
+            hs_state = HSState::Live;
+            SQLPIPE_LOG(config.on_log, LogLevel::Info,
+                        "hello ok, seq match ({}), skipping diff sync", seq);
+            return {HelloMsg{kProtocolVersion, my_sv, {}, seq}};
+        }
+
         hs_state = HSState::WaitBucketHashes;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "hello ok, waiting for bucket hashes");
-        return {HelloMsg{kProtocolVersion, my_sv, {}}};
+        return {HelloMsg{kProtocolVersion, my_sv, {}, -1}};
     }
 
     std::vector<Message> handle_bucket_hashes(const BucketHashesMsg& msg) {
@@ -2073,6 +2082,14 @@ struct Replica::Impl {
                 "unsupported protocol version"}}, {}, {}};
         }
 
+        // Fast reconnect: master confirmed seq match — skip to Live.
+        if (m.last_seq > 0 && m.last_seq == seq) {
+            state = Replica::State::Live;
+            SQLPIPE_LOG(config.on_log, LogLevel::Info,
+                        "fast reconnect: seq match ({}), skipping diff sync", seq);
+            return {{AckMsg{seq}}, {}, {}};
+        }
+
         // Compute bucket hashes and send to master.
         report(DiffPhase::ComputingBuckets, {}, 0, 0);
         auto buckets = detail::compute_all_buckets(
@@ -2262,7 +2279,8 @@ Message Replica::hello() const {
     const auto* f = impl_->config.table_filter
         ? &*impl_->config.table_filter : nullptr;
     return HelloMsg{kProtocolVersion,
-                    detail::compute_schema_fingerprint(impl_->db, f), {}};
+                    detail::compute_schema_fingerprint(impl_->db, f), {},
+                    impl_->seq};
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
@@ -2656,6 +2674,7 @@ struct Peer::Impl {
                 HelloMsg patched = *hello;
                 patched.schema_version = master->schema_version();
                 patched.owned_tables = {};
+                patched.last_seq = -1;  // Peer directions use different seq keys
 
                 auto master_resp = master->handle_message(patched);
                 for (auto& m : master_resp) {
@@ -2670,6 +2689,7 @@ struct Peer::Impl {
                 auto our_hello = replica->hello();
                 auto& h = std::get<HelloMsg>(our_hello);
                 h.owned_tables = my_tables;
+                h.last_seq = -1;  // Peer directions use different seq keys
                 result.messages.push_back(
                     PeerMessage{SenderRole::AsReplica, std::move(our_hello)});
 
@@ -2719,6 +2739,7 @@ struct Peer::Impl {
             }
             hello->schema_version = replica->schema_version();
             hello->owned_tables = {};
+            hello->last_seq = -1;  // Peer directions use different seq keys
         }
 
         auto hr = replica->handle_message(forwarded);
@@ -2786,6 +2807,7 @@ std::vector<PeerMessage> Peer::start() {
     auto hello = impl_->replica->hello();
     auto& h = std::get<HelloMsg>(hello);
     h.owned_tables = impl_->my_tables;
+    h.last_seq = -1;  // Peer directions use different seq keys
 
     return {PeerMessage{SenderRole::AsReplica, std::move(hello)}};
 }
