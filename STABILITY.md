@@ -26,21 +26,22 @@ API surface complexity:
 
 The clock starts from the last breaking change to the interaction surface.
 
-Current surface: ~75 items → 3 months. Last breaking change: v0.13.0
+Current surface: ~75 items → 3 months. Last breaking change: v0.14.0
+(PeerRole breaking change + protocol v6, 2026-03-22).
 (subscribe() returns SubscriptionId instead of QueryResult, 2026-03-21).
-Eligible: 2026-06-21.
+Eligible: 2026-06-22.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.13.0. Items annotated with stability assessments.
+Snapshot as of v0.14.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.13.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.14.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `13` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `14` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 
 ### Type aliases
@@ -116,7 +117,7 @@ Snapshot as of v0.13.0. Items annotated with stability assessments.
 
 | Name | Value | Stability |
 |---|---|---|
-| `kProtocolVersion` | `5` | **Stable** (will increment with breaking wire changes) |
+| `kProtocolVersion` | `6` | **Stable** (will increment with breaking wire changes) |
 | `kDefaultBucketSize` | `1024` | **Stable** |
 | `kMaxMessageSize` | `64 * 1024 * 1024` (64 MB) | **Stable** |
 | `kMaxArrayCount` | `10'000'000` (10 M) | **Stable** |

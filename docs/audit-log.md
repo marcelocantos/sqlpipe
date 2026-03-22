@@ -82,3 +82,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `dfcc5aa`
 - **Outcome**: Released v0.13.0. Swift SPM package with SyncPeer wrapper.
+
+## 2026-03-22 — /release v0.14.0
+
+- **Commit**: `b7f1b08`
+- **Outcome**: Released v0.14.0. Protocol v6 (fast reconnect), explicit PeerRole, prediction API, seq continuity check, Relay class, fan-out and chain replication tests.
