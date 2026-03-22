@@ -2623,7 +2623,7 @@ struct Peer::Impl {
     bool replica_handshake_done = false;
 
     bool is_server() const {
-        return config.approve_ownership != nullptr;
+        return config.role == PeerRole::Server;
     }
 
     void create_master() {

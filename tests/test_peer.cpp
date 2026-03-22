@@ -95,6 +95,7 @@ TEST_CASE("peer: client start produces hello with owned_tables") {
 TEST_CASE("peer: server rejects start()") {
     DB d;
     PeerConfig cfg;
+    cfg.role = PeerRole::Server;
     cfg.approve_ownership = [](const std::set<std::string>&) { return true; };
     Peer server(d.db, cfg);
 
@@ -114,6 +115,7 @@ TEST_CASE("peer: fresh handshake both sides go live") {
     Peer client(client_db.db, client_cfg);
 
     PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
     server_cfg.approve_ownership = [](const std::set<std::string>& t) {
         return t == std::set<std::string>{"t1"};
     };
@@ -142,6 +144,7 @@ TEST_CASE("peer: ownership rejection") {
     Peer client(client_db.db, client_cfg);
 
     PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
     server_cfg.approve_ownership = [](const std::set<std::string>&) {
         return false;
     };
@@ -170,6 +173,7 @@ TEST_CASE("peer: client-owned table live streaming") {
     Peer client(client_db.db, client_cfg);
 
     PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
     server_cfg.approve_ownership = [](const std::set<std::string>&) {
         return true;
     };
@@ -207,6 +211,7 @@ TEST_CASE("peer: server-owned table live streaming") {
     Peer client(client_db.db, client_cfg);
 
     PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
     server_cfg.approve_ownership = [](const std::set<std::string>&) {
         return true;
     };
@@ -242,6 +247,7 @@ TEST_CASE("peer: bidirectional live streaming") {
     Peer client(client_db.db, client_cfg);
 
     PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
     server_cfg.approve_ownership = [](const std::set<std::string>&) {
         return true;
     };
@@ -282,7 +288,9 @@ TEST_CASE("peer: auto-approve when callback is null") {
     Peer client(client_db.db, client_cfg);
 
     // Server with no approve_ownership callback → auto-approve.
-    Peer server(server_db.db);
+    PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
+    Peer server(server_db.db, server_cfg);
 
     auto initial = client.start();
     exchange(client, server, initial);
@@ -304,7 +312,9 @@ TEST_CASE("peer: flush on non-owned table produces nothing") {
     client_cfg.owned_tables = {"t1"};
     Peer client(client_db.db, client_cfg);
 
-    Peer server(server_db.db);
+    PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
+    Peer server(server_db.db, server_cfg);
     auto initial = client.start();
     exchange(client, server, initial);
 
@@ -329,7 +339,9 @@ TEST_CASE("peer: one side owns all tables") {
     client_cfg.owned_tables = {"t1", "t2"};
     Peer client(client_db.db, client_cfg);
 
-    Peer server(server_db.db);
+    PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
+    Peer server(server_db.db, server_cfg);
     auto initial = client.start();
     exchange(client, server, initial);
 
@@ -366,7 +378,9 @@ TEST_CASE("peer: diff sync after reconnect") {
         PeerConfig client_cfg;
         client_cfg.owned_tables = {"t1"};
         Peer client(client_db.db, client_cfg);
-        Peer server(server_db.db);
+        PeerConfig server_cfg;
+        server_cfg.role = PeerRole::Server;
+        Peer server(server_db.db, server_cfg);
         auto initial = client.start();
         exchange(client, server, initial);
 
@@ -398,6 +412,7 @@ TEST_CASE("peer: diff sync after reconnect") {
         client_cfg.owned_tables = {"t1"};
         Peer client(client_db.db, client_cfg);
         PeerConfig server_cfg;
+        server_cfg.role = PeerRole::Server;
         server_cfg.approve_ownership =
             [](const std::set<std::string>&) { return true; };
         Peer server(server_db.db, server_cfg);
@@ -425,6 +440,7 @@ TEST_CASE("peer: reset and reconnect") {
     Peer client(client_db.db, client_cfg);
 
     PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
     server_cfg.approve_ownership = [](const std::set<std::string>&) {
         return true;
     };
@@ -484,6 +500,7 @@ TEST_CASE("peer: table_filter excludes tables from replication") {
     Peer client(client_db.db, client_cfg);
 
     PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
     server_cfg.table_filter = std::set<std::string>{"t1", "t2"};
     server_cfg.approve_ownership = [](const std::set<std::string>&) {
         return true;
@@ -528,6 +545,7 @@ TEST_CASE("peer: server rejects client ownership outside table_filter") {
 
     // Server filter only includes t2 — t1 is outside.
     PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
     server_cfg.table_filter = std::set<std::string>{"t2"};
     server_cfg.approve_ownership = [](const std::set<std::string>&) {
         return true;
@@ -570,6 +588,7 @@ TEST_CASE("peer: subscribe receives updates through handle_message") {
     Peer client(client_db.db, client_cfg);
 
     PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
     server_cfg.approve_ownership =
         [](const std::set<std::string>&) { return true; };
     Peer server(server_db.db, server_cfg);

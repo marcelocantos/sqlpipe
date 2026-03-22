@@ -147,9 +147,10 @@
   - `approve_ownership` callback is only valid on Server peers
   - `start()` is only valid on Client peers (already enforced, but tied to role not callback)
   - Existing implicit behavior preserved as default for backwards compatibility during pre-1.0
-- **Context**: Currently the server role is inferred from whether `approve_ownership` is set. This is subtle and easy to misconfigure. An explicit role makes the API self-documenting. Breaking change — must be done before 1.0.
-- **Status**: identified
+- **Context**: Previously the server role was inferred from `approve_ownership` being set. Now explicit via `PeerRole::Server`. Breaking change.
+- **Status**: achieved
 - **Discovered**: 2026-03-15
+- **Achieved**: 2026-03-22
 
 ### 🎯T8 Prediction API for optimistic local updates
 - **Weight**: 3 (value 8 / cost 3)

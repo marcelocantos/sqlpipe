@@ -562,7 +562,16 @@ namespace sqlpipe {
 using ApproveOwnershipCallback = std::function<bool(
     const std::set<std::string>& requested_tables)>;
 
+/// Explicit role for a Peer in the handshake protocol.
+enum class PeerRole : std::uint8_t {
+    Client,  ///< Initiates the handshake via start(). Sends owned_tables.
+    Server,  ///< Waits for the client's hello. Validates ownership.
+};
+
 struct PeerConfig {
+    /// Peer role — determines handshake behaviour.
+    PeerRole role = PeerRole::Client;
+
     /// Tables this peer wants to own (client-side: sent in hello).
     /// Ignored on the server side (computed as complement of client's).
     std::set<std::string> owned_tables;
@@ -572,8 +581,7 @@ struct PeerConfig {
     /// Complement (remote tables) is computed within this filtered set.
     std::optional<std::set<std::string>> table_filter;
 
-    /// Server-side ownership validation callback.
-    /// Non-null indicates this peer is the server.
+    /// Server-side ownership validation callback (server role only).
     /// nullptr = auto-approve any request.
     ApproveOwnershipCallback approve_ownership = nullptr;
 
