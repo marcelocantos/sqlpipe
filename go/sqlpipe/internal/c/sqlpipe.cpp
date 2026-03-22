@@ -2950,6 +2950,93 @@ void sync_handshake(Master& master, Replica& replica) {
     }
 }
 
+// ── Relay ───────────────────────────────────────────────────────────
+
+struct Relay::Impl {
+    sqlite3*     db;
+    RelayConfig  config;
+    Master       master;
+    Replica      replica;
+    std::map<std::size_t, SinkCallback> sinks;
+    std::size_t  next_sink_id = 1;
+
+    Impl(sqlite3* db_, RelayConfig cfg)
+        : db(db_),
+          config(std::move(cfg)),
+          master(db_, make_master_config()),
+          replica(db_, make_replica_config()) {}
+
+    MasterConfig make_master_config() {
+        MasterConfig mc;
+        mc.table_filter = config.table_filter;
+        mc.on_log = config.on_log;
+        return mc;
+    }
+
+    ReplicaConfig make_replica_config() {
+        ReplicaConfig rc;
+        rc.table_filter = config.table_filter;
+        rc.on_conflict = config.on_conflict;
+        rc.on_schema_mismatch = config.on_schema_mismatch;
+        rc.on_log = config.on_log;
+        return rc;
+    }
+
+    void broadcast() {
+        auto msgs = master.flush();
+        for (auto& msg : msgs) {
+            for (auto& [_, cb] : sinks) {
+                cb(msg);
+            }
+        }
+    }
+};
+
+Relay::Relay(sqlite3* db, RelayConfig config)
+    : impl_(std::make_unique<Impl>(db, std::move(config))) {}
+
+Relay::~Relay() = default;
+Relay::Relay(Relay&&) noexcept = default;
+Relay& Relay::operator=(Relay&&) noexcept = default;
+
+std::size_t Relay::add_sink(SinkCallback cb) {
+    auto id = impl_->next_sink_id++;
+    impl_->sinks[id] = std::move(cb);
+    return id;
+}
+
+void Relay::remove_sink(std::size_t id) {
+    impl_->sinks.erase(id);
+}
+
+Message Relay::hello() {
+    return impl_->replica.hello();
+}
+
+std::vector<Message> Relay::handle_upstream(const Message& msg) {
+    auto hr = impl_->replica.handle_message(msg);
+    impl_->broadcast();
+    return std::move(hr.messages);
+}
+
+std::vector<Message> Relay::handle_downstream(const Message& msg) {
+    return impl_->master.handle_message(msg);
+}
+
+SubscriptionId Relay::subscribe(const std::string& sql) {
+    return impl_->replica.subscribe(sql);
+}
+
+void Relay::unsubscribe(SubscriptionId id) {
+    impl_->replica.unsubscribe(id);
+}
+
+void Relay::reset() {
+    impl_->replica.reset();
+}
+
+// ── Convenience utilities ────────────────────────────────────────
+
 void sync_handshake(Peer& client, Peer& server) {
     auto pending_for_server = client.start();
     while (!pending_for_server.empty() ||
@@ -2971,6 +3058,22 @@ void sync_handshake(Peer& client, Peer& server) {
             (client.state() != Peer::State::Live ||
              server.state() != Peer::State::Live)) {
             break;
+        }
+    }
+}
+
+void sync_handshake(Master& master, Relay& relay) {
+    auto pending = master.handle_message(relay.hello());
+    while (!pending.empty()) {
+        std::vector<Message> for_master;
+        for (const auto& msg : pending) {
+            auto resp = relay.handle_upstream(msg);
+            for_master.insert(for_master.end(), resp.begin(), resp.end());
+        }
+        pending.clear();
+        for (const auto& msg : for_master) {
+            auto resp = master.handle_message(msg);
+            pending.insert(pending.end(), resp.begin(), resp.end());
         }
     }
 }

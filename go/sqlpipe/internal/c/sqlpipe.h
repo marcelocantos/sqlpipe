@@ -687,6 +687,78 @@ std::vector<std::uint8_t> serialize(const PeerMessage& msg);
 /// Deserialize a byte buffer into a PeerMessage.
 PeerMessage deserialize_peer(std::span<const std::uint8_t> buf);
 
+// ── relay.h ─────────────────────────────────────────────────────
+
+/// Callback to deliver a message to a downstream sink.
+using SinkCallback = std::function<void(const Message&)>;
+
+/// Configuration for a Relay node.
+struct RelayConfig {
+    /// Optional table filter (same semantics as MasterConfig/ReplicaConfig).
+    std::optional<std::set<std::string>> table_filter;
+
+    /// Conflict callback for the internal Replica.
+    ConflictCallback on_conflict = nullptr;
+
+    /// Schema mismatch callback for the internal Replica.
+    SchemaMismatchCallback on_schema_mismatch = nullptr;
+
+    /// Log callback forwarded to both internal Master and Replica.
+    LogCallback on_log = nullptr;
+};
+
+/// A relay node that receives changesets from an upstream Master and
+/// broadcasts them to downstream Replica sinks.
+///
+/// Internally owns a Replica (upstream) and a Master (downstream) on
+/// the same sqlite3* handle. The SQLite session extension captures
+/// changeset_apply writes, so the Master's session sees the Replica's
+/// applied changes and can flush them downstream.
+///
+/// Does NOT own the sqlite3* handle.
+class Relay {
+public:
+    explicit Relay(sqlite3* db, RelayConfig config = {});
+    ~Relay();
+
+    Relay(const Relay&) = delete;
+    Relay& operator=(const Relay&) = delete;
+    Relay(Relay&&) noexcept;
+    Relay& operator=(Relay&&) noexcept;
+
+    /// Register a downstream sink. Returns an ID for removal.
+    std::size_t add_sink(SinkCallback cb);
+
+    /// Remove a downstream sink by ID.
+    void remove_sink(std::size_t id);
+
+    /// Generate the HelloMsg to send to the upstream master.
+    Message hello();
+
+    /// Handle an incoming message from the upstream master.
+    /// Applies the changeset locally, flushes to the internal Master,
+    /// and broadcasts to all registered sinks.
+    /// Returns response messages to send back to the upstream master.
+    std::vector<Message> handle_upstream(const Message& msg);
+
+    /// Handle an incoming message from a downstream sink (handshake).
+    /// Returns response messages to send back to that sink.
+    std::vector<Message> handle_downstream(const Message& msg);
+
+    /// Subscribe to a query (on the replica side).
+    SubscriptionId subscribe(const std::string& sql);
+
+    /// Remove a subscription.
+    void unsubscribe(SubscriptionId id);
+
+    /// Reset for reconnection to upstream.
+    void reset();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // ── Convenience utilities ───────────────────────────────────────
 
 /// Drive the Master/Replica handshake protocol to completion when both
@@ -697,5 +769,8 @@ void sync_handshake(Master& master, Replica& replica);
 /// in the same process. The client initiates; messages are exchanged
 /// until both peers reach Live state or no more messages remain.
 void sync_handshake(Peer& client, Peer& server);
+
+/// Drive the Master/Relay handshake (upstream side).
+void sync_handshake(Master& master, Relay& relay);
 
 } // namespace sqlpipe

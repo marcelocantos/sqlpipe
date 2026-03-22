@@ -1041,7 +1041,7 @@ TEST_CASE("fan-out: replicas at different seqs receive correct data") {
 
 // ── Chain replication tests ─────────────────────────────────────
 
-TEST_CASE("chain: source → relay → sink") {
+TEST_CASE("chain: source → relay → sink using Relay class") {
     DB src_db, relay_db, sink_db;
     const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
     src_db.exec(schema);
@@ -1049,26 +1049,49 @@ TEST_CASE("chain: source → relay → sink") {
     sink_db.exec(schema);
 
     Master source(src_db.db);
-
-    // Relay: master FIRST (session attaches), then replica on same db.
-    Master relay_master(relay_db.db);
-    Replica relay_replica(relay_db.db);
-
+    Relay relay(relay_db.db);
     Replica sink(sink_db.db);
 
-    sync_handshake(source, relay_replica);
-    sync_handshake(relay_master, sink);
+    // Register sink — relay broadcasts to it automatically.
+    std::vector<Message> sink_inbox;
+    relay.add_sink([&](const Message& m) { sink_inbox.push_back(m); });
 
-    // Insert at source, flush through the chain.
+    // Handshake: source ↔ relay (upstream)
+    sync_handshake(source, relay);
+
+    // Handshake: relay ↔ sink (downstream)
+    {
+        auto h = sink.hello();
+        auto resp = relay.handle_downstream(h);
+        std::vector<Message> pending;
+        for (auto& m : resp) {
+            auto hr = sink.handle_message(m);
+            pending.insert(pending.end(), hr.messages.begin(), hr.messages.end());
+        }
+        while (!pending.empty()) {
+            std::vector<Message> next;
+            for (auto& m : pending) {
+                auto mr = relay.handle_downstream(m);
+                for (auto& m2 : mr) {
+                    auto hr = sink.handle_message(m2);
+                    next.insert(next.end(), hr.messages.begin(), hr.messages.end());
+                }
+            }
+            pending = std::move(next);
+        }
+    }
+    CHECK(sink.state() == Replica::State::Live);
+
+    // Insert at source, flush through chain.
     src_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
     src_db.exec("INSERT INTO t1 VALUES (2, 'world')");
     auto msgs = source.flush();
-    for (auto& m : msgs) relay_replica.handle_message(m);
+    for (auto& m : msgs) relay.handle_upstream(m);
 
-    // Relay master captures the changeset_apply writes via its session.
-    auto relay_msgs = relay_master.flush();
-    REQUIRE(!relay_msgs.empty());
-    for (auto& m : relay_msgs) sink.handle_message(m);
+    // Sink should have received broadcast.
+    REQUIRE(!sink_inbox.empty());
+    for (auto& m : sink_inbox) sink.handle_message(m);
+    sink_inbox.clear();
 
     CHECK(src_db.count("t1") == 2);
     CHECK(relay_db.count("t1") == 2);
@@ -1077,16 +1100,15 @@ TEST_CASE("chain: source → relay → sink") {
     // Second round.
     src_db.exec("INSERT INTO t1 VALUES (3, 'chain')");
     msgs = source.flush();
-    for (auto& m : msgs) relay_replica.handle_message(m);
-    relay_msgs = relay_master.flush();
-    for (auto& m : relay_msgs) sink.handle_message(m);
+    for (auto& m : msgs) relay.handle_upstream(m);
+    for (auto& m : sink_inbox) sink.handle_message(m);
 
     CHECK(src_db.count("t1") == 3);
     CHECK(relay_db.count("t1") == 3);
     CHECK(sink_db.count("t1") == 3);
 }
 
-TEST_CASE("chain: late sink joins mid-chain") {
+TEST_CASE("chain: late sink joins mid-chain via Relay") {
     DB src_db, relay_db, sink_db;
     const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
     src_db.exec(schema);
@@ -1094,28 +1116,103 @@ TEST_CASE("chain: late sink joins mid-chain") {
     sink_db.exec(schema);
 
     Master source(src_db.db);
-    Master relay_master(relay_db.db);
-    Replica relay_replica(relay_db.db);
-    sync_handshake(source, relay_replica);
+    Relay relay(relay_db.db);
 
-    // Stream some data through source → relay.
+    sync_handshake(source, relay);
+
+    // Stream data through source → relay (no sink yet).
     src_db.exec("INSERT INTO t1 VALUES (1, 'a')");
     src_db.exec("INSERT INTO t1 VALUES (2, 'b')");
     auto msgs = source.flush();
-    for (auto& m : msgs) relay_replica.handle_message(m);
-    relay_master.flush();  // advance relay master's seq
+    for (auto& m : msgs) relay.handle_upstream(m);
+    CHECK(relay_db.count("t1") == 2);
 
-    // Sink joins late — diff syncs from relay.
+    // Sink joins late — register and handshake.
+    std::vector<Message> sink_inbox;
+    relay.add_sink([&](const Message& m) { sink_inbox.push_back(m); });
+
     Replica sink(sink_db.db);
-    sync_handshake(relay_master, sink);
+    auto hello = sink.hello();
+    auto resp = relay.handle_downstream(hello);
+    std::vector<Message> pending;
+    for (auto& m : resp) {
+        auto hr = sink.handle_message(m);
+        pending.insert(pending.end(), hr.messages.begin(), hr.messages.end());
+    }
+    while (!pending.empty()) {
+        std::vector<Message> next;
+        for (auto& m : pending) {
+            auto mr = relay.handle_downstream(m);
+            for (auto& m2 : mr) {
+                auto hr = sink.handle_message(m2);
+                next.insert(next.end(), hr.messages.begin(), hr.messages.end());
+            }
+        }
+        pending = std::move(next);
+    }
     CHECK(sink.state() == Replica::State::Live);
     CHECK(sink_db.count("t1") == 2);
 
     // Subsequent streaming works end-to-end.
     src_db.exec("INSERT INTO t1 VALUES (3, 'c')");
     msgs = source.flush();
-    for (auto& m : msgs) relay_replica.handle_message(m);
-    auto relay_msgs = relay_master.flush();
-    for (auto& m : relay_msgs) sink.handle_message(m);
+    for (auto& m : msgs) relay.handle_upstream(m);
+    for (auto& m : sink_inbox) sink.handle_message(m);
     CHECK(sink_db.count("t1") == 3);
+}
+
+TEST_CASE("chain: relay broadcasts to multiple sinks") {
+    DB src_db, relay_db, s1_db, s2_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    src_db.exec(schema); relay_db.exec(schema);
+    s1_db.exec(schema); s2_db.exec(schema);
+
+    Master source(src_db.db);
+    Relay relay(relay_db.db);
+
+    std::vector<Message> s1_inbox, s2_inbox;
+    relay.add_sink([&](const Message& m) { s1_inbox.push_back(m); });
+    relay.add_sink([&](const Message& m) { s2_inbox.push_back(m); });
+
+    sync_handshake(source, relay);
+
+    Replica s1(s1_db.db), s2(s2_db.db);
+    // Handshake sinks via downstream.
+    auto drive_sink_handshake = [&](Replica& sink) {
+        auto h = sink.hello();
+        auto resp = relay.handle_downstream(h);
+        std::vector<Message> pending;
+        for (auto& m : resp) {
+            auto hr = sink.handle_message(m);
+            pending.insert(pending.end(), hr.messages.begin(), hr.messages.end());
+        }
+        while (!pending.empty()) {
+            std::vector<Message> next;
+            for (auto& m : pending) {
+                auto mr = relay.handle_downstream(m);
+                for (auto& m2 : mr) {
+                    auto hr = sink.handle_message(m2);
+                    next.insert(next.end(), hr.messages.begin(), hr.messages.end());
+                }
+            }
+            pending = std::move(next);
+        }
+    };
+    drive_sink_handshake(s1);
+    drive_sink_handshake(s2);
+    CHECK(s1.state() == Replica::State::Live);
+    CHECK(s2.state() == Replica::State::Live);
+
+    // Insert and flush through chain.
+    src_db.exec("INSERT INTO t1 VALUES (1, 'broadcast')");
+    auto msgs = source.flush();
+    for (auto& m : msgs) relay.handle_upstream(m);
+
+    // Both sinks should have received.
+    CHECK(s1_inbox.size() == s2_inbox.size());
+    for (auto& m : s1_inbox) s1.handle_message(m);
+    for (auto& m : s2_inbox) s2.handle_message(m);
+
+    CHECK(s1_db.count("t1") == 1);
+    CHECK(s2_db.count("t1") == 1);
 }
