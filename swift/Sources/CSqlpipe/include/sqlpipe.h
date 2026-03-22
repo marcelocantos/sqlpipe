@@ -224,7 +224,7 @@ private:
 // ── protocol.h ──────────────────────────────────────────────────
 namespace sqlpipe {
 
-inline constexpr std::uint32_t kProtocolVersion = 5;
+inline constexpr std::uint32_t kProtocolVersion = 6;
 
 // ── Message types ───────────────────────────────────────────────────
 
@@ -233,6 +233,9 @@ struct HelloMsg {
     std::uint32_t protocol_version;  ///< Must match kProtocolVersion.
     SchemaVersion schema_version;    ///< Sender's schema fingerprint.
     std::set<std::string> owned_tables;  ///< Tables the sender wants to own (Peer mode).
+    Seq last_seq = -1;  ///< Sender's current seq (-1 = not provided).
+                        ///< When replica's seq matches master's and both > 0,
+                        ///< diff sync is skipped (fast reconnect).
 };
 
 /// A single changeset (one flush() worth of changes). Used in live streaming.
@@ -508,8 +511,24 @@ public:
     /// Remove a subscription.
     void unsubscribe(SubscriptionId id);
 
+    /// Begin an optimistic prediction. Creates a SQLite SAVEPOINT.
+    /// Only one prediction can be active at a time.
+    /// While active, the client can write optimistically to the local
+    /// database and subscriptions will fire with the predicted state.
+    void begin_prediction();
+
+    /// Finalise the prediction — the client is done editing and will
+    /// send the action to the server. The savepoint stays open until
+    /// the server responds (via handle_message, which auto-rollbacks).
+    void commit_prediction();
+
+    /// Cancel the prediction before sending. Rolls back the savepoint,
+    /// restoring the pre-prediction state.
+    void rollback_prediction();
+
     /// Reset to Init state for reconnection. Subscriptions are preserved;
     /// they will re-evaluate after the next handshake applies changes.
+    /// Also rolls back any active prediction.
     void reset();
 
     Seq current_seq() const;

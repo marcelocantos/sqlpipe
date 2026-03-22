@@ -2003,6 +2003,10 @@ struct Replica::Impl {
     Replica::State state = Replica::State::Init;
     QueryWatch     watch;
 
+    // Prediction state.
+    enum class PredictionState : uint8_t { None, Drafting, Committed };
+    PredictionState prediction = PredictionState::None;
+
     Impl(sqlite3* db_, ReplicaConfig cfg)
         : db(db_), config(std::move(cfg)), watch(db_) {}
 
@@ -2284,6 +2288,15 @@ Message Replica::hello() const {
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
+    // Auto-rollback a committed prediction before applying server data.
+    if (impl_->prediction == Impl::PredictionState::Committed) {
+        detail::exec(impl_->db, "ROLLBACK TO _sqlpipe_prediction");
+        detail::exec(impl_->db, "RELEASE _sqlpipe_prediction");
+        impl_->prediction = Impl::PredictionState::None;
+        SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug,
+                    "prediction auto-rolled back (server response)");
+    }
+
     auto prev_state = impl_->state;
     auto result = std::visit([&](const auto& m) -> HandleResult {
         using T = std::decay_t<decltype(m)>;
@@ -2366,6 +2379,11 @@ HandleResult Replica::handle_message(const Message& msg) {
 }
 
 HandleResult Replica::handle_messages(std::span<const Message> msgs) {
+    if (impl_->prediction == Impl::PredictionState::Committed) {
+        detail::exec(impl_->db, "ROLLBACK TO _sqlpipe_prediction");
+        detail::exec(impl_->db, "RELEASE _sqlpipe_prediction");
+        impl_->prediction = Impl::PredictionState::None;
+    }
     auto prev_state = impl_->state;
     HandleResult combined;
     std::set<std::string> affected;
@@ -2460,7 +2478,46 @@ void Replica::unsubscribe(SubscriptionId id) {
     impl_->watch.unsubscribe(id);
 }
 
+void Replica::begin_prediction() {
+    using PS = Impl::PredictionState;
+    if (impl_->prediction != PS::None) {
+        throw Error(ErrorCode::InvalidState,
+                    "prediction already active");
+    }
+    detail::exec(impl_->db, "SAVEPOINT _sqlpipe_prediction");
+    impl_->prediction = PS::Drafting;
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "prediction begun");
+}
+
+void Replica::commit_prediction() {
+    using PS = Impl::PredictionState;
+    if (impl_->prediction != PS::Drafting) {
+        throw Error(ErrorCode::InvalidState,
+                    "no drafting prediction to commit");
+    }
+    impl_->prediction = PS::Committed;
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "prediction committed (awaiting server)");
+}
+
+void Replica::rollback_prediction() {
+    using PS = Impl::PredictionState;
+    if (impl_->prediction == PS::None) {
+        throw Error(ErrorCode::InvalidState,
+                    "no active prediction to rollback");
+    }
+    detail::exec(impl_->db, "ROLLBACK TO _sqlpipe_prediction");
+    detail::exec(impl_->db, "RELEASE _sqlpipe_prediction");
+    impl_->prediction = PS::None;
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "prediction rolled back");
+}
+
 void Replica::reset() {
+    // Rollback any active prediction before resetting.
+    if (impl_->prediction != Impl::PredictionState::None) {
+        detail::exec(impl_->db, "ROLLBACK TO _sqlpipe_prediction");
+        detail::exec(impl_->db, "RELEASE _sqlpipe_prediction");
+        impl_->prediction = Impl::PredictionState::None;
+    }
     impl_->state = State::Init;
     impl_->seq = detail::read_seq(impl_->db, impl_->config.seq_key);
     SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info, "replica reset to Init at seq={}", impl_->seq);

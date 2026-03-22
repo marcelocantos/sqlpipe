@@ -151,4 +151,19 @@
 - **Status**: identified
 - **Discovered**: 2026-03-15
 
+### 🎯T8 Prediction API for optimistic local updates
+- **Weight**: 3 (value 8 / cost 3)
+- **Estimated-cost**: 3
+- **Acceptance**:
+  - `Replica::begin_prediction()` creates a SQLite SAVEPOINT
+  - `Replica::commit_prediction()` marks prediction as sent (savepoint stays open)
+  - `Replica::rollback_prediction()` cancels before sending
+  - `Replica::handle_message()` auto-rollbacks committed predictions before applying server data
+  - `Replica::reset()` rolls back active predictions
+  - Tests: confirmed, rejected, cancelled, reset, double-begin error
+- **Context**: Interactive apps need instant feedback. Predictions use SQLite savepoints — the server remains authoritative.
+- **Status**: achieved
+- **Discovered**: 2026-03-22
+- **Achieved**: 2026-03-22
+
 ## Achieved

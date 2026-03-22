@@ -721,3 +721,109 @@ TEST_CASE("integration: subscriptions fire after diff sync with no changes") {
     CHECK(result.subscriptions[0].id == sub_id);
     CHECK(std::get<int64_t>(result.subscriptions[0].rows[0][0]) == 2);
 }
+
+TEST_CASE("prediction: confirmed by server (data matches)") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Predict an insert locally.
+    replica.begin_prediction();
+    replica_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    replica.commit_prediction();
+
+    // Verify predicted data is visible.
+    CHECK(replica_db.count("t1") == 1);
+
+    // Server makes the same change and sends it.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    auto msgs = master.flush();
+    auto result = replica.handle_message(msgs[0]);
+
+    // Prediction was rolled back, server data applied.
+    // Result should be the same (1 row).
+    CHECK(replica_db.count("t1") == 1);
+    CHECK(result.changes.size() == 1);
+}
+
+TEST_CASE("prediction: rejected by server (different data)") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Predict inserting row 1.
+    replica.begin_prediction();
+    replica_db.exec("INSERT INTO t1 VALUES (1, 'predicted')");
+    replica.commit_prediction();
+
+    CHECK(replica_db.count("t1") == 1);
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=1") == "predicted");
+
+    // Server sends a different row instead (rejection scenario).
+    master_db.exec("INSERT INTO t1 VALUES (2, 'server')");
+    auto msgs = master.flush();
+    auto result = replica.handle_message(msgs[0]);
+
+    // Prediction rolled back: row 1 gone, row 2 from server.
+    CHECK(replica_db.count("t1") == 1);
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=2") == "server");
+}
+
+TEST_CASE("prediction: cancelled before send") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Begin and cancel a prediction.
+    replica.begin_prediction();
+    replica_db.exec("INSERT INTO t1 VALUES (1, 'nope')");
+    CHECK(replica_db.count("t1") == 1);
+
+    replica.rollback_prediction();
+    CHECK(replica_db.count("t1") == 0);  // rolled back
+}
+
+TEST_CASE("prediction: reset rolls back active prediction") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    replica.begin_prediction();
+    replica_db.exec("INSERT INTO t1 VALUES (1, 'will be lost')");
+    replica.commit_prediction();
+    CHECK(replica_db.count("t1") == 1);
+
+    // Reset (simulating disconnect) rolls back prediction.
+    replica.reset();
+    CHECK(replica_db.count("t1") == 0);
+}
+
+TEST_CASE("prediction: error on double begin") {
+    DB d;
+    d.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY)");
+    Replica replica(d.db);
+
+    replica.begin_prediction();
+    CHECK_THROWS_AS(replica.begin_prediction(), Error);
+    replica.rollback_prediction();  // cleanup
+}
