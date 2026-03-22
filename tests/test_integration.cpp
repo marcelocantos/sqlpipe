@@ -1018,14 +1018,23 @@ TEST_CASE("fan-out: replicas at different seqs receive correct data") {
     CHECK(r1.current_seq() == 2);
     CHECK(r2.current_seq() == 1);
 
-    // Flush 3 — send to both. r2 is behind but should apply fine
-    // (changesets are independent, keyed by seq).
+    // Flush 3 — send to both. r2 is behind (seq 1, expects 2, gets 3).
+    // Should reject with a seq gap error.
     master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
     msgs = master.flush();
-    for (auto& m : msgs) { r1.handle_message(m); r2.handle_message(m); }
-
+    for (auto& m : msgs) r1.handle_message(m);
     CHECK(r1.current_seq() == 3);
-    CHECK(r2.current_seq() == 3);  // jumped from 1 to 3 (missed 2)
     CHECK(r1_db.count("t1") == 3);
-    CHECK(r2_db.count("t1") == 2);  // has rows 1 and 3, missed row 2
+
+    // r2 rejects the out-of-order changeset.
+    CHECK_THROWS_AS(r2.handle_message(msgs[0]), Error);
+    CHECK(r2.current_seq() == 1);    // unchanged
+    CHECK(r2_db.count("t1") == 1);   // unchanged
+
+    // r2 needs a reconnect (diff sync) to catch up.
+    r2.reset();
+    Master master2(master_db.db);
+    sync_handshake(master2, r2);
+    CHECK(r2.state() == Replica::State::Live);
+    CHECK(r2_db.count("t1") == 3);
 }

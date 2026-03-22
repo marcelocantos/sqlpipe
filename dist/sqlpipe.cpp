@@ -2028,6 +2028,12 @@ struct Replica::Impl {
     }
 
     std::vector<ChangeEvent> apply_changeset(const Changeset& data, Seq new_seq) {
+        if (new_seq != seq + 1) {
+            throw Error(ErrorCode::ProtocolError,
+                        "changeset seq gap: expected " +
+                        std::to_string(seq + 1) + ", got " +
+                        std::to_string(new_seq));
+        }
         int rc = sqlite3changeset_apply(
             db,
             static_cast<int>(data.size()),
