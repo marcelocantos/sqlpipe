@@ -827,3 +827,205 @@ TEST_CASE("prediction: error on double begin") {
     CHECK_THROWS_AS(replica.begin_prediction(), Error);
     replica.rollback_prediction();  // cleanup
 }
+
+// ── Fan-out tests (one Master, N Replicas) ──────────────────────
+
+TEST_CASE("fan-out: 3 replicas all receive same data") {
+    DB master_db, r1_db, r2_db, r3_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    r1_db.exec(schema);
+    r2_db.exec(schema);
+    r3_db.exec(schema);
+
+    Master master(master_db.db);
+    Replica r1(r1_db.db), r2(r2_db.db), r3(r3_db.db);
+
+    // Handshake all three.
+    sync_handshake(master, r1);
+    sync_handshake(master, r2);
+    sync_handshake(master, r3);
+    CHECK(r1.state() == Replica::State::Live);
+    CHECK(r2.state() == Replica::State::Live);
+    CHECK(r3.state() == Replica::State::Live);
+
+    // Insert and flush — broadcast to all.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    master_db.exec("INSERT INTO t1 VALUES (2, 'world')");
+    auto msgs = master.flush();
+    REQUIRE(!msgs.empty());
+
+    for (auto& msg : msgs) {
+        r1.handle_message(msg);
+        r2.handle_message(msg);
+        r3.handle_message(msg);
+    }
+
+    CHECK(r1_db.count("t1") == 2);
+    CHECK(r2_db.count("t1") == 2);
+    CHECK(r3_db.count("t1") == 2);
+    CHECK(r1.current_seq() == r2.current_seq());
+    CHECK(r2.current_seq() == r3.current_seq());
+}
+
+TEST_CASE("fan-out: late joiner diff syncs to catch up") {
+    DB master_db, r1_db, r2_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    r1_db.exec(schema);
+    r2_db.exec(schema);
+
+    Master master(master_db.db);
+    Replica r1(r1_db.db);
+    sync_handshake(master, r1);
+
+    // Stream some data to r1.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    auto msgs = master.flush();
+    for (auto& m : msgs) r1.handle_message(m);
+    CHECK(r1_db.count("t1") == 2);
+
+    // More data.
+    master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
+    msgs = master.flush();
+    for (auto& m : msgs) r1.handle_message(m);
+    CHECK(r1_db.count("t1") == 3);
+
+    // Late joiner r2 — should diff sync and get all 3 rows.
+    Replica r2(r2_db.db);
+    sync_handshake(master, r2);
+    CHECK(r2.state() == Replica::State::Live);
+    CHECK(r2_db.count("t1") == 3);
+
+    // Subsequent live streaming works for both.
+    master_db.exec("INSERT INTO t1 VALUES (4, 'd')");
+    msgs = master.flush();
+    for (auto& m : msgs) {
+        r1.handle_message(m);
+        r2.handle_message(m);
+    }
+    CHECK(r1_db.count("t1") == 4);
+    CHECK(r2_db.count("t1") == 4);
+}
+
+TEST_CASE("fan-out: replica disconnect and reconnect while others stream") {
+    DB master_db, r1_db, r2_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    r1_db.exec(schema);
+    r2_db.exec(schema);
+
+    Master master(master_db.db);
+    Replica r1(r1_db.db), r2(r2_db.db);
+    sync_handshake(master, r1);
+    sync_handshake(master, r2);
+
+    // Both get initial data.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    auto msgs = master.flush();
+    for (auto& m : msgs) { r1.handle_message(m); r2.handle_message(m); }
+
+    // r2 "disconnects" — r1 keeps streaming.
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
+    msgs = master.flush();
+    for (auto& m : msgs) r1.handle_message(m);
+    // r2 missed these.
+
+    CHECK(r1_db.count("t1") == 3);
+    CHECK(r2_db.count("t1") == 1);  // still at old state
+
+    // r2 reconnects — diff sync catches up.
+    r2.reset();
+    Master master2(master_db.db);  // new master for the reconnect handshake
+    sync_handshake(master2, r2);
+    CHECK(r2.state() == Replica::State::Live);
+    CHECK(r2_db.count("t1") == 3);
+}
+
+TEST_CASE("fan-out: flush during another replica's handshake") {
+    DB master_db, r1_db, r2_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    r1_db.exec(schema);
+    r2_db.exec(schema);
+
+    Master master(master_db.db);
+    Replica r1(r1_db.db);
+    sync_handshake(master, r1);
+
+    // Insert data and flush to r1 (r1 is live).
+    master_db.exec("INSERT INTO t1 VALUES (1, 'before')");
+    auto msgs = master.flush();
+    for (auto& m : msgs) r1.handle_message(m);
+
+    // r2 starts handshake — sends hello, master responds with hello.
+    Replica r2(r2_db.db);
+    auto hello = r2.hello();
+    auto hello_resp = master.handle_message(hello);
+
+    // Meanwhile, master gets more data and flushes to r1.
+    master_db.exec("INSERT INTO t1 VALUES (2, 'during')");
+    auto live_msgs = master.flush();
+    for (auto& m : live_msgs) r1.handle_message(m);
+    CHECK(r1_db.count("t1") == 2);
+
+    // Feed the hello response to r2, which sends bucket hashes.
+    // Then drive the rest of the handshake to completion.
+    std::vector<Message> pending;
+    for (auto& m : hello_resp) {
+        auto hr = r2.handle_message(m);
+        pending.insert(pending.end(), hr.messages.begin(), hr.messages.end());
+    }
+    while (!pending.empty()) {
+        std::vector<Message> next;
+        for (auto& m : pending) {
+            auto mr = master.handle_message(m);
+            for (auto& m2 : mr) {
+                auto hr = r2.handle_message(m2);
+                next.insert(next.end(), hr.messages.begin(), hr.messages.end());
+            }
+        }
+        pending = std::move(next);
+    }
+    CHECK(r2.state() == Replica::State::Live);
+    CHECK(r2_db.count("t1") == 2);
+}
+
+TEST_CASE("fan-out: replicas at different seqs receive correct data") {
+    DB master_db, r1_db, r2_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    r1_db.exec(schema);
+    r2_db.exec(schema);
+
+    Master master(master_db.db);
+    Replica r1(r1_db.db), r2(r2_db.db);
+    sync_handshake(master, r1);
+    sync_handshake(master, r2);
+
+    // Flush 1 — both receive.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    auto msgs = master.flush();
+    for (auto& m : msgs) { r1.handle_message(m); r2.handle_message(m); }
+
+    // Flush 2 — only r1 receives.
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    msgs = master.flush();
+    for (auto& m : msgs) r1.handle_message(m);
+
+    CHECK(r1.current_seq() == 2);
+    CHECK(r2.current_seq() == 1);
+
+    // Flush 3 — send to both. r2 is behind but should apply fine
+    // (changesets are independent, keyed by seq).
+    master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
+    msgs = master.flush();
+    for (auto& m : msgs) { r1.handle_message(m); r2.handle_message(m); }
+
+    CHECK(r1.current_seq() == 3);
+    CHECK(r2.current_seq() == 3);  // jumped from 1 to 3 (missed 2)
+    CHECK(r1_db.count("t1") == 3);
+    CHECK(r2_db.count("t1") == 2);  // has rows 1 and 3, missed row 2
+}
