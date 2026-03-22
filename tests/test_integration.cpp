@@ -1038,3 +1038,84 @@ TEST_CASE("fan-out: replicas at different seqs receive correct data") {
     CHECK(r2.state() == Replica::State::Live);
     CHECK(r2_db.count("t1") == 3);
 }
+
+// ── Chain replication tests ─────────────────────────────────────
+
+TEST_CASE("chain: source → relay → sink") {
+    DB src_db, relay_db, sink_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    src_db.exec(schema);
+    relay_db.exec(schema);
+    sink_db.exec(schema);
+
+    Master source(src_db.db);
+
+    // Relay: master FIRST (session attaches), then replica on same db.
+    Master relay_master(relay_db.db);
+    Replica relay_replica(relay_db.db);
+
+    Replica sink(sink_db.db);
+
+    sync_handshake(source, relay_replica);
+    sync_handshake(relay_master, sink);
+
+    // Insert at source, flush through the chain.
+    src_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    src_db.exec("INSERT INTO t1 VALUES (2, 'world')");
+    auto msgs = source.flush();
+    for (auto& m : msgs) relay_replica.handle_message(m);
+
+    // Relay master captures the changeset_apply writes via its session.
+    auto relay_msgs = relay_master.flush();
+    REQUIRE(!relay_msgs.empty());
+    for (auto& m : relay_msgs) sink.handle_message(m);
+
+    CHECK(src_db.count("t1") == 2);
+    CHECK(relay_db.count("t1") == 2);
+    CHECK(sink_db.count("t1") == 2);
+
+    // Second round.
+    src_db.exec("INSERT INTO t1 VALUES (3, 'chain')");
+    msgs = source.flush();
+    for (auto& m : msgs) relay_replica.handle_message(m);
+    relay_msgs = relay_master.flush();
+    for (auto& m : relay_msgs) sink.handle_message(m);
+
+    CHECK(src_db.count("t1") == 3);
+    CHECK(relay_db.count("t1") == 3);
+    CHECK(sink_db.count("t1") == 3);
+}
+
+TEST_CASE("chain: late sink joins mid-chain") {
+    DB src_db, relay_db, sink_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    src_db.exec(schema);
+    relay_db.exec(schema);
+    sink_db.exec(schema);
+
+    Master source(src_db.db);
+    Master relay_master(relay_db.db);
+    Replica relay_replica(relay_db.db);
+    sync_handshake(source, relay_replica);
+
+    // Stream some data through source → relay.
+    src_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    src_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    auto msgs = source.flush();
+    for (auto& m : msgs) relay_replica.handle_message(m);
+    relay_master.flush();  // advance relay master's seq
+
+    // Sink joins late — diff syncs from relay.
+    Replica sink(sink_db.db);
+    sync_handshake(relay_master, sink);
+    CHECK(sink.state() == Replica::State::Live);
+    CHECK(sink_db.count("t1") == 2);
+
+    // Subsequent streaming works end-to-end.
+    src_db.exec("INSERT INTO t1 VALUES (3, 'c')");
+    msgs = source.flush();
+    for (auto& m : msgs) relay_replica.handle_message(m);
+    auto relay_msgs = relay_master.flush();
+    for (auto& m : relay_msgs) sink.handle_message(m);
+    CHECK(sink_db.count("t1") == 3);
+}
