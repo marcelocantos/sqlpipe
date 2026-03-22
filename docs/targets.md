@@ -167,4 +167,15 @@
 - **Discovered**: 2026-03-22
 - **Achieved**: 2026-03-22
 
+### 🎯T9 Stress test SIGSEGV in test_stress.cpp:242 is fixed
+- **Weight**: 4 (value 5 / cost 1)
+- **Estimated-cost**: 1
+- **Acceptance**:
+  - `mk test` reports 0 failures (no SIGSEGV in stress tests)
+  - Root cause identified and documented in commit message
+- **Context**: Stress test wasn't updated for the T7 PeerRole breaking change. Missing `role = PeerRole::Server` on server PeerConfig.
+- **Status**: achieved
+- **Discovered**: 2026-03-22
+- **Achieved**: 2026-03-22
+
 ## Achieved

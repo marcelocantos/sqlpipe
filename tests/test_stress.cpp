@@ -252,6 +252,7 @@ TEST_CASE("stress: peer bidirectional random operations") {
     Peer client(client_db.db, client_cfg);
 
     PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
     server_cfg.approve_ownership = [](const std::set<std::string>&) {
         return true;
     };
