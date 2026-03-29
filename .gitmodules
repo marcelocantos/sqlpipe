@@ -1,0 +1,3 @@
+[submodule "vendor/github.com/sqliteai/liteparser"]
+	path = vendor/github.com/sqliteai/liteparser
+	url = https://github.com/sqliteai/liteparser.git
