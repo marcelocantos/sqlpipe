@@ -1927,3 +1927,129 @@ TEST_CASE("integration: update moves row in/out of predicate scope") {
     REQUIRE(result.subscriptions.size() == 1);
     CHECK(result.subscriptions[0].rows.size() == 2);  // beta, gamma
 }
+
+TEST_CASE("integration: OR equality predicates merged to IN-list") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, status TEXT, val INT)");
+    replica_db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, status TEXT, val INT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Insert items with different statuses.
+    master_db.exec("INSERT INTO items VALUES (1, 'active', 10)");
+    master_db.exec("INSERT INTO items VALUES (2, 'pending', 20)");
+    master_db.exec("INSERT INTO items VALUES (3, 'deleted', 30)");
+    master_db.exec("INSERT INTO items VALUES (4, 'active', 40)");
+    for (int i = 0; i < 4; ++i) deliver(master.flush(), replica);
+
+    // Subscribe using OR of equalities: status = 'active' OR status = 'pending'.
+    // This should be merged into InList(status, {'active', 'pending'}).
+    replica.subscribe(
+        "SELECT id, val FROM items WHERE status = 'active' OR status = 'pending'");
+
+    // Trigger initial delivery.
+    master_db.exec("INSERT INTO items VALUES (99, 'deleted', 0)");
+    auto init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+    CHECK(init.subscriptions[0].rows.size() == 3);  // items 1, 2, 4
+
+    // Insert deleted item — should NOT fire (not in {active, pending}).
+    master_db.exec("INSERT INTO items VALUES (5, 'deleted', 50)");
+    auto msgs = master.flush();
+    auto result = deliver(msgs, replica);
+    CHECK(result.subscriptions.empty());
+
+    // Insert active item — SHOULD fire.
+    master_db.exec("INSERT INTO items VALUES (6, 'active', 60)");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.size() == 4);
+
+    // Insert pending item — SHOULD fire.
+    master_db.exec("INSERT INTO items VALUES (7, 'pending', 70)");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.size() == 5);
+}
+
+TEST_CASE("integration: NOT IN predicate") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, status TEXT, val INT)");
+    replica_db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, status TEXT, val INT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Subscribe to items NOT IN ('deleted', 'archived').
+    replica.subscribe(
+        "SELECT id, val FROM items WHERE status NOT IN ('deleted', 'archived')");
+
+    // Trigger initial delivery.
+    master_db.exec("INSERT INTO items VALUES (99, 'deleted', 0)");
+    auto init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+    CHECK(init.subscriptions[0].rows.empty());  // deleted item not in result
+
+    // Insert an active item — SHOULD fire (not in exclusion list).
+    master_db.exec("INSERT INTO items VALUES (1, 'active', 10)");
+    auto msgs = master.flush();
+    auto result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.size() == 1);
+
+    // Insert a deleted item — should NOT fire.
+    master_db.exec("INSERT INTO items VALUES (2, 'deleted', 20)");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    CHECK(result.subscriptions.empty());
+
+    // Insert an archived item — should NOT fire.
+    master_db.exec("INSERT INTO items VALUES (3, 'archived', 30)");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    CHECK(result.subscriptions.empty());
+
+    // Insert a pending item — SHOULD fire.
+    master_db.exec("INSERT INTO items VALUES (4, 'pending', 40)");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.size() == 2);  // active + pending
+}
+
+TEST_CASE("integration: three-valued NULL semantics in predicates") {
+    // Verify that NULL handling follows SQL three-valued logic.
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, val INTEGER)");
+    replica_db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, val INTEGER)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Subscribe to val = 1.
+    replica.subscribe("SELECT id FROM items WHERE val = 1");
+
+    // Trigger initial.
+    master_db.exec("INSERT INTO items VALUES (99, 99)");
+    auto init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+
+    // Insert a row with NULL val — should NOT fire.
+    // SQL: NULL = 1 → NULL → row not in result.
+    master_db.exec("INSERT INTO items VALUES (1, NULL)");
+    auto msgs = master.flush();
+    auto result = deliver(msgs, replica);
+    CHECK(result.subscriptions.empty());
+
+    // Insert a row with val = 1 — SHOULD fire.
+    master_db.exec("INSERT INTO items VALUES (2, 1)");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+}

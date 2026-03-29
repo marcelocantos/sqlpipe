@@ -1919,15 +1919,15 @@ using RAPtr = std::unique_ptr<RANode>;
 
 /// Comparison operator for predicate checks.
 enum class CheckOp : std::uint8_t {
-    Eq,        // column = value
-    Ne,        // column != value
-    Lt,        // column < value
-    Le,        // column <= value
-    Gt,        // column > value
-    Ge,        // column >= value
-    IsNull,    // column IS NULL
-    IsNotNull, // column IS NOT NULL
-    InList,    // column IN (v1, v2, ...)
+    Eq,         // column = value
+    Ne,         // column != value
+    Lt,         // column < value
+    Le,         // column <= value
+    Gt,         // column > value
+    Ge,         // column >= value
+    IsNull,     // column IS NULL
+    IsNotNull,  // column IS NOT NULL
+    InList,     // column IN (v1, v2, ...)
 };
 
 /// A resolved predicate: table.column <op> literal value(s).
@@ -1936,8 +1936,9 @@ struct ResolvedPredicate {
     std::string        column;
     int                column_index;  // position in table schema (-1 if unknown)
     CheckOp            op = CheckOp::Eq;
-    Value              value;   // for Eq/Ne/Lt/Le/Gt/Ge
-    std::vector<Value> values;  // for InList
+    Value              value;    // for Eq/Ne/Lt/Le/Gt/Ge
+    std::vector<Value> values;   // for InList
+    bool               negated = false;  // emit Not after the check
 };
 
 /// A resolved column reference: (table, column_index).
@@ -2287,6 +2288,67 @@ void extract_predicates(
         return;
     }
 
+    // OR → try to merge equalities on the same column into InList.
+    // e.g., x = 1 OR x = 2 OR x = 3 → InList(x, {1, 2, 3}).
+    // Nested ORs are flattened: OR(OR(a=1, a=2), a=3) → {1, 2, 3}.
+    if (expr->kind == LP_EXPR_BINARY_OP && expr->u.binary.op == LP_OP_OR) {
+        // Collect all equality leaves from the OR tree.
+        struct EqLeaf { std::string table; std::string col; int idx; Value val; };
+        std::vector<EqLeaf> leaves;
+        bool all_eq = true;
+
+        std::function<void(const LpNode*)> collect_or = [&](const LpNode* n) {
+            if (!n) { all_eq = false; return; }
+            if (n->kind == LP_EXPR_BINARY_OP && n->u.binary.op == LP_OP_OR) {
+                collect_or(n->u.binary.left);
+                collect_or(n->u.binary.right);
+                return;
+            }
+            // Must be column = literal.
+            if (n->kind == LP_EXPR_BINARY_OP &&
+                (n->u.binary.op == LP_OP_EQ || n->u.binary.op == LP_OP_IS)) {
+                const LpNode* lhs = n->u.binary.left;
+                const LpNode* rhs = n->u.binary.right;
+                if (is_literal(lhs) && is_column_ref(rhs)) std::swap(lhs, rhs);
+                if (is_column_ref(lhs) && is_literal(rhs) &&
+                    rhs->kind != LP_EXPR_LITERAL_NULL) {
+                    std::string table, col;
+                    int idx;
+                    if (resolve_column(lhs, schema, aliases, table, col, idx)) {
+                        leaves.push_back({table, col, idx,
+                                          lp_literal_to_value(rhs)});
+                        return;
+                    }
+                }
+            }
+            all_eq = false;
+        };
+        collect_or(expr);
+
+        if (all_eq && !leaves.empty()) {
+            // Check all leaves reference the same (table, column).
+            bool same_col = true;
+            for (size_t i = 1; i < leaves.size(); ++i) {
+                if (leaves[i].table != leaves[0].table ||
+                    leaves[i].col != leaves[0].col) {
+                    same_col = false;
+                    break;
+                }
+            }
+            if (same_col) {
+                std::vector<Value> vals;
+                vals.reserve(leaves.size());
+                for (auto& l : leaves) vals.push_back(std::move(l.val));
+                out.push_back({leaves[0].table, leaves[0].col, leaves[0].idx,
+                               CheckOp::InList, {}, std::move(vals)});
+                return;
+            }
+        }
+        // OR branches we can't merge → opaque.
+        has_opaque = true;
+        return;
+    }
+
     // Comparison operators: =, !=, <, <=, >, >=, IS, IS NOT.
     if (expr->kind == LP_EXPR_BINARY_OP) {
         auto check_op = binop_to_checkop(expr->u.binary.op);
@@ -2294,6 +2356,38 @@ void extract_predicates(
             const LpNode* lhs = expr->u.binary.left;
             const LpNode* rhs = expr->u.binary.right;
 
+            // IS NULL / IS NOT NULL: must check before general comparison
+            // because is_literal() matches LP_EXPR_LITERAL_NULL, and
+            // we need IsNull/IsNotNull opcodes (not Eq/Ne which return
+            // NULL under three-valued logic).
+            if (expr->u.binary.op == LP_OP_IS ||
+                expr->u.binary.op == LP_OP_ISNOT) {
+                // Normalize: column on left.
+                if (rhs && rhs->kind == LP_EXPR_LITERAL_NULL &&
+                    is_column_ref(lhs)) {
+                    std::string table, col;
+                    int idx;
+                    if (resolve_column(lhs, schema, aliases, table, col, idx)) {
+                        auto op = (expr->u.binary.op == LP_OP_IS)
+                            ? CheckOp::IsNull : CheckOp::IsNotNull;
+                        out.push_back({table, col, idx, op, {}, {}});
+                        return;
+                    }
+                }
+                if (lhs && lhs->kind == LP_EXPR_LITERAL_NULL &&
+                    is_column_ref(rhs)) {
+                    std::string table, col;
+                    int idx;
+                    if (resolve_column(rhs, schema, aliases, table, col, idx)) {
+                        auto op = (expr->u.binary.op == LP_OP_IS)
+                            ? CheckOp::IsNull : CheckOp::IsNotNull;
+                        out.push_back({table, col, idx, op, {}, {}});
+                        return;
+                    }
+                }
+            }
+
+            // General comparison: column <op> literal.
             // Normalize: column on left, literal on right.
             bool flipped = false;
             if (is_literal(lhs) && is_column_ref(rhs)) {
@@ -2301,7 +2395,9 @@ void extract_predicates(
                 flipped = true;
             }
 
-            if (is_column_ref(lhs) && is_literal(rhs)) {
+            if (is_column_ref(lhs) && is_literal(rhs) &&
+                rhs->kind != LP_EXPR_LITERAL_NULL) {
+                // Skip NULL literals here — they're handled above as IS/IS NOT.
                 std::string table, col;
                 int idx;
                 if (resolve_column(lhs, schema, aliases, table, col, idx)) {
@@ -2311,24 +2407,11 @@ void extract_predicates(
                     return;
                 }
             }
-
-            // IS NULL / IS NOT NULL via `column IS NULL` (LP_OP_IS with NULL literal).
-            if ((*check_op == CheckOp::Eq || *check_op == CheckOp::Ne) &&
-                is_column_ref(lhs) && rhs && rhs->kind == LP_EXPR_LITERAL_NULL) {
-                std::string table, col;
-                int idx;
-                if (resolve_column(lhs, schema, aliases, table, col, idx)) {
-                    auto op = (*check_op == CheckOp::Eq)
-                        ? CheckOp::IsNull : CheckOp::IsNotNull;
-                    out.push_back({table, col, idx, op, {}, {}});
-                    return;
-                }
-            }
         }
     }
 
-    // IN list: column IN (val1, val2, ...).
-    if (expr->kind == LP_EXPR_IN && !expr->u.in.is_not) {
+    // IN / NOT IN list: column [NOT] IN (val1, val2, ...).
+    if (expr->kind == LP_EXPR_IN) {
         const LpNode* col_expr = expr->u.in.expr;
         // Only handle literal value lists (not subqueries).
         if (is_column_ref(col_expr) && !expr->u.in.select &&
@@ -2350,7 +2433,7 @@ void extract_predicates(
                 }
                 if (all_literal) {
                     out.push_back({table, col, idx, CheckOp::InList,
-                                   {}, std::move(vals)});
+                                   {}, std::move(vals), expr->u.in.is_not != 0});
                     return;
                 }
             }
@@ -2358,6 +2441,7 @@ void extract_predicates(
     }
 
     // BETWEEN: column BETWEEN low AND high → column >= low AND column <= high.
+    // NOT BETWEEN: treated as opaque (requires OR composition in the program).
     if (expr->kind == LP_EXPR_BETWEEN && !expr->u.between.is_not) {
         const LpNode* col_expr = expr->u.between.expr;
         if (is_column_ref(col_expr) &&
@@ -3135,7 +3219,8 @@ void collect_equijoins(const RANode* node,
 /// Check if two predicates are structurally identical.
 bool predicates_match(const ResolvedPredicate& a, const ResolvedPredicate& b) {
     return a.table == b.table && a.column == b.column &&
-           a.op == b.op && a.value == b.value && a.values == b.values;
+           a.op == b.op && a.value == b.value && a.values == b.values &&
+           a.negated == b.negated;
 }
 
 void propagate_predicates(
@@ -3346,6 +3431,10 @@ void emit_predicate(Program& p, const ResolvedPredicate& pred) {
             emit_op(p, VMOp::InList);
             emit_u8(p, static_cast<uint8_t>(pred.values.size()));
             break;
+    }
+    // Apply negation if set (e.g., NOT IN).
+    if (pred.negated) {
+        emit_op(p, VMOp::Not);
     }
 }
 
@@ -3621,6 +3710,13 @@ bool vm_run(const Program& prog, VMContext& ctx) {
             case VMOp::Gt: case VMOp::Ge: {
                 auto b = stack.back(); stack.pop_back();
                 auto a = stack.back(); stack.pop_back();
+                // SQL: any comparison with NULL yields NULL.
+                bool a_null = std::holds_alternative<std::monostate>(a);
+                bool b_null = std::holds_alternative<std::monostate>(b);
+                if (a_null || b_null) {
+                    stack.push_back(std::monostate{});
+                    break;
+                }
                 int cmp = compare_values(a, b);
                 bool result;
                 switch (op) {
@@ -3650,33 +3746,83 @@ bool vm_run(const Program& prog, VMContext& ctx) {
             case VMOp::InList: {
                 uint8_t count = prog[pc++];
                 // Stack: [... value, list_item_0, ..., list_item_(count-1)]
-                // The list items are on top, value is below them.
-                bool found = false;
                 std::vector<Value> items(
                     stack.end() - count, stack.end());
                 stack.resize(stack.size() - count);
                 auto val = stack.back(); stack.pop_back();
-                for (const auto& item : items) {
-                    if (val == item) { found = true; break; }
+                // SQL IN: NULL value → NULL. NULL in list → NULL if no match.
+                if (std::holds_alternative<std::monostate>(val)) {
+                    stack.push_back(std::monostate{});
+                } else {
+                    bool found = false;
+                    bool has_null_item = false;
+                    for (const auto& item : items) {
+                        if (std::holds_alternative<std::monostate>(item)) {
+                            has_null_item = true;
+                        } else if (val == item) {
+                            found = true; break;
+                        }
+                    }
+                    if (found) {
+                        stack.push_back(std::int64_t{1});
+                    } else if (has_null_item) {
+                        stack.push_back(std::monostate{});
+                    } else {
+                        stack.push_back(std::int64_t{0});
+                    }
                 }
-                stack.push_back(found ? std::int64_t{1} : std::int64_t{0});
                 break;
             }
             case VMOp::And: {
-                auto b = std::get<std::int64_t>(stack.back()); stack.pop_back();
-                auto a = std::get<std::int64_t>(stack.back()); stack.pop_back();
-                stack.push_back(std::int64_t{(a && b) ? 1 : 0});
+                // SQL three-valued AND:
+                // false AND _ = false, _ AND false = false
+                // true AND true = true
+                // NULL AND true = NULL, true AND NULL = NULL
+                // NULL AND NULL = NULL
+                auto bv = stack.back(); stack.pop_back();
+                auto av = stack.back(); stack.pop_back();
+                bool a_null = std::holds_alternative<std::monostate>(av);
+                bool b_null = std::holds_alternative<std::monostate>(bv);
+                if (!a_null && std::get<std::int64_t>(av) == 0) {
+                    stack.push_back(std::int64_t{0});  // false AND _ = false
+                } else if (!b_null && std::get<std::int64_t>(bv) == 0) {
+                    stack.push_back(std::int64_t{0});  // _ AND false = false
+                } else if (a_null || b_null) {
+                    stack.push_back(std::monostate{});  // NULL involved = NULL
+                } else {
+                    stack.push_back(std::int64_t{1});   // true AND true = true
+                }
                 break;
             }
             case VMOp::Or: {
-                auto b = std::get<std::int64_t>(stack.back()); stack.pop_back();
-                auto a = std::get<std::int64_t>(stack.back()); stack.pop_back();
-                stack.push_back(std::int64_t{(a || b) ? 1 : 0});
+                // SQL three-valued OR:
+                // true OR _ = true, _ OR true = true
+                // false OR false = false
+                // NULL OR false = NULL, false OR NULL = NULL
+                // NULL OR NULL = NULL
+                auto bv = stack.back(); stack.pop_back();
+                auto av = stack.back(); stack.pop_back();
+                bool a_null = std::holds_alternative<std::monostate>(av);
+                bool b_null = std::holds_alternative<std::monostate>(bv);
+                if (!a_null && std::get<std::int64_t>(av) != 0) {
+                    stack.push_back(std::int64_t{1});  // true OR _ = true
+                } else if (!b_null && std::get<std::int64_t>(bv) != 0) {
+                    stack.push_back(std::int64_t{1});  // _ OR true = true
+                } else if (a_null || b_null) {
+                    stack.push_back(std::monostate{});  // NULL involved = NULL
+                } else {
+                    stack.push_back(std::int64_t{0});   // false OR false = false
+                }
                 break;
             }
             case VMOp::Not: {
-                auto a = std::get<std::int64_t>(stack.back()); stack.pop_back();
-                stack.push_back(std::int64_t{a ? 0 : 1});
+                auto v = stack.back(); stack.pop_back();
+                if (std::holds_alternative<std::monostate>(v)) {
+                    stack.push_back(std::monostate{});  // NOT NULL = NULL
+                } else {
+                    auto a = std::get<std::int64_t>(v);
+                    stack.push_back(std::int64_t{a ? 0 : 1});
+                }
                 break;
             }
             case VMOp::True:
