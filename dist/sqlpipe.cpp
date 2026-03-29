@@ -1940,6 +1940,22 @@ struct ResolvedPredicate {
     std::vector<Value> values;  // for InList
 };
 
+/// A resolved column reference: (table, column_index).
+struct ColumnRef {
+    std::string table;
+    int         column_index;
+    bool operator<(const ColumnRef& o) const {
+        if (table != o.table) return table < o.table;
+        return column_index < o.column_index;
+    }
+    bool operator==(const ColumnRef& o) const {
+        return table == o.table && column_index == o.column_index;
+    }
+};
+
+/// Set of column references read by an RA subtree.
+using ColumnRefSet = std::set<ColumnRef>;
+
 struct RAScan : RANode {
     std::string table;
     RAScan(std::string t) : table(std::move(t)) { kind = Scan; }
@@ -1956,6 +1972,9 @@ struct RAFilter : RANode {
     /// When true, we can still use extracted predicates but must
     /// conservatively assume non-analyzed terms could match anything.
     bool has_opaque_terms = false;
+    /// All column references in the filter expression (including
+    /// columns in predicates and opaque terms).
+    ColumnRefSet columns_read;
 
     RAFilter(RAPtr c) : child(std::move(c)) { kind = Filter; }
     void collect_tables(std::set<std::string>& out) const override {
@@ -1965,6 +1984,9 @@ struct RAFilter : RANode {
 
 struct RAProject : RANode {
     RAPtr child;
+    /// Column references in the SELECT list.
+    ColumnRefSet columns_read;
+
     RAProject(RAPtr c) : child(std::move(c)) { kind = Project; }
     void collect_tables(std::set<std::string>& out) const override {
         child->collect_tables(out);
@@ -1986,6 +2008,8 @@ struct RAJoin : RANode {
     RAPtr left, right;
     /// Equijoin conditions extracted from the ON clause.
     std::vector<JoinEquality> equalities;
+    /// All column references in ON expressions.
+    ColumnRefSet columns_read;
 
     RAJoin(RAPtr l, RAPtr r) : left(std::move(l)), right(std::move(r)) {
         kind = Join;
@@ -1998,6 +2022,9 @@ struct RAJoin : RANode {
 
 struct RAAggregate : RANode {
     RAPtr child;
+    /// Column references in GROUP BY / aggregate expressions.
+    ColumnRefSet columns_read;
+
     RAAggregate(RAPtr c) : child(std::move(c)) { kind = Aggregate; }
     void collect_tables(std::set<std::string>& out) const override {
         child->collect_tables(out);
@@ -2105,6 +2132,100 @@ bool is_column_ref(const LpNode* node) {
 
 /// Extract equality predicates from a WHERE expression.
 /// Walks AND-connected terms looking for `column = literal` patterns.
+/// Walk an AST expression and collect all column references.
+void collect_expr_columns(const LpNode* expr, const SchemaMap& schema,
+                          const AliasMap& aliases, ColumnRefSet& out) {
+    if (!expr) return;
+    switch (expr->kind) {
+        case LP_EXPR_COLUMN_REF: {
+            std::string table, col;
+            col = expr->u.column_ref.column;
+            if (expr->u.column_ref.table) {
+                table = resolve_table(aliases,
+                    std::string(expr->u.column_ref.table));
+            } else {
+                table = resolve_unqualified_column(schema, aliases, col);
+            }
+            if (!table.empty()) {
+                int idx = column_index(schema, table, col);
+                if (idx >= 0) out.insert({table, idx});
+            }
+            break;
+        }
+        case LP_EXPR_STAR: {
+            // SELECT * or table.* — all columns of the referenced table(s).
+            if (expr->u.star.table) {
+                std::string table = resolve_table(aliases,
+                    std::string(expr->u.star.table));
+                auto it = schema.find(table);
+                if (it != schema.end()) {
+                    for (const auto& ci : it->second) {
+                        out.insert({table, ci.index});
+                    }
+                }
+            } else {
+                // Bare * — all columns of all tables in scope.
+                for (const auto& [alias, table] : aliases) {
+                    auto it = schema.find(table);
+                    if (it != schema.end()) {
+                        for (const auto& ci : it->second) {
+                            out.insert({table, ci.index});
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case LP_EXPR_BINARY_OP:
+            collect_expr_columns(expr->u.binary.left, schema, aliases, out);
+            collect_expr_columns(expr->u.binary.right, schema, aliases, out);
+            break;
+        case LP_EXPR_UNARY_OP:
+            collect_expr_columns(expr->u.unary.operand, schema, aliases, out);
+            break;
+        case LP_EXPR_FUNCTION:
+            for (int i = 0; i < expr->u.function.args.count; ++i) {
+                collect_expr_columns(
+                    expr->u.function.args.items[i], schema, aliases, out);
+            }
+            break;
+        case LP_EXPR_CAST:
+            collect_expr_columns(expr->u.cast.expr, schema, aliases, out);
+            break;
+        case LP_EXPR_BETWEEN:
+            collect_expr_columns(expr->u.between.expr, schema, aliases, out);
+            collect_expr_columns(expr->u.between.low, schema, aliases, out);
+            collect_expr_columns(expr->u.between.high, schema, aliases, out);
+            break;
+        case LP_EXPR_IN:
+            collect_expr_columns(expr->u.in.expr, schema, aliases, out);
+            for (int i = 0; i < expr->u.in.values.count; ++i) {
+                collect_expr_columns(
+                    expr->u.in.values.items[i], schema, aliases, out);
+            }
+            break;
+        case LP_EXPR_CASE:
+            collect_expr_columns(expr->u.case_.operand, schema, aliases, out);
+            for (int i = 0; i < expr->u.case_.when_exprs.count; ++i) {
+                collect_expr_columns(
+                    expr->u.case_.when_exprs.items[i], schema, aliases, out);
+            }
+            collect_expr_columns(expr->u.case_.else_expr, schema, aliases, out);
+            break;
+        case LP_EXPR_COLLATE:
+            collect_expr_columns(expr->u.collate.expr, schema, aliases, out);
+            break;
+        case LP_EXPR_SUBQUERY:
+            // Subquery — conservatively don't descend. The subquery's
+            // dependencies are handled when/if we analyze it separately.
+            break;
+        case LP_EXPR_EXISTS:
+            break;
+        default:
+            break;
+    }
+}
+
 /// Resolve a column reference to (table, column, column_index).
 /// Returns false if resolution fails.
 bool resolve_column(const LpNode* col_node, const SchemaMap& schema,
@@ -2425,11 +2546,14 @@ RAPtr build_from(const LpNode* from, const SchemaMap& schema,
             auto join = std::make_unique<RAJoin>(
                 std::move(left), std::move(right));
 
-            // Extract equijoin conditions from ON clause.
+            // Extract equijoin conditions and column refs from ON clause.
             if (from->u.join.on_expr) {
                 extract_join_equalities(
                     from->u.join.on_expr, schema, aliases,
                     join->equalities);
+                collect_expr_columns(
+                    from->u.join.on_expr, schema, aliases,
+                    join->columns_read);
             }
 
             // USING clause → explicit equijoins.
@@ -2762,6 +2886,9 @@ RAPtr select_to_ra(const LpNode* select, const SchemaMap& schema,
         extract_predicates(
             select->u.select.where, schema, aliases,
             filter->predicates, filter->has_opaque_terms);
+        // Collect all column references in WHERE (including opaque terms).
+        collect_expr_columns(
+            select->u.select.where, schema, aliases, filter->columns_read);
 
         // Extract implicit equijoin conditions (column=column across tables)
         // from WHERE and add to the nearest Join node.
@@ -2775,20 +2902,49 @@ RAPtr select_to_ra(const LpNode* select, const SchemaMap& schema,
         ra = std::move(filter);
     }
 
-    // GROUP BY → Aggregate.
+    // GROUP BY → Aggregate with column tracking.
     if (select->u.select.group_by.count > 0) {
-        ra = std::make_unique<RAAggregate>(std::move(ra));
+        auto agg = std::make_unique<RAAggregate>(std::move(ra));
+        for (int i = 0; i < select->u.select.group_by.count; ++i) {
+            collect_expr_columns(
+                select->u.select.group_by.items[i], schema, aliases,
+                agg->columns_read);
+        }
+        ra = std::move(agg);
     }
 
     // HAVING → another Filter (on aggregated results).
     if (select->u.select.having) {
         auto filter = std::make_unique<RAFilter>(std::move(ra));
         filter->has_opaque_terms = true;  // HAVING predicates are post-aggregate
+        collect_expr_columns(
+            select->u.select.having, schema, aliases, filter->columns_read);
         ra = std::move(filter);
     }
 
-    // SELECT list → Project.
-    ra = std::make_unique<RAProject>(std::move(ra));
+    // SELECT list → Project with column tracking.
+    {
+        auto proj = std::make_unique<RAProject>(std::move(ra));
+        for (int i = 0; i < select->u.select.result_columns.count; ++i) {
+            auto* rc = select->u.select.result_columns.items[i];
+            if (rc && rc->kind == LP_RESULT_COLUMN) {
+                collect_expr_columns(
+                    rc->u.result_column.expr, schema, aliases,
+                    proj->columns_read);
+            }
+        }
+        // ORDER BY columns are also relevant — changing an ORDER BY column
+        // can reorder results, which changes the query output.
+        for (int i = 0; i < select->u.select.order_by.count; ++i) {
+            auto* ot = select->u.select.order_by.items[i];
+            if (ot && ot->kind == LP_ORDER_TERM) {
+                collect_expr_columns(
+                    ot->u.order_term.expr, schema, aliases,
+                    proj->columns_read);
+            }
+        }
+        ra = std::move(proj);
+    }
 
     return ra;
 }
@@ -2839,6 +2995,68 @@ RAPtr sql_to_ra(const std::string& sql, const SchemaMap& schema) {
 }
 
 /// Collect all equality predicates from an RA tree (from all Filter nodes).
+/// Collect all column references from the RA tree.
+void collect_all_columns(const RANode* node, ColumnRefSet& out) {
+    if (!node) return;
+    switch (node->kind) {
+        case RANode::Scan:
+            break;  // Scan itself doesn't read columns; parent nodes do.
+        case RANode::Filter: {
+            auto* f = static_cast<const RAFilter*>(node);
+            out.insert(f->columns_read.begin(), f->columns_read.end());
+            // Also include predicate columns.
+            for (const auto& pred : f->predicates) {
+                if (pred.column_index >= 0)
+                    out.insert({pred.table, pred.column_index});
+            }
+            collect_all_columns(f->child.get(), out);
+            break;
+        }
+        case RANode::Project: {
+            auto* p = static_cast<const RAProject*>(node);
+            out.insert(p->columns_read.begin(), p->columns_read.end());
+            collect_all_columns(p->child.get(), out);
+            break;
+        }
+        case RANode::Join: {
+            auto* j = static_cast<const RAJoin*>(node);
+            out.insert(j->columns_read.begin(), j->columns_read.end());
+            for (const auto& eq : j->equalities) {
+                if (eq.left_index >= 0) out.insert({eq.left_table, eq.left_index});
+                if (eq.right_index >= 0) out.insert({eq.right_table, eq.right_index});
+            }
+            collect_all_columns(j->left.get(), out);
+            collect_all_columns(j->right.get(), out);
+            break;
+        }
+        case RANode::Aggregate: {
+            auto* a = static_cast<const RAAggregate*>(node);
+            out.insert(a->columns_read.begin(), a->columns_read.end());
+            collect_all_columns(a->child.get(), out);
+            break;
+        }
+        case RANode::SetOp: {
+            auto* s = static_cast<const RASetOp*>(node);
+            collect_all_columns(s->left.get(), out);
+            collect_all_columns(s->right.get(), out);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+/// Get the set of column indices referenced by a query for a specific table.
+std::set<int> columns_for_table(const RANode* ra, const std::string& table) {
+    ColumnRefSet all;
+    collect_all_columns(ra, all);
+    std::set<int> result;
+    for (const auto& cr : all) {
+        if (cr.table == table) result.insert(cr.column_index);
+    }
+    return result;
+}
+
 void collect_predicates(const RANode* node,
                         std::vector<ResolvedPredicate>& out) {
     if (!node) return;
@@ -3414,10 +3632,12 @@ done:
 
 // ── Predicate index using VM programs ───────────────────────────
 
-/// Per-(subscription, table) compiled program.
+/// Per-(subscription, table) compiled program + relevant column set.
 struct SubProgram {
     SubscriptionId sub_id;
-    Program        program;  // empty = no predicates for this table → always affected
+    Program        program;       // empty = no predicates for this table → always affected
+    std::set<int>  columns_used;  // columns the query reads from this table
+                                  // empty = unknown → conservative (all columns relevant)
 };
 
 /// The predicate index: maps table → list of compiled programs.
@@ -3465,9 +3685,32 @@ std::set<SubscriptionId> evaluate_changeset(
             continue;
         }
 
+        // For UPDATE, determine which columns changed.
+        std::set<int> changed_cols;
+        if (cs_op == SQLITE_UPDATE) {
+            for (int col = 0; col < ncol; ++col) {
+                sqlite3_value* val = nullptr;
+                sqlite3changeset_new(iter, col, &val);
+                if (val) changed_cols.insert(col);
+            }
+        }
+
         // Run each subscription's program.
         for (const auto& sp : idx_it->second) {
             if (affected.count(sp.sub_id)) continue;
+
+            // For UPDATE: if the subscription's relevant columns don't
+            // overlap with the changed columns, the result can't change.
+            if (cs_op == SQLITE_UPDATE && !sp.columns_used.empty()) {
+                bool any_overlap = false;
+                for (int col : changed_cols) {
+                    if (sp.columns_used.count(col)) {
+                        any_overlap = true;
+                        break;
+                    }
+                }
+                if (!any_overlap) continue;  // no relevant column changed
+            }
 
             if (sp.program.empty()) {
                 // No predicates for this table → always affected.
@@ -3552,7 +3795,12 @@ struct QueryWatch::Impl {
             for (const auto& table : sub.tables) {
                 auto program = detail::compile_predicates(
                     sub.predicates, table);
-                prog_index[table].push_back({id, std::move(program)});
+                std::set<int> cols;
+                if (sub.ra) {
+                    cols = detail::columns_for_table(sub.ra.get(), table);
+                }
+                prog_index[table].push_back(
+                    {id, std::move(program), std::move(cols)});
             }
         }
     }
