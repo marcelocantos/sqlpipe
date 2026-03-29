@@ -2185,6 +2185,91 @@ void extract_join_equalities(
     }
 }
 
+/// Build equijoins from USING clause columns.
+void extract_using_equalities(
+        const LpNodeList& using_cols,
+        const LpNode* left_from,
+        const LpNode* right_from,
+        const SchemaMap& schema,
+        const AliasMap& aliases,
+        std::vector<JoinEquality>& out) {
+    // Resolve table names from the immediate FROM items.
+    auto resolve_from = [&](const LpNode* from) -> std::string {
+        if (from && from->kind == LP_FROM_TABLE) {
+            std::string name = from->u.from_table.name;
+            if (from->u.from_table.alias) {
+                return resolve_table(aliases,
+                    std::string(from->u.from_table.alias));
+            }
+            return name;
+        }
+        return {};
+    };
+
+    // For USING, we need the table names from both sides.
+    // For nested joins, the "table" is the result of the join —
+    // we'd need to search deeper. For now, handle the simple case.
+    std::string lt = resolve_from(left_from);
+    std::string rt = resolve_from(right_from);
+    if (lt.empty() || rt.empty()) return;
+
+    for (int i = 0; i < using_cols.count; ++i) {
+        const LpNode* col_node = using_cols.items[i];
+        if (!col_node) continue;
+        // USING columns are column references or identifiers.
+        std::string col;
+        if (col_node->kind == LP_EXPR_COLUMN_REF) {
+            col = col_node->u.column_ref.column;
+        } else if (col_node->kind == LP_EXPR_LITERAL_STRING) {
+            col = col_node->u.literal.value;
+        }
+        if (col.empty()) continue;
+
+        int li = column_index(schema, lt, col);
+        int ri = column_index(schema, rt, col);
+        if (li >= 0 && ri >= 0) {
+            out.push_back({lt, col, li, rt, col, ri});
+        }
+    }
+}
+
+/// Build equijoins from NATURAL join by finding matching column names.
+void extract_natural_equalities(
+        const LpNode* left_from,
+        const LpNode* right_from,
+        const SchemaMap& schema,
+        const AliasMap& aliases,
+        std::vector<JoinEquality>& out) {
+    auto resolve_from = [&](const LpNode* from) -> std::string {
+        if (from && from->kind == LP_FROM_TABLE) {
+            if (from->u.from_table.alias) {
+                return resolve_table(aliases,
+                    std::string(from->u.from_table.alias));
+            }
+            return std::string(from->u.from_table.name);
+        }
+        return {};
+    };
+
+    std::string lt = resolve_from(left_from);
+    std::string rt = resolve_from(right_from);
+    if (lt.empty() || rt.empty()) return;
+
+    auto lit = schema.find(lt);
+    auto rit = schema.find(rt);
+    if (lit == schema.end() || rit == schema.end()) return;
+
+    // Find columns present in both tables.
+    for (const auto& lci : lit->second) {
+        for (const auto& rci : rit->second) {
+            if (lci.name == rci.name) {
+                out.push_back({lt, lci.name, lci.index,
+                               rt, rci.name, rci.index});
+            }
+        }
+    }
+}
+
 /// Build the RA tree for a FROM clause (table refs and joins).
 RAPtr build_from(const LpNode* from, const SchemaMap& schema,
                  AliasMap& aliases) {
@@ -2213,12 +2298,29 @@ RAPtr build_from(const LpNode* from, const SchemaMap& schema,
         if (left && right) {
             auto join = std::make_unique<RAJoin>(
                 std::move(left), std::move(right));
+
             // Extract equijoin conditions from ON clause.
             if (from->u.join.on_expr) {
                 extract_join_equalities(
                     from->u.join.on_expr, schema, aliases,
                     join->equalities);
             }
+
+            // USING clause → explicit equijoins.
+            if (from->u.join.using_columns.count > 0) {
+                extract_using_equalities(
+                    from->u.join.using_columns,
+                    from->u.join.left, from->u.join.right,
+                    schema, aliases, join->equalities);
+            }
+
+            // NATURAL join → equijoins on all matching column names.
+            if (from->u.join.join_type & LP_JOIN_NATURAL) {
+                extract_natural_equalities(
+                    from->u.join.left, from->u.join.right,
+                    schema, aliases, join->equalities);
+            }
+
             return join;
         }
         return left ? std::move(left) : std::move(right);
@@ -2226,6 +2328,295 @@ RAPtr build_from(const LpNode* from, const SchemaMap& schema,
 
     return nullptr;
 }
+
+/// Extract implicit equijoin conditions from a WHERE expression.
+/// Finds column=column predicates where the two columns belong to
+/// different tables (comma-join style). These are added to the
+/// nearest enclosing Join node.
+void extract_implicit_equijoins(
+        const LpNode* expr,
+        const SchemaMap& schema,
+        const AliasMap& aliases,
+        std::vector<JoinEquality>& equijoins) {
+    if (!expr) return;
+
+    if (expr->kind == LP_EXPR_BINARY_OP && expr->u.binary.op == LP_OP_AND) {
+        extract_implicit_equijoins(
+            expr->u.binary.left, schema, aliases, equijoins);
+        extract_implicit_equijoins(
+            expr->u.binary.right, schema, aliases, equijoins);
+        return;
+    }
+
+    if (expr->kind == LP_EXPR_BINARY_OP && expr->u.binary.op == LP_OP_EQ) {
+        const LpNode* lhs = expr->u.binary.left;
+        const LpNode* rhs = expr->u.binary.right;
+        if (is_column_ref(lhs) && is_column_ref(rhs)) {
+            std::string lt, lc, rt, rc;
+            lc = lhs->u.column_ref.column;
+            rc = rhs->u.column_ref.column;
+
+            if (lhs->u.column_ref.table) {
+                lt = resolve_table(aliases,
+                    std::string(lhs->u.column_ref.table));
+            } else {
+                lt = resolve_unqualified_column(schema, aliases, lc);
+            }
+            if (rhs->u.column_ref.table) {
+                rt = resolve_table(aliases,
+                    std::string(rhs->u.column_ref.table));
+            } else {
+                rt = resolve_unqualified_column(schema, aliases, rc);
+            }
+
+            // Only capture cross-table equalities (implicit joins).
+            if (!lt.empty() && !rt.empty() && lt != rt) {
+                int li = column_index(schema, lt, lc);
+                int ri = column_index(schema, rt, rc);
+                equijoins.push_back({lt, lc, li, rt, rc, ri});
+            }
+        }
+    }
+}
+
+// ── RA optimization passes ─────────────────────────────────────
+
+/// Collect the set of tables reachable from an RA subtree.
+std::set<std::string> tables_of(const RANode* node) {
+    std::set<std::string> t;
+    if (node) node->collect_tables(t);
+    return t;
+}
+
+/// Check if a predicate's table is reachable from an RA subtree.
+bool predicate_applies_to(const ResolvedPredicate& pred, const RANode* node) {
+    auto t = tables_of(node);
+    return t.count(pred.table) > 0;
+}
+
+/// Push Filter predicates down through the RA tree toward Scan nodes.
+/// Returns the optimized tree. Modifies the tree in place where possible.
+RAPtr push_filters_down(RAPtr node) {
+    if (!node) return nullptr;
+
+    switch (node->kind) {
+        case RANode::Filter: {
+            auto* f = static_cast<RAFilter*>(node.get());
+            // First, recursively optimize the child.
+            f->child = push_filters_down(std::move(f->child));
+
+            // If child is a Join, try to push predicates into the
+            // join's left or right subtree.
+            if (f->child && f->child->kind == RANode::Join) {
+                auto* j = static_cast<RAJoin*>(f->child.get());
+                std::vector<ResolvedPredicate> remaining;
+
+                for (auto& pred : f->predicates) {
+                    bool pushed = false;
+                    // Can push to left if predicate's table is in left subtree.
+                    if (predicate_applies_to(pred, j->left.get()) &&
+                        !predicate_applies_to(pred, j->right.get())) {
+                        // Wrap left in a Filter with this predicate.
+                        auto lf = std::make_unique<RAFilter>(std::move(j->left));
+                        lf->predicates.push_back(std::move(pred));
+                        j->left = push_filters_down(std::move(lf));
+                        pushed = true;
+                    }
+                    // Can push to right if predicate's table is in right subtree.
+                    else if (predicate_applies_to(pred, j->right.get()) &&
+                             !predicate_applies_to(pred, j->left.get())) {
+                        auto rf = std::make_unique<RAFilter>(std::move(j->right));
+                        rf->predicates.push_back(std::move(pred));
+                        j->right = push_filters_down(std::move(rf));
+                        pushed = true;
+                    }
+
+                    if (!pushed) {
+                        remaining.push_back(std::move(pred));
+                    }
+                }
+
+                f->predicates = std::move(remaining);
+
+                // If all predicates were pushed down, elide the empty Filter.
+                if (f->predicates.empty() && !f->has_opaque_terms) {
+                    return std::move(f->child);
+                }
+            }
+
+            // If child is a Project, push through it (project doesn't filter).
+            if (f->child && f->child->kind == RANode::Project) {
+                auto* p = static_cast<RAProject*>(f->child.get());
+                // Move filter below project: Filter(Project(x)) → Project(Filter(x))
+                auto inner = std::move(p->child);
+                auto new_filter = std::make_unique<RAFilter>(std::move(inner));
+                new_filter->predicates = std::move(f->predicates);
+                new_filter->has_opaque_terms = f->has_opaque_terms;
+                p->child = push_filters_down(std::move(new_filter));
+                return std::move(f->child);
+            }
+
+            return std::move(node);
+        }
+
+        case RANode::Join: {
+            auto* j = static_cast<RAJoin*>(node.get());
+            j->left = push_filters_down(std::move(j->left));
+            j->right = push_filters_down(std::move(j->right));
+            return std::move(node);
+        }
+
+        case RANode::Project: {
+            auto* p = static_cast<RAProject*>(node.get());
+            p->child = push_filters_down(std::move(p->child));
+            return std::move(node);
+        }
+
+        case RANode::Aggregate: {
+            auto* a = static_cast<RAAggregate*>(node.get());
+            a->child = push_filters_down(std::move(a->child));
+            return std::move(node);
+        }
+
+        case RANode::SetOp: {
+            auto* s = static_cast<RASetOp*>(node.get());
+            s->left = push_filters_down(std::move(s->left));
+            s->right = push_filters_down(std::move(s->right));
+            return std::move(node);
+        }
+
+        default:
+            return std::move(node);
+    }
+}
+
+/// Create per-predicate Filter nodes from a Filter with multiple predicates.
+/// Filter({a.x=1, b.y=2}, child) → Filter(a.x=1, Filter(b.y=2, child))
+RAPtr split_filters(RAPtr node) {
+    if (!node) return nullptr;
+
+    switch (node->kind) {
+        case RANode::Filter: {
+            auto* f = static_cast<RAFilter*>(node.get());
+            f->child = split_filters(std::move(f->child));
+
+            if (f->predicates.size() <= 1) return std::move(node);
+
+            // Build a chain: innermost first.
+            RAPtr result = std::move(f->child);
+            for (auto& pred : f->predicates) {
+                auto new_f = std::make_unique<RAFilter>(std::move(result));
+                new_f->predicates.push_back(std::move(pred));
+                result = std::move(new_f);
+            }
+            // If the original had opaque terms, add an opaque filter at top.
+            if (f->has_opaque_terms) {
+                auto opaque = std::make_unique<RAFilter>(std::move(result));
+                opaque->has_opaque_terms = true;
+                result = std::move(opaque);
+            }
+            return result;
+        }
+
+        case RANode::Join: {
+            auto* j = static_cast<RAJoin*>(node.get());
+            j->left = split_filters(std::move(j->left));
+            j->right = split_filters(std::move(j->right));
+            return std::move(node);
+        }
+
+        case RANode::Project: {
+            auto* p = static_cast<RAProject*>(node.get());
+            p->child = split_filters(std::move(p->child));
+            return std::move(node);
+        }
+
+        case RANode::Aggregate: {
+            auto* a = static_cast<RAAggregate*>(node.get());
+            a->child = split_filters(std::move(a->child));
+            return std::move(node);
+        }
+
+        case RANode::SetOp: {
+            auto* s = static_cast<RASetOp*>(node.get());
+            s->left = split_filters(std::move(s->left));
+            s->right = split_filters(std::move(s->right));
+            return std::move(node);
+        }
+
+        default:
+            return std::move(node);
+    }
+}
+
+/// Add propagated predicates as new Filter nodes above relevant Scans.
+/// For each (table, predicate) derived from equijoin propagation,
+/// wraps the matching Scan in a Filter if one doesn't already exist.
+RAPtr inject_propagated_predicates(
+        RAPtr node,
+        const std::vector<ResolvedPredicate>& propagated) {
+    if (!node || propagated.empty()) return std::move(node);
+
+    switch (node->kind) {
+        case RANode::Scan: {
+            auto* s = static_cast<RAScan*>(node.get());
+            // Collect predicates for this table.
+            std::vector<ResolvedPredicate> mine;
+            for (const auto& p : propagated) {
+                if (p.table == s->table) mine.push_back(p);
+            }
+            if (mine.empty()) return std::move(node);
+            auto f = std::make_unique<RAFilter>(std::move(node));
+            f->predicates = std::move(mine);
+            return f;
+        }
+
+        case RANode::Filter: {
+            auto* f = static_cast<RAFilter*>(node.get());
+            f->child = inject_propagated_predicates(
+                std::move(f->child), propagated);
+            return std::move(node);
+        }
+
+        case RANode::Join: {
+            auto* j = static_cast<RAJoin*>(node.get());
+            j->left = inject_propagated_predicates(
+                std::move(j->left), propagated);
+            j->right = inject_propagated_predicates(
+                std::move(j->right), propagated);
+            return std::move(node);
+        }
+
+        case RANode::Project: {
+            auto* p = static_cast<RAProject*>(node.get());
+            p->child = inject_propagated_predicates(
+                std::move(p->child), propagated);
+            return std::move(node);
+        }
+
+        case RANode::Aggregate: {
+            auto* a = static_cast<RAAggregate*>(node.get());
+            a->child = inject_propagated_predicates(
+                std::move(a->child), propagated);
+            return std::move(node);
+        }
+
+        case RANode::SetOp: {
+            auto* s = static_cast<RASetOp*>(node.get());
+            s->left = inject_propagated_predicates(
+                std::move(s->left), propagated);
+            s->right = inject_propagated_predicates(
+                std::move(s->right), propagated);
+            return std::move(node);
+        }
+
+        default:
+            return std::move(node);
+    }
+}
+
+// optimize_ra defined below, after collect/propagate functions.
+RAPtr optimize_ra(RAPtr ra);
 
 /// Transform a SELECT AST into an RA tree.
 RAPtr select_to_ra(const LpNode* select, const SchemaMap& schema,
@@ -2239,12 +2630,22 @@ RAPtr select_to_ra(const LpNode* select, const SchemaMap& schema,
         return nullptr;
     }
 
-    // WHERE → Filter with predicate extraction.
+    // WHERE → Filter with predicate extraction + implicit join detection.
     if (select->u.select.where) {
         auto filter = std::make_unique<RAFilter>(std::move(ra));
         extract_eq_predicates(
             select->u.select.where, schema, aliases,
             filter->predicates, filter->has_opaque_terms);
+
+        // Extract implicit equijoin conditions (column=column across tables)
+        // from WHERE and add to the nearest Join node.
+        if (filter->child && filter->child->kind == RANode::Join) {
+            auto* j = static_cast<RAJoin*>(filter->child.get());
+            extract_implicit_equijoins(
+                select->u.select.where, schema, aliases,
+                j->equalities);
+        }
+
         ra = std::move(filter);
     }
 
@@ -2260,8 +2661,7 @@ RAPtr select_to_ra(const LpNode* select, const SchemaMap& schema,
         ra = std::move(filter);
     }
 
-    // SELECT list → Project (we don't analyze projections for invalidation
-    // but include for completeness).
+    // SELECT list → Project.
     ra = std::make_unique<RAProject>(std::move(ra));
 
     return ra;
@@ -2284,7 +2684,7 @@ RAPtr compound_to_ra(const LpNode* node, const SchemaMap& schema) {
     return nullptr;
 }
 
-/// Top-level: parse SQL and produce an RA tree.
+/// Top-level: parse SQL, produce an RA tree, and optimize it.
 /// Returns nullptr if the SQL can't be analyzed (not a SELECT, parse error).
 RAPtr sql_to_ra(const std::string& sql, const SchemaMap& schema) {
     arena_t* arena = arena_create(4096);
@@ -2305,6 +2705,10 @@ RAPtr sql_to_ra(const std::string& sql, const SchemaMap& schema) {
     }
 
     arena_destroy(arena);
+
+    // Optimize: propagate predicates through equijoins, split, push to leaves.
+    ra = optimize_ra(std::move(ra));
+
     return ra;
 }
 
@@ -2439,6 +2843,39 @@ void propagate_predicates(
             }
         }
     }
+}
+
+/// Run all optimization passes on an RA tree:
+/// 1. Propagate predicates through equijoins
+/// 2. Inject propagated predicates at leaf Scans
+/// 3. Split multi-predicate Filters
+/// 4. Push Filters toward leaves
+RAPtr optimize_ra(RAPtr ra) {
+    if (!ra) return nullptr;
+
+    // Collect all predicates and equijoins.
+    std::vector<ResolvedPredicate> predicates;
+    collect_predicates(ra.get(), predicates);
+    std::vector<JoinEquality> equijoins;
+    collect_equijoins(ra.get(), equijoins);
+
+    // Propagate predicates through equijoins to derive new ones.
+    auto original_count = predicates.size();
+    propagate_predicates(predicates, equijoins);
+
+    // Inject any newly derived predicates at the relevant Scans.
+    if (predicates.size() > original_count) {
+        std::vector<ResolvedPredicate> new_preds(
+            predicates.begin() + static_cast<std::ptrdiff_t>(original_count),
+            predicates.end());
+        ra = inject_propagated_predicates(std::move(ra), new_preds);
+    }
+
+    // Split and push filters down.
+    ra = split_filters(std::move(ra));
+    ra = push_filters_down(std::move(ra));
+
+    return ra;
 }
 
 /// Check if a changeset row value matches a predicate value.
@@ -2620,11 +3057,9 @@ struct QueryWatch::Impl {
 
         if (ra_out) {
             ra_out->collect_tables(tables);
+            // After optimization, predicates are pushed to leaf Filters.
+            // Collect them all for changeset checking.
             detail::collect_predicates(ra_out.get(), preds_out);
-            // Propagate predicates through equijoin conditions.
-            std::vector<detail::JoinEquality> equijoins;
-            detail::collect_equijoins(ra_out.get(), equijoins);
-            detail::propagate_predicates(preds_out, equijoins);
         } else {
             // RA transform failed (non-SELECT or parse error).
             // Fall back to authorizer-based table discovery.
