@@ -1484,6 +1484,91 @@ TEST_CASE("integration: predicate correctness — skipped re-eval implies identi
     CHECK(result.subscriptions[0].rows.size() == 2);  // original + new
 }
 
+TEST_CASE("integration: multi-column AND predicate — UPDATE to unrelated column") {
+    // Regression test: UPDATE that changes a column NOT referenced by the query
+    // should not trigger re-evaluation, even with multi-column predicates.
+    // Also tests that UPDATE to a predicated column correctly evaluates the
+    // full AND expression using preloaded row values.
+    DB master_db, replica_db;
+    master_db.exec(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, category INTEGER, "
+        "  status TEXT, description TEXT)");
+    replica_db.exec(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, category INTEGER, "
+        "  status TEXT, description TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Insert items.
+    master_db.exec("INSERT INTO items VALUES (1, 1, 'active', 'item one')");
+    master_db.exec("INSERT INTO items VALUES (2, 2, 'active', 'item two')");
+    master_db.exec("INSERT INTO items VALUES (3, 1, 'deleted', 'item three')");
+    for (int i = 0; i < 3; ++i) deliver(master.flush(), replica);
+
+    // Subscribe: multi-column predicate on category AND status.
+    replica.subscribe(
+        "SELECT id, description FROM items "
+        "WHERE category = 1 AND status = 'active'");
+
+    // Trigger initial.
+    master_db.exec("INSERT INTO items VALUES (99, 99, 'x', 'dummy')");
+    auto init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+    CHECK(init.subscriptions[0].rows.size() == 1);  // only item 1
+
+    // UPDATE description of item 1 (column not in query) — should NOT fire.
+    // The query doesn't reference 'description' at all.
+    // Wait: the query's SELECT list includes 'description'. So it IS relevant.
+    // Let's use a query that doesn't select description.
+    replica.unsubscribe(init.subscriptions[0].id);
+    replica.subscribe(
+        "SELECT id FROM items WHERE category = 1 AND status = 'active'");
+
+    // Trigger initial for new subscription.
+    master_db.exec("INSERT INTO items VALUES (98, 99, 'x', 'dummy2')");
+    init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+    CHECK(init.subscriptions[0].rows.size() == 1);  // item 1
+
+    // UPDATE description of item 1 — NOT in query's column set → skip.
+    master_db.exec("UPDATE items SET description = 'updated' WHERE id = 1");
+    auto msgs = master.flush();
+    auto result = deliver(msgs, replica);
+    CHECK(result.subscriptions.empty());  // column irrelevant
+
+    // UPDATE status of item 1 from 'active' to 'pending'.
+    // Multi-column predicate: category=1 AND status='active'.
+    // Old: (1, 'active') → matches both → row was in result.
+    // New: (1, 'pending') → category matches, status doesn't → row leaves.
+    // Preload needed: the UPDATE only changes 'status', but the VM
+    // also needs 'category' to evaluate the AND. The preloaded row
+    // provides category=1 for both old and new passes.
+    master_db.exec("UPDATE items SET status = 'pending' WHERE id = 1");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.empty());  // no rows match now
+
+    // UPDATE category of item 2 from 2 to 1.
+    // Old: (2, 'active') → category doesn't match → not in result.
+    // New: (1, 'active') → both match → enters result.
+    master_db.exec("UPDATE items SET category = 1 WHERE id = 2");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.size() == 1);  // item 2 now matches
+
+    // UPDATE status of item 3 from 'deleted' to 'active'.
+    // category=1 (matches), old status='deleted' (no), new status='active' (yes).
+    master_db.exec("UPDATE items SET status = 'active' WHERE id = 3");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.size() == 2);  // items 2 and 3
+}
+
 TEST_CASE("integration: AND predicate correctness — result-changing operations") {
     // Test that operations which DO change the query result trigger re-evaluation.
     // For AND predicates, test transitions that actually affect whether rows

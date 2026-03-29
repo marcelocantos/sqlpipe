@@ -3352,7 +3352,13 @@ void emit_predicate(Program& p, const ResolvedPredicate& pred) {
 /// Compile predicates for a specific table into a bytecode program.
 /// All predicates for the table are AND-connected.
 /// Returns an empty program if no predicates apply (= always affected).
-Program compile_predicates(
+/// Compile result: program bytecode and whether preloading is needed.
+struct CompileResult {
+    Program program;
+    bool    needs_preload = false;
+};
+
+CompileResult compile_predicates(
         const std::vector<ResolvedPredicate>& predicates,
         const std::string& table) {
     // Collect predicates for this table.
@@ -3364,6 +3370,12 @@ Program compile_predicates(
     }
     if (mine.empty()) return {};  // no predicates → no program
 
+    // Check if predicates reference more than one distinct column.
+    // Multi-column predicates need preloading for UPDATE changesets.
+    std::set<int> pred_columns;
+    for (const auto* p : mine) pred_columns.insert(p->column_index);
+    bool needs_preload = pred_columns.size() > 1;
+
     Program prog;
     emit_predicate(prog, *mine[0]);
     for (size_t i = 1; i < mine.size(); ++i) {
@@ -3371,7 +3383,7 @@ Program compile_predicates(
         emit_op(prog, VMOp::And);
     }
     emit_op(prog, VMOp::Halt);
-    return prog;
+    return {std::move(prog), needs_preload};
 }
 
 // ── VM evaluator ────────────────────────────────────────────────
@@ -3451,7 +3463,13 @@ struct VMContext {
     sqlite3_changeset_iter* iter;
     int op;   // SQLITE_INSERT, SQLITE_UPDATE, or SQLITE_DELETE
     bool use_new;  // true = LoadCol reads new values, false = old values
-    bool unknown_column = false;  // set when LoadCol can't read a value
+
+    /// Preloaded row values for UPDATE operations.
+    /// old_row and new_row contain the full row state, with unknown columns
+    /// filled from the database. Empty if not preloaded.
+    std::vector<Value> old_row;
+    std::vector<Value> new_row;
+    bool preloaded = false;
 };
 
 /// Read a LE uint16 from program at position pc. Advances pc.
@@ -3492,16 +3510,26 @@ bool vm_run(const Program& prog, VMContext& ctx) {
         switch (op) {
             case VMOp::LoadCol: {
                 uint8_t col = prog[pc++];
+
+                // If row is preloaded (UPDATE with DB lookup), use it.
+                if (ctx.preloaded) {
+                    const auto& row = ctx.use_new ? ctx.new_row : ctx.old_row;
+                    if (col < row.size()) {
+                        stack.push_back(row[col]);
+                    } else {
+                        stack.push_back(std::monostate{});
+                    }
+                    break;
+                }
+
+                // Otherwise read directly from changeset.
                 sqlite3_value* val = nullptr;
                 if (ctx.op == SQLITE_INSERT) {
                     sqlite3changeset_new(ctx.iter, col, &val);
                 } else if (ctx.op == SQLITE_DELETE) {
                     sqlite3changeset_old(ctx.iter, col, &val);
                 } else if (ctx.op == SQLITE_UPDATE) {
-                    // For UPDATE, the changeset only includes PK + changed
-                    // columns. Try the preferred direction first, then fall
-                    // back. If neither has a value, the column didn't change
-                    // and its value is unknown from the changeset alone.
+                    // Fallback path for non-preloaded UPDATEs.
                     if (ctx.use_new) {
                         sqlite3changeset_new(ctx.iter, col, &val);
                         if (!val) sqlite3changeset_old(ctx.iter, col, &val);
@@ -3510,17 +3538,9 @@ bool vm_run(const Program& prog, VMContext& ctx) {
                         if (!val) sqlite3changeset_new(ctx.iter, col, &val);
                     }
                     if (!val) {
-                        // Column value unknown — push sentinel.
-                        // Any comparison with unknown must be conservative
-                        // (assume could match). We use a special int value
-                        // and short-circuit in comparisons. Actually, the
-                        // simplest correct approach: if ANY LoadCol returns
-                        // unknown, the whole expression is indeterminate →
-                        // return true (conservative).
-                        // Set a flag and bail.
-                        ctx.unknown_column = true;
-                        stack.push_back(std::monostate{}); // placeholder
-                        break;
+                        // Column value unknown — conservative bail-out.
+                        // This path only hits if preloading wasn't done.
+                        return true;
                     }
                 }
                 stack.push_back(sqlite3_value_to_value(val));
@@ -3620,9 +3640,6 @@ bool vm_run(const Program& prog, VMContext& ctx) {
             case VMOp::Halt:
                 goto done;
         }
-        // If a LoadCol couldn't determine the column value, the expression
-        // is indeterminate. Conservatively return true (could match).
-        if (ctx.unknown_column) return true;
     }
 done:
     if (stack.empty()) return true;  // empty program → conservative
@@ -3638,7 +3655,55 @@ struct SubProgram {
     Program        program;       // empty = no predicates for this table → always affected
     std::set<int>  columns_used;  // columns the query reads from this table
                                   // empty = unknown → conservative (all columns relevant)
+    bool needs_preload = false;   // true if program references columns that may be
+                                  // absent from UPDATE changesets (multi-column predicates)
 };
+
+/// Preload old and new row state for an UPDATE changeset entry.
+/// Reads the current DB row (which reflects the NEW state since the
+/// changeset has already been applied), then reconstructs old state
+/// from changeset old values for changed columns.
+void preload_update_row(VMContext& ctx, sqlite3* db,
+                        const std::string& table, int ncol) {
+    // Get rowid from changeset — it's the PK, always in old values.
+    // For integer primary key tables, the PK column value IS the rowid.
+    sqlite3_value* pk_val = nullptr;
+    sqlite3changeset_old(ctx.iter, 0, &pk_val);
+    if (!pk_val) return;  // can't determine rowid
+    int64_t rowid = sqlite3_value_int64(pk_val);
+
+    // Read current row from DB (= new state).
+    std::string sql = "SELECT * FROM \"" + table + "\" WHERE rowid = ?";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        if (stmt) sqlite3_finalize(stmt);
+        return;
+    }
+    sqlite3_bind_int64(stmt, 1, rowid);
+
+    ctx.new_row.resize(static_cast<size_t>(ncol));
+    ctx.old_row.resize(static_cast<size_t>(ncol));
+
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        for (int i = 0; i < ncol; ++i) {
+            ctx.new_row[static_cast<size_t>(i)] =
+                sqlite3_value_to_value(sqlite3_column_value(stmt, i));
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    // Old row = new row, then overlay with changeset old values for
+    // changed columns.
+    ctx.old_row = ctx.new_row;
+    for (int i = 0; i < ncol; ++i) {
+        sqlite3_value* val = nullptr;
+        sqlite3changeset_old(ctx.iter, i, &val);
+        if (val) {
+            ctx.old_row[static_cast<size_t>(i)] = sqlite3_value_to_value(val);
+        }
+    }
+    ctx.preloaded = true;
+}
 
 /// The predicate index: maps table → list of compiled programs.
 using ProgramIndex = std::unordered_map<std::string, std::vector<SubProgram>>;
@@ -3647,6 +3712,7 @@ using ProgramIndex = std::unordered_map<std::string, std::vector<SubProgram>>;
 /// Runs each program twice (old values, new values) per changeset row.
 /// Returns the set of subscription IDs affected.
 std::set<SubscriptionId> evaluate_changeset(
+        sqlite3* db,
         const Changeset& data,
         const ProgramIndex& index,
         const std::unordered_map<std::string, std::set<SubscriptionId>>& table_subs) {
@@ -3718,13 +3784,18 @@ std::set<SubscriptionId> evaluate_changeset(
                 continue;
             }
 
-            VMContext ctx{iter, cs_op, false, false};
+            VMContext ctx{iter, cs_op, false, {}, {}, false};
             bool old_match = false, new_match = false;
+
+            // For UPDATE with multi-column predicates, preload the
+            // full row from the database to fill in unchanged columns.
+            if (cs_op == SQLITE_UPDATE && sp.needs_preload && db) {
+                preload_update_row(ctx, db, table_name, ncol);
+            }
 
             // Run against old values (UPDATE, DELETE).
             if (cs_op == SQLITE_UPDATE || cs_op == SQLITE_DELETE) {
                 ctx.use_new = false;
-                ctx.unknown_column = false;
                 old_match = vm_run(sp.program, ctx);
             }
 
@@ -3732,7 +3803,6 @@ std::set<SubscriptionId> evaluate_changeset(
             if (!old_match &&
                 (cs_op == SQLITE_INSERT || cs_op == SQLITE_UPDATE)) {
                 ctx.use_new = true;
-                ctx.unknown_column = false;
                 new_match = vm_run(sp.program, ctx);
             }
 
@@ -3793,14 +3863,15 @@ struct QueryWatch::Impl {
         prog_index.clear();
         for (const auto& [id, sub] : subscriptions) {
             for (const auto& table : sub.tables) {
-                auto program = detail::compile_predicates(
+                auto cr = detail::compile_predicates(
                     sub.predicates, table);
                 std::set<int> cols;
                 if (sub.ra) {
                     cols = detail::columns_for_table(sub.ra.get(), table);
                 }
                 prog_index[table].push_back(
-                    {id, std::move(program), std::move(cols)});
+                    {id, std::move(cr.program), std::move(cols),
+                     cr.needs_preload});
             }
         }
     }
@@ -3877,7 +3948,7 @@ struct QueryWatch::Impl {
             // VM evaluation: iterate changeset once, run compiled
             // programs for each subscription.
             ids = detail::evaluate_changeset(
-                *changeset, prog_index, table_subs);
+                db, *changeset, prog_index, table_subs);
         } else {
             // No changeset or no predicates — table-level invalidation.
             for (const auto& table : affected) {
