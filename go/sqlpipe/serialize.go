@@ -15,12 +15,11 @@ func Serialize(msg Message) []byte {
 		buf = append(buf, byte(TagHello))
 		buf = putU32(buf, m.ProtocolVersion)
 		buf = putI32(buf, int32(m.SchemaVersion))
-		if len(m.OwnedTables) > 0 {
-			buf = putU32(buf, uint32(len(m.OwnedTables)))
-			for _, t := range m.OwnedTables {
-				buf = putString(buf, t)
-			}
+		buf = putU32(buf, uint32(len(m.OwnedTables)))
+		for _, t := range m.OwnedTables {
+			buf = putString(buf, t)
 		}
+		buf = putI64(buf, int64(m.LastSeq))
 
 	case ChangesetMsg:
 		buf = append(buf, byte(TagChangeset))

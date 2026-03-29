@@ -1,8 +1,8 @@
 // Copyright 2026 Marcelo Cantos
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ChangeEvent, HandleResult, PeerHandleResult, QueryResult, Value } from './types.js';
-import { OpType } from './types.js';
+import type { ChangeEvent, HandleResult, OutMessage, PeerHandleResult, QueryResult, Value } from './types.js';
+import { Delivery, OpType } from './types.js';
 
 /** Little-endian binary reader over a Uint8Array. */
 export class Reader {
@@ -99,17 +99,19 @@ export function decodeQueryResult(r: Reader): QueryResult {
   return { id, columns, rows };
 }
 
-/** Extract wire messages from an encoded messages buffer. */
-export function decodeMessages(buf: Uint8Array): Uint8Array[] {
+/** Extract wire messages with delivery hints from an encoded messages buffer. */
+export function decodeMessages(buf: Uint8Array): OutMessage[] {
   const r = new Reader(buf);
   const count = r.u32();
-  const msgs: Uint8Array[] = [];
+  const msgs: OutMessage[] = [];
   for (let i = 0; i < count; i++) {
     const len = r.u32();
     // Include the 4-byte length prefix in the message.
     const start = r.pos - 4;
     r.pos += len;
-    msgs.push(buf.slice(start, r.pos));
+    const data = buf.slice(start, r.pos);
+    const delivery = r.u8() as Delivery;
+    msgs.push({ data, delivery });
   }
   return msgs;
 }
@@ -118,14 +120,16 @@ export function decodeMessages(buf: Uint8Array): Uint8Array[] {
 export function decodeHandleResult(buf: Uint8Array): HandleResult {
   const r = new Reader(buf);
 
-  // Response messages.
+  // Response messages (with delivery hints).
   const msgCount = r.u32();
-  const messages: Uint8Array[] = [];
+  const messages: OutMessage[] = [];
   for (let i = 0; i < msgCount; i++) {
     const len = r.u32();
     const start = r.pos - 4;
     r.pos += len;
-    messages.push(buf.slice(start, r.pos));
+    const data = buf.slice(start, r.pos);
+    const delivery = r.u8() as Delivery;
+    messages.push({ data, delivery });
   }
 
   // Changes.
@@ -146,12 +150,14 @@ export function decodePeerHandleResult(buf: Uint8Array): PeerHandleResult {
   const r = new Reader(buf);
 
   const msgCount = r.u32();
-  const messages: Uint8Array[] = [];
+  const messages: OutMessage[] = [];
   for (let i = 0; i < msgCount; i++) {
     const len = r.u32();
     const start = r.pos - 4;
     r.pos += len;
-    messages.push(buf.slice(start, r.pos));
+    const data = buf.slice(start, r.pos);
+    const delivery = r.u8() as Delivery;
+    messages.push({ data, delivery });
   }
 
   const changeCount = r.u32();

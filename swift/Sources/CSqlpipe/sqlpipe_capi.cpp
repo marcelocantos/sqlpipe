@@ -106,24 +106,26 @@ void encode_query_result(Buf& b, const sqlpipe::QueryResult& qr) {
     }
 }
 
-// Encode vector<Message> as [u32 count][serialized msgs...].
-Buf encode_messages(const std::vector<sqlpipe::Message>& msgs) {
+// Encode vector<OutMessage> as [u32 count][[serialized msg][u8 delivery]]...
+Buf encode_messages(const std::vector<sqlpipe::OutMessage>& msgs) {
     Buf b;
     put_u32(b, static_cast<uint32_t>(msgs.size()));
-    for (auto& msg : msgs) {
-        auto wire = sqlpipe::serialize(msg);
+    for (auto& om : msgs) {
+        auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
+        put_u8(b, static_cast<uint8_t>(om.delivery));
     }
     return b;
 }
 
-// Encode vector<PeerMessage> as [u32 count][serialized pmsgs...].
-Buf encode_peer_messages(const std::vector<sqlpipe::PeerMessage>& msgs) {
+// Encode vector<PeerOutMessage> as [u32 count][[serialized pmsg][u8 delivery]]...
+Buf encode_peer_messages(const std::vector<sqlpipe::PeerOutMessage>& msgs) {
     Buf b;
     put_u32(b, static_cast<uint32_t>(msgs.size()));
-    for (auto& msg : msgs) {
-        auto wire = sqlpipe::serialize(msg);
+    for (auto& om : msgs) {
+        auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
+        put_u8(b, static_cast<uint8_t>(om.delivery));
     }
     return b;
 }
@@ -133,9 +135,10 @@ Buf encode_handle_result(const sqlpipe::HandleResult& hr) {
     Buf b;
     // Messages.
     put_u32(b, static_cast<uint32_t>(hr.messages.size()));
-    for (auto& msg : hr.messages) {
-        auto wire = sqlpipe::serialize(msg);
+    for (auto& om : hr.messages) {
+        auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
+        put_u8(b, static_cast<uint8_t>(om.delivery));
     }
     // Changes.
     put_u32(b, static_cast<uint32_t>(hr.changes.size()));
@@ -151,9 +154,10 @@ Buf encode_peer_handle_result(const sqlpipe::PeerHandleResult& phr) {
     Buf b;
     // Messages.
     put_u32(b, static_cast<uint32_t>(phr.messages.size()));
-    for (auto& msg : phr.messages) {
-        auto wire = sqlpipe::serialize(msg);
+    for (auto& om : phr.messages) {
+        auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
+        put_u8(b, static_cast<uint8_t>(om.delivery));
     }
     // Changes.
     put_u32(b, static_cast<uint32_t>(phr.changes.size()));
@@ -242,11 +246,13 @@ sqlpipe::MasterConfig to_master_config(sqlpipe_master_config cfg) {
     if (cfg.on_flush) {
         auto fn = cfg.on_flush;
         auto ctx = cfg.flush_ctx;
-        mc.on_flush = [fn, ctx](const std::vector<sqlpipe::Message>& msgs) {
+        mc.on_flush = [fn, ctx](const std::vector<sqlpipe::OutMessage>& msgs) {
             auto encoded = encode_messages(msgs);
             fn(ctx, encoded.data(), encoded.size());
         };
     }
+    if (cfg.changeset_queue_size > 0)
+        mc.changeset_queue_size = cfg.changeset_queue_size;
     return mc;
 }
 
@@ -472,9 +478,11 @@ void sqlpipe_replica_free(sqlpipe_replica* r) { delete r; }
 
 sqlpipe_error sqlpipe_replica_hello(sqlpipe_replica* r, sqlpipe_buf* out) {
     try {
-        auto msg = r->impl.hello();
-        auto wire = sqlpipe::serialize(msg);
-        *out = to_buf(Buf(wire.begin(), wire.end()));
+        auto hello_out = r->impl.hello();
+        auto wire = sqlpipe::serialize(hello_out.msg);
+        Buf b(wire.begin(), wire.end());
+        put_u8(b, static_cast<uint8_t>(hello_out.delivery));
+        *out = to_buf(std::move(b));
         return ok();
     } catch (const sqlpipe::Error& e) { return make_error(e); }
       catch (const std::exception& e) { return make_error(1, e.what()); }

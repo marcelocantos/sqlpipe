@@ -48,34 +48,34 @@ struct DB {
 // Full handshake including diff exchange.
 void handshake(Master& master, Replica& replica) {
     auto hello = replica.hello();
-    auto resp = master.handle_message(hello);
+    auto resp = master.handle_message(hello.msg);
     HandleResult r;
     for (const auto& m : resp) {
-        auto result = replica.handle_message(m);
+        auto result = replica.handle_message(m.msg);
         r.messages.insert(r.messages.end(),
                           result.messages.begin(), result.messages.end());
     }
     for (const auto& m : r.messages) {
-        auto result = master.handle_message(m);
+        auto result = master.handle_message(m.msg);
         HandleResult r2;
         for (const auto& m2 : result) {
-            auto result2 = replica.handle_message(m2);
+            auto result2 = replica.handle_message(m2.msg);
             r2.messages.insert(r2.messages.end(),
                                result2.messages.begin(), result2.messages.end());
         }
         for (const auto& m3 : r2.messages) {
-            auto result3 = master.handle_message(m3);
+            auto result3 = master.handle_message(m3.msg);
             for (const auto& m4 : result3) {
-                replica.handle_message(m4);
+                replica.handle_message(m4.msg);
             }
         }
     }
 }
 
-HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
+HandleResult deliver(const std::vector<OutMessage>& msgs, Replica& handler) {
     HandleResult result;
     for (const auto& m : msgs) {
-        auto resp = handler.handle_message(m);
+        auto resp = handler.handle_message(m.msg);
         result.messages.insert(result.messages.end(),
                                resp.messages.begin(), resp.messages.end());
         result.changes.insert(result.changes.end(),
@@ -96,12 +96,12 @@ TEST_CASE("diff sync: schema mismatch produces ErrorMsg") {
     Replica replica(replica_db.db);
 
     auto hello = replica.hello();
-    auto master_resp = master.handle_message(hello);
+    auto master_resp = master.handle_message(hello.msg);
 
     // Master should detect schema mismatch and send ErrorMsg.
     REQUIRE(master_resp.size() == 1);
-    CHECK(std::holds_alternative<ErrorMsg>(master_resp[0]));
-    auto& err = std::get<ErrorMsg>(master_resp[0]);
+    CHECK(std::holds_alternative<ErrorMsg>(master_resp[0].msg));
+    auto& err = std::get<ErrorMsg>(master_resp[0].msg);
     CHECK(err.code == ErrorCode::SchemaMismatch);
     CHECK(err.remote_schema_version == master.schema_version());
     CHECK(!err.remote_schema_sql.empty());
@@ -235,10 +235,10 @@ TEST_CASE("diff sync: auto-migrate empty replica to master schema") {
     Replica replica(replica_db.db);  // no schema, no tables
 
     // First handshake attempt: schema mismatch → auto-migration → reset.
-    auto pending = master.handle_message(replica.hello());
+    auto pending = master.handle_message(replica.hello().msg);
     REQUIRE(pending.size() == 1);  // ErrorMsg with schema SQL
 
-    auto result = replica.handle_message(pending[0]);
+    auto result = replica.handle_message(pending[0].msg);
     // Auto-migration should have resolved the mismatch and reset to Init.
     CHECK(replica.state() == Replica::State::Init);
 
@@ -273,10 +273,10 @@ TEST_CASE("diff sync: auto-migrate adds new column") {
     replica.reset();
     Master master2(master_db.db);  // new master with evolved schema
 
-    auto pending = master2.handle_message(replica.hello());
+    auto pending = master2.handle_message(replica.hello().msg);
     REQUIRE(pending.size() == 1);  // ErrorMsg
 
-    auto result = replica.handle_message(pending[0]);
+    auto result = replica.handle_message(pending[0].msg);
     CHECK(replica.state() == Replica::State::Init);  // auto-migrated
 
     sync_handshake(master2, replica);
@@ -295,7 +295,7 @@ TEST_CASE("diff sync: fast reconnect when seq matches (no diff messages)") {
     sync_handshake(master, replica);
     master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
     auto msgs = master.flush();
-    for (auto& m : msgs) replica.handle_message(m);
+    for (auto& m : msgs) replica.handle_message(m.msg);
     CHECK(replica.current_seq() == 1);
 
     // Simulate reconnect with no changes — seqs match.
@@ -304,21 +304,21 @@ TEST_CASE("diff sync: fast reconnect when seq matches (no diff messages)") {
 
     // Track what messages are exchanged.
     auto hello = replica2.hello();
-    auto resp = master2.handle_message(hello);
+    auto resp = master2.handle_message(hello.msg);
 
     // Master should respond with a single HelloMsg (fast path).
     REQUIRE(resp.size() == 1);
-    CHECK(std::holds_alternative<HelloMsg>(resp[0]));
-    auto& hm = std::get<HelloMsg>(resp[0]);
+    CHECK(std::holds_alternative<HelloMsg>(resp[0].msg));
+    auto& hm = std::get<HelloMsg>(resp[0].msg);
     CHECK(hm.last_seq == 1);  // confirms fast path
 
     // Replica receives the HelloMsg and goes straight to Live.
-    auto result = replica2.handle_message(resp[0]);
+    auto result = replica2.handle_message(resp[0].msg);
     CHECK(replica2.state() == Replica::State::Live);
 
     // No BucketHashesMsg — just an AckMsg back.
     REQUIRE(result.messages.size() == 1);
-    CHECK(std::holds_alternative<AckMsg>(result.messages[0]));
+    CHECK(std::holds_alternative<AckMsg>(result.messages[0].msg));
 
     // Data is still there.
     CHECK(replica_db.count("t1") == 1);
@@ -335,7 +335,7 @@ TEST_CASE("diff sync: no fast reconnect when seq differs") {
     sync_handshake(master, replica);
     master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
     auto msgs = master.flush();
-    for (auto& m : msgs) replica.handle_message(m);
+    for (auto& m : msgs) replica.handle_message(m.msg);
 
     // Master adds more data (seq=2), replica stays at seq=1.
     {

@@ -45,7 +45,7 @@ masterDb.exec("INSERT INTO items VALUES (2, 'world', 2.72)");
 const msgs = master.flush();
 assert(msgs.length === 1, `expected 1 flush message, got ${msgs.length}`);
 
-const result = replica.handleMessage(msgs[0]);
+const result = replica.handleMessage(msgs[0].data);
 assert(result.changes.length === 2, `expected 2 changes, got ${result.changes.length}`);
 assert(result.messages.length === 1, `expected 1 ack, got ${result.messages.length}`);
 console.log(`replicated ${result.changes.length} changes`);
@@ -75,7 +75,7 @@ console.log(`QueryWatch: count=${countResult!.rows[0][0]}`);
 // Insert another row on master and replicate.
 masterDb.exec("INSERT INTO items VALUES (3, 'sqlpipe', 1.0)");
 const msgs2 = master.flush();
-const result2 = replica.handleMessage(msgs2[0]);
+const result2 = replica.handleMessage(msgs2[0].data);
 assert(result2.changes.length === 1, `expected 1 change`);
 
 // Notify the watch — both subscriptions should fire (data changed).

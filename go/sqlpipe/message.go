@@ -27,6 +27,7 @@ type HelloMsg struct {
 	ProtocolVersion uint32
 	SchemaVersion   SchemaVersion
 	OwnedTables     []string // Sorted. Tables the sender wants to own (Peer mode).
+	LastSeq         Seq      // Sender's current seq (-1 = not provided).
 }
 
 func (HelloMsg) messageTag() MessageTag { return TagHello }
@@ -129,16 +130,28 @@ type PeerMessage struct {
 	Payload    Message
 }
 
+// OutMessage pairs a Message with a transport delivery hint.
+type OutMessage struct {
+	Msg      Message
+	Delivery Delivery
+}
+
+// PeerOutMessage pairs a PeerMessage with a transport delivery hint.
+type PeerOutMessage struct {
+	Msg      PeerMessage
+	Delivery Delivery
+}
+
 // HandleResult is the return type for Replica.HandleMessage.
 type HandleResult struct {
-	Messages      []Message
+	Messages      []OutMessage
 	Changes       []ChangeEvent
 	Subscriptions []QueryResult
 }
 
 // PeerHandleResult is the return type for Peer.HandleMessage.
 type PeerHandleResult struct {
-	Messages      []PeerMessage
+	Messages      []PeerOutMessage
 	Changes       []ChangeEvent
 	Subscriptions []QueryResult
 }
@@ -147,13 +160,14 @@ type PeerHandleResult struct {
 
 // MasterConfig configures a Master.
 type MasterConfig struct {
-	TableFilter      *TableFilter            // nil = track all tables.
-	SeqKey           string                  // Meta-table key (default "seq").
-	BucketSize       int64                   // Rows per bucket (default 1024).
-	OnProgress       ProgressCallback        // nil = no reporting.
-	OnSchemaMismatch SchemaMismatchCallback  // nil = default behaviour.
-	OnLog            LogCallback             // nil = discard log output.
-	OnFlush          FlushCallback           // nil = manual flush only.
+	TableFilter        *TableFilter            // nil = track all tables.
+	SeqKey             string                  // Meta-table key (default "seq").
+	BucketSize         int64                   // Rows per bucket (default 1024).
+	ChangesetQueueSize uint64                  // Max queued changesets (default 64). 0 = use default.
+	OnProgress         ProgressCallback        // nil = no reporting.
+	OnSchemaMismatch   SchemaMismatchCallback  // nil = default behaviour.
+	OnLog              LogCallback             // nil = discard log output.
+	OnFlush            FlushCallback           // nil = manual flush only.
 }
 
 // ReplicaConfig configures a Replica.

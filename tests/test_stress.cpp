@@ -69,35 +69,35 @@ struct DB {
 // Perform a full handshake between master and replica.
 void handshake(Master& master, Replica& replica) {
     auto hello = replica.hello();
-    auto resp = master.handle_message(hello);
+    auto resp = master.handle_message(hello.msg);
     HandleResult r;
     for (const auto& m : resp) {
-        auto result = replica.handle_message(m);
+        auto result = replica.handle_message(m.msg);
         r.messages.insert(r.messages.end(),
                           result.messages.begin(), result.messages.end());
     }
     for (const auto& m : r.messages) {
-        auto result = master.handle_message(m);
+        auto result = master.handle_message(m.msg);
         HandleResult r2;
         for (const auto& m2 : result) {
-            auto result2 = replica.handle_message(m2);
+            auto result2 = replica.handle_message(m2.msg);
             r2.messages.insert(r2.messages.end(),
                                result2.messages.begin(),
                                result2.messages.end());
         }
         for (const auto& m3 : r2.messages) {
-            auto result3 = master.handle_message(m3);
+            auto result3 = master.handle_message(m3.msg);
             for (const auto& m4 : result3) {
-                replica.handle_message(m4);
+                replica.handle_message(m4.msg);
             }
         }
     }
 }
 
-HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
+HandleResult deliver(const std::vector<OutMessage>& msgs, Replica& handler) {
     HandleResult result;
     for (const auto& m : msgs) {
-        auto resp = handler.handle_message(m);
+        auto resp = handler.handle_message(m.msg);
         result.messages.insert(result.messages.end(),
                                resp.messages.begin(), resp.messages.end());
         result.changes.insert(result.changes.end(),
@@ -106,10 +106,10 @@ HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
     return result;
 }
 
-PeerHandleResult deliver(const std::vector<PeerMessage>& msgs, Peer& handler) {
+PeerHandleResult deliver(const std::vector<PeerOutMessage>& msgs, Peer& handler) {
     PeerHandleResult result;
     for (const auto& m : msgs) {
-        auto resp = handler.handle_message(m);
+        auto resp = handler.handle_message(m.msg);
         result.messages.insert(result.messages.end(),
                                resp.messages.begin(), resp.messages.end());
         result.changes.insert(result.changes.end(),
@@ -118,7 +118,7 @@ PeerHandleResult deliver(const std::vector<PeerMessage>& msgs, Peer& handler) {
     return result;
 }
 
-void exchange(Peer& a, Peer& b, const std::vector<PeerMessage>& initial) {
+void exchange(Peer& a, Peer& b, const std::vector<PeerOutMessage>& initial) {
     auto msgs = initial;
     while (!msgs.empty()) {
         auto resp_b = deliver(msgs, b);
@@ -201,7 +201,7 @@ TEST_CASE("stress: random live streaming converges") {
         auto result = deliver(msgs, replica);
         // Feed acks back to master.
         for (const auto& m : result.messages) {
-            master.handle_message(m);
+            master.handle_message(m.msg);
         }
     }
 
@@ -311,7 +311,7 @@ TEST_CASE("stress: large dataset live streaming") {
         auto msgs = master.flush();
         auto result = deliver(msgs, replica);
         for (const auto& m : result.messages) {
-            master.handle_message(m);
+            master.handle_message(m.msg);
         }
     }
 

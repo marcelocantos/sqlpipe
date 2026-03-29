@@ -82,6 +82,7 @@ typedef struct {
     size_t       table_filter_count;
     const char*  seq_key;            // NULL = "seq".
     int64_t      bucket_size;        // 0 = default (1024).
+    uint64_t     changeset_queue_size; // 0 = use default (64).
     sqlpipe_progress_fn         on_progress;
     void*                       progress_ctx;
     sqlpipe_schema_mismatch_fn  on_schema_mismatch;

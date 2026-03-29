@@ -157,7 +157,7 @@ public final class SyncPeer: @unchecked Sendable {
         let err = sqlpipe_peer_start(peer, &buf)
         defer { sqlpipe_free_buf(buf) }
         if err.code != 0 { logError(err, "start"); return nil }
-        return stripCountPrefix(buf)
+        return stripCountAndDelivery(buf)
     }
 
     /// Handle an incoming binary message. Returns response + changes + subscriptions.
@@ -213,7 +213,7 @@ public final class SyncPeer: @unchecked Sendable {
         let err = sqlpipe_peer_flush(peer, &buf)
         defer { sqlpipe_free_buf(buf) }
         if err.code != 0 { logError(err, "flush"); return nil }
-        return stripCountPrefix(buf)
+        return stripCountAndDelivery(buf)
     }
 
     /// Subscribe to a SQL query. Returns the subscription ID.
@@ -321,19 +321,25 @@ public final class SyncPeer: @unchecked Sendable {
         let bytes = UnsafeBufferPointer(start: data, count: buf.len)
         var offset = 0
 
+        // Messages are encoded as [u32 count][[4B len][payload][u8 delivery]]...
+        // We strip the delivery bytes and concatenate the raw wire messages.
         let msgCount = readU32(bytes, offset: &offset)
-        let msgStart = offset
-        for _ in 0..<msgCount {
-            guard offset + 4 <= bytes.count else { break }
-            let msgLen = readU32(bytes, offset: &offset)
-            offset += Int(msgLen)
-        }
-        let msgEnd = offset
-
         var responseData: Data?
         if msgCount > 0 {
-            responseData = Data(bytes: bytes.baseAddress!.advanced(by: msgStart),
-                                count: msgEnd - msgStart)
+            var msgs = Data()
+            for _ in 0..<msgCount {
+                guard offset + 4 <= bytes.count else { break }
+                let msgStart = offset
+                let msgLen = readU32(bytes, offset: &offset)
+                offset += Int(msgLen)
+                let msgEnd = offset
+                // Copy the wire message (4B length prefix + payload).
+                msgs.append(Data(bytes: bytes.baseAddress!.advanced(by: msgStart),
+                                 count: msgEnd - msgStart))
+                // Skip the delivery hint byte.
+                offset += 1
+            }
+            responseData = msgs
         }
 
         let changeCount = readU32(bytes, offset: &offset)
@@ -432,9 +438,30 @@ public final class SyncPeer: @unchecked Sendable {
 
     // MARK: - Helpers
 
-    private func stripCountPrefix(_ buf: sqlpipe_buf) -> Data? {
+    /// Decode a [u32 count][[4B len][payload][u8 delivery]]... buffer,
+    /// stripping the count prefix and delivery bytes to produce clean
+    /// wire messages suitable for sending to the remote peer.
+    private func stripCountAndDelivery(_ buf: sqlpipe_buf) -> Data? {
         guard let data = buf.data, buf.len > 4 else { return nil }
-        return Data(bytes: data.advanced(by: 4), count: buf.len - 4)
+        let bytes = UnsafeBufferPointer(start: data, count: buf.len)
+        var offset = 0
+
+        let count = readU32(bytes, offset: &offset)
+        guard count > 0 else { return nil }
+
+        var result = Data()
+        for _ in 0..<count {
+            guard offset + 4 <= bytes.count else { break }
+            let msgStart = offset
+            let msgLen = readU32(bytes, offset: &offset)
+            offset += Int(msgLen)
+            let msgEnd = offset
+            result.append(Data(bytes: bytes.baseAddress!.advanced(by: msgStart),
+                               count: msgEnd - msgStart))
+            // Skip the delivery hint byte.
+            offset += 1
+        }
+        return result.isEmpty ? nil : result
     }
 
     private func logError(_ err: sqlpipe_error, _ ctx: String) {

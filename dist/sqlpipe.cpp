@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <format>
 #include <lz4.h>
@@ -1341,6 +1342,21 @@ struct Master::Impl {
     Seq                      seq = 0;
     SchemaVersion            cached_sv = 0;
 
+    // Changeset queue for replay on reconnect.
+    struct QueuedChangeset {
+        Seq       seq;
+        Changeset data;
+    };
+    std::deque<QueuedChangeset> changeset_queue;
+
+    void enqueue_changeset(Seq s, const Changeset& data) {
+        if (config.changeset_queue_size == 0) return;
+        changeset_queue.push_back({s, data});
+        while (changeset_queue.size() > config.changeset_queue_size) {
+            changeset_queue.pop_front();
+        }
+    }
+
     // Diff handshake state.
     enum class HSState : std::uint8_t {
         Idle,
@@ -1395,7 +1411,10 @@ struct Master::Impl {
             SQLPIPE_LOG(config.on_log, LogLevel::Debug,
                         "auto-flushed changeset seq={} ({} bytes)", seq, cs.size());
 
-            std::vector<Message> msgs = {ChangesetMsg{seq, std::move(cs)}};
+            enqueue_changeset(seq, cs);
+
+            std::vector<OutMessage> msgs = {
+                tagged(Message{ChangesetMsg{seq, std::move(cs)}})};
             config.on_flush(msgs);
         }
 
@@ -1460,11 +1479,11 @@ struct Master::Impl {
         return cs;
     }
 
-    std::vector<Message> handle_hello(const HelloMsg& hello) {
+    std::vector<OutMessage> handle_hello(const HelloMsg& hello) {
         if (hello.protocol_version != kProtocolVersion) {
-            return {ErrorMsg{ErrorCode::ProtocolError,
+            return {tagged(Message{ErrorMsg{ErrorCode::ProtocolError,
                 "unsupported protocol version: " +
-                std::to_string(hello.protocol_version)}};
+                std::to_string(hello.protocol_version)}})};
         }
 
         auto my_sv = detail::compute_schema_fingerprint(db, filter());
@@ -1483,12 +1502,12 @@ struct Master::Impl {
                 SQLPIPE_LOG(config.on_log, LogLevel::Info,
                             "schema mismatch (replica={}, master={})",
                             hello.schema_version, my_sv);
-                return {ErrorMsg{ErrorCode::SchemaMismatch,
+                return {tagged(Message{ErrorMsg{ErrorCode::SchemaMismatch,
                     "schema mismatch: replica=" +
                     std::to_string(hello.schema_version) +
                     " master=" + std::to_string(my_sv),
                     my_sv,
-                    detail::get_schema_sql(db, filter())}};
+                    detail::get_schema_sql(db, filter())}})};
             }
         }
 
@@ -1498,18 +1517,46 @@ struct Master::Impl {
             hs_state = HSState::Live;
             SQLPIPE_LOG(config.on_log, LogLevel::Info,
                         "hello ok, seq match ({}), skipping diff sync", seq);
-            return {HelloMsg{kProtocolVersion, my_sv, {}, seq}};
+            return {tagged(Message{HelloMsg{kProtocolVersion, my_sv, {}, seq}})};
+        }
+
+        // Queue replay: if replica's seq is behind but still within our
+        // changeset queue, replay the queued changesets instead of
+        // running full diff sync. Send HelloMsg with last_seq matching
+        // the replica's seq so it triggers fast reconnect to Live,
+        // then the queued changesets apply in Live state.
+        if (hello.last_seq > 0 && !changeset_queue.empty() &&
+            hello.last_seq >= changeset_queue.front().seq - 1) {
+            // Find the first changeset after the replica's seq.
+            std::vector<OutMessage> result;
+            result.push_back(tagged(Message{
+                HelloMsg{kProtocolVersion, my_sv, {}, hello.last_seq}}));
+            std::size_t replayed = 0;
+            for (const auto& qc : changeset_queue) {
+                if (qc.seq > hello.last_seq) {
+                    result.push_back(tagged(Message{
+                        ChangesetMsg{qc.seq, qc.data}}));
+                    ++replayed;
+                }
+            }
+            if (replayed > 0) {
+                hs_state = HSState::Live;
+                SQLPIPE_LOG(config.on_log, LogLevel::Info,
+                            "queue replay: {} changesets (seq {}→{})",
+                            replayed, hello.last_seq + 1, seq);
+                return result;
+            }
         }
 
         hs_state = HSState::WaitBucketHashes;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "hello ok, waiting for bucket hashes");
-        return {HelloMsg{kProtocolVersion, my_sv, {}, -1}};
+        return {tagged(Message{HelloMsg{kProtocolVersion, my_sv, {}, -1}})};
     }
 
-    std::vector<Message> handle_bucket_hashes(const BucketHashesMsg& msg) {
+    std::vector<OutMessage> handle_bucket_hashes(const BucketHashesMsg& msg) {
         if (hs_state != HSState::WaitBucketHashes) {
-            return {ErrorMsg{ErrorCode::InvalidState,
-                "unexpected BucketHashesMsg"}};
+            return {tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "unexpected BucketHashesMsg"}})};
         }
 
         // Compute our own bucket hashes.
@@ -1597,20 +1644,20 @@ struct Master::Impl {
             // All buckets match. Skip row-hash exchange.
             hs_state = HSState::Live;
             SQLPIPE_LOG(config.on_log, LogLevel::Info, "all buckets match, entering live at seq={}", seq);
-            return {NeedBucketsMsg{},
-                    DiffReadyMsg{seq, {}, {}}};
+            return {tagged(Message{NeedBucketsMsg{}}),
+                    tagged(Message{DiffReadyMsg{seq, {}, {}}})};
         }
 
         pending_ranges = need.ranges;
         hs_state = HSState::WaitRowHashes;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "{} mismatched bucket ranges", need.ranges.size());
-        return {std::move(need)};
+        return {tagged(Message{std::move(need)})};
     }
 
-    std::vector<Message> handle_row_hashes(const RowHashesMsg& msg) {
+    std::vector<OutMessage> handle_row_hashes(const RowHashesMsg& msg) {
         if (hs_state != HSState::WaitRowHashes) {
-            return {ErrorMsg{ErrorCode::InvalidState,
-                "unexpected RowHashesMsg"}};
+            return {tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "unexpected RowHashesMsg"}})};
         }
 
         // Build map of replica's rows: table → (rowid → hash).
@@ -1718,7 +1765,7 @@ struct Master::Impl {
         pending_ranges.clear();
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "diff computed, entering live at seq={}", seq);
 
-        return {DiffReadyMsg{seq, std::move(combined), std::move(deletes)}};
+        return {tagged(Message{DiffReadyMsg{seq, std::move(combined), std::move(deletes)}})};
     }
 };
 
@@ -1746,7 +1793,7 @@ void Master::exec(const std::string& sql) {
     }
 }
 
-std::vector<Message> Master::flush() {
+std::vector<OutMessage> Master::flush() {
     // If DDL ran since last flush, the tracked table set may have changed.
     auto sv = detail::compute_schema_fingerprint(impl_->db, impl_->filter());
     if (sv != impl_->cached_sv) {
@@ -1765,11 +1812,13 @@ std::vector<Message> Master::flush() {
 
     SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "flushed changeset seq={} ({} bytes)", impl_->seq, cs.size());
 
-    return {ChangesetMsg{impl_->seq, std::move(cs)}};
+    impl_->enqueue_changeset(impl_->seq, cs);
+
+    return {tagged(Message{ChangesetMsg{impl_->seq, std::move(cs)}})};
 }
 
-std::vector<Message> Master::handle_message(const Message& msg) {
-    return std::visit([&](const auto& m) -> std::vector<Message> {
+std::vector<OutMessage> Master::handle_message(const Message& msg) {
+    return std::visit([&](const auto& m) -> std::vector<OutMessage> {
         using T = std::decay_t<decltype(m)>;
 
         if constexpr (std::is_same_v<T, HelloMsg>) {
@@ -1786,8 +1835,8 @@ std::vector<Message> Master::handle_message(const Message& msg) {
             return {};
         }
         else {
-            return {ErrorMsg{ErrorCode::InvalidState,
-                "unexpected message from replica"}};
+            return {tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "unexpected message from replica"}})};
         }
     }, msg);
 }
@@ -2083,13 +2132,13 @@ struct Replica::Impl {
     HandleResult handle_hello_from_master(const HelloMsg& m) {
         if (state != Replica::State::Handshake) {
             state = Replica::State::Error;
-            return {{ErrorMsg{ErrorCode::InvalidState,
-                "received HelloMsg in unexpected state"}}, {}, {}};
+            return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "received HelloMsg in unexpected state"}})}, {}, {}};
         }
         if (m.protocol_version != kProtocolVersion) {
             state = Replica::State::Error;
-            return {{ErrorMsg{ErrorCode::ProtocolError,
-                "unsupported protocol version"}}, {}, {}};
+            return {{tagged(Message{ErrorMsg{ErrorCode::ProtocolError,
+                "unsupported protocol version"}})}, {}, {}};
         }
 
         // Fast reconnect: master confirmed seq match — skip to Live.
@@ -2097,7 +2146,7 @@ struct Replica::Impl {
             state = Replica::State::Live;
             SQLPIPE_LOG(config.on_log, LogLevel::Info,
                         "fast reconnect: seq match ({}), skipping diff sync", seq);
-            return {{AckMsg{seq}}, {}, {}};
+            return {{tagged(Message{AckMsg{seq}})}, {}, {}};
         }
 
         // Compute bucket hashes and send to master.
@@ -2109,14 +2158,14 @@ struct Replica::Impl {
                static_cast<std::int64_t>(buckets.size()));
         state = Replica::State::DiffBuckets;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "sending {} bucket hashes", buckets.size());
-        return {{BucketHashesMsg{std::move(buckets)}}, {}, {}};
+        return {{tagged(Message{BucketHashesMsg{std::move(buckets)}})}, {}, {}};
     }
 
     HandleResult handle_need_buckets(const NeedBucketsMsg& m) {
         if (state != Replica::State::DiffBuckets) {
             state = Replica::State::Error;
-            return {{ErrorMsg{ErrorCode::InvalidState,
-                "received NeedBucketsMsg in unexpected state"}}, {}, {}};
+            return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "received NeedBucketsMsg in unexpected state"}})}, {}, {}};
         }
 
         state = Replica::State::DiffRows;
@@ -2172,15 +2221,15 @@ struct Replica::Impl {
         }
 
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "sending row hashes for {} ranges", m.ranges.size());
-        return {{std::move(rh)}, {}, {}};
+        return {{tagged(Message{std::move(rh)})}, {}, {}};
     }
 
     HandleResult handle_diff_ready(const DiffReadyMsg& m) {
         if (state != Replica::State::DiffRows &&
             state != Replica::State::DiffBuckets) {
             state = Replica::State::Error;
-            return {{ErrorMsg{ErrorCode::InvalidState,
-                "received DiffReadyMsg in unexpected state"}}, {}, {}};
+            return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "received DiffReadyMsg in unexpected state"}})}, {}, {}};
         }
 
         std::vector<ChangeEvent> events;
@@ -2269,7 +2318,7 @@ struct Replica::Impl {
         state = Replica::State::Live;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "diff applied, entering live at seq={}", seq);
 
-        return {{AckMsg{m.seq}}, std::move(events), {}};
+        return {{tagged(Message{AckMsg{m.seq}})}, std::move(events), {}};
     }
 };
 
@@ -2284,13 +2333,13 @@ Replica::~Replica() = default;
 Replica::Replica(Replica&&) noexcept = default;
 Replica& Replica::operator=(Replica&&) noexcept = default;
 
-Message Replica::hello() const {
+OutMessage Replica::hello() const {
     impl_->state = State::Handshake;
     const auto* f = impl_->config.table_filter
         ? &*impl_->config.table_filter : nullptr;
-    return HelloMsg{kProtocolVersion,
+    return tagged(Message{HelloMsg{kProtocolVersion,
                     detail::compute_schema_fingerprint(impl_->db, f), {},
-                    impl_->seq};
+                    impl_->seq}});
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
@@ -2319,12 +2368,12 @@ HandleResult Replica::handle_message(const Message& msg) {
         else if constexpr (std::is_same_v<T, ChangesetMsg>) {
             if (impl_->state != State::Live) {
                 impl_->state = State::Error;
-                return {{ErrorMsg{ErrorCode::InvalidState,
-                    "received ChangesetMsg in unexpected state"}}, {}, {}};
+                return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                    "received ChangesetMsg in unexpected state"}})}, {}, {}};
             }
             auto events = impl_->apply_changeset(m.data, m.seq);
             SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "applied changeset seq={}", m.seq);
-            return {{AckMsg{m.seq}}, std::move(events), {}};
+            return {{tagged(Message{AckMsg{m.seq}})}, std::move(events), {}};
         }
         else if constexpr (std::is_same_v<T, ErrorMsg>) {
             if (m.code == ErrorCode::SchemaMismatch) {
@@ -2356,8 +2405,8 @@ HandleResult Replica::handle_message(const Message& msg) {
             return {};
         }
         else {
-            return {{ErrorMsg{ErrorCode::InvalidState,
-                "unexpected message type from master"}}, {}, {}};
+            return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "unexpected message type from master"}})}, {}, {}};
         }
     }, msg);
 
@@ -2410,12 +2459,12 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
             else if constexpr (std::is_same_v<T, ChangesetMsg>) {
                 if (impl_->state != State::Live) {
                     impl_->state = State::Error;
-                    return {{ErrorMsg{ErrorCode::InvalidState,
-                        "received ChangesetMsg in unexpected state"}}, {}, {}};
+                    return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                        "received ChangesetMsg in unexpected state"}})}, {}, {}};
                 }
                 auto events = impl_->apply_changeset(m.data, m.seq);
                 SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "applied changeset seq={}", m.seq);
-                return {{AckMsg{m.seq}}, std::move(events), {}};
+                return {{tagged(Message{AckMsg{m.seq}})}, std::move(events), {}};
             }
             else if constexpr (std::is_same_v<T, ErrorMsg>) {
                 if (m.code == ErrorCode::SchemaMismatch) {
@@ -2445,8 +2494,8 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
                 return {};
             }
             else {
-                return {{ErrorMsg{ErrorCode::InvalidState,
-                    "unexpected message type from master"}}, {}, {}};
+                return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                    "unexpected message type from master"}})}, {}, {}};
             }
         }, msg);
 
@@ -2690,10 +2739,10 @@ struct Peer::Impl {
                 // Ownership negotiation.
                 if (hello->owned_tables.empty()) {
                     state = Peer::State::Error;
-                    result.messages.push_back(PeerMessage{
+                    result.messages.push_back(tagged(PeerMessage{
                         SenderRole::AsMaster,
                         ErrorMsg{ErrorCode::ProtocolError,
-                                 "peer hello must include owned_tables"}});
+                                 "peer hello must include owned_tables"}}));
                     return result;
                 }
 
@@ -2703,11 +2752,11 @@ struct Peer::Impl {
                         if (config.table_filter->find(t) ==
                                 config.table_filter->end()) {
                             state = Peer::State::Error;
-                            result.messages.push_back(PeerMessage{
+                            result.messages.push_back(tagged(PeerMessage{
                                 SenderRole::AsMaster,
                                 ErrorMsg{ErrorCode::OwnershipRejected,
                                     "table '" + t +
-                                    "' is not in table_filter"}});
+                                    "' is not in table_filter"}}));
                             return result;
                         }
                     }
@@ -2716,10 +2765,10 @@ struct Peer::Impl {
                 if (config.approve_ownership) {
                     if (!config.approve_ownership(hello->owned_tables)) {
                         state = Peer::State::Error;
-                        result.messages.push_back(PeerMessage{
+                        result.messages.push_back(tagged(PeerMessage{
                             SenderRole::AsMaster,
                             ErrorMsg{ErrorCode::OwnershipRejected,
-                                     "ownership request rejected"}});
+                                     "ownership request rejected"}}));
                         return result;
                     }
                 }
@@ -2740,21 +2789,23 @@ struct Peer::Impl {
                 patched.last_seq = -1;  // Peer directions use different seq keys
 
                 auto master_resp = master->handle_message(patched);
-                for (auto& m : master_resp) {
-                    if (std::holds_alternative<DiffReadyMsg>(m)) {
+                for (auto& om : master_resp) {
+                    if (std::holds_alternative<DiffReadyMsg>(om.msg)) {
                         master_handshake_done = true;
                     }
-                    result.messages.push_back(
-                        PeerMessage{SenderRole::AsMaster, std::move(m)});
+                    result.messages.push_back(PeerOutMessage{
+                        PeerMessage{SenderRole::AsMaster, std::move(om.msg)},
+                        om.delivery});
                 }
 
                 // Also initiate our Replica's hello (to sync their tables).
                 auto our_hello = replica->hello();
-                auto& h = std::get<HelloMsg>(our_hello);
+                auto& h = std::get<HelloMsg>(our_hello.msg);
                 h.owned_tables = my_tables;
                 h.last_seq = -1;  // Peer directions use different seq keys
-                result.messages.push_back(
-                    PeerMessage{SenderRole::AsReplica, std::move(our_hello)});
+                result.messages.push_back(PeerOutMessage{
+                    PeerMessage{SenderRole::AsReplica, std::move(our_hello.msg)},
+                    our_hello.delivery});
 
                 check_live();
                 return result;
@@ -2763,20 +2814,21 @@ struct Peer::Impl {
 
         // Subsequent AsReplica messages → forward to Master.
         if (!master) {
-            result.messages.push_back(PeerMessage{
+            result.messages.push_back(tagged(PeerMessage{
                 SenderRole::AsMaster,
                 ErrorMsg{ErrorCode::InvalidState,
-                         "master not initialized"}});
+                         "master not initialized"}}));
             return result;
         }
 
         auto master_resp = master->handle_message(msg.payload);
-        for (auto& m : master_resp) {
-            if (std::holds_alternative<DiffReadyMsg>(m)) {
+        for (auto& om : master_resp) {
+            if (std::holds_alternative<DiffReadyMsg>(om.msg)) {
                 master_handshake_done = true;
             }
-            result.messages.push_back(
-                PeerMessage{SenderRole::AsMaster, std::move(m)});
+            result.messages.push_back(PeerOutMessage{
+                PeerMessage{SenderRole::AsMaster, std::move(om.msg)},
+                om.delivery});
         }
 
         check_live();
@@ -2787,10 +2839,10 @@ struct Peer::Impl {
         PeerHandleResult result;
 
         if (!replica) {
-            result.messages.push_back(PeerMessage{
+            result.messages.push_back(tagged(PeerMessage{
                 SenderRole::AsReplica,
                 ErrorMsg{ErrorCode::InvalidState,
-                         "replica not initialized"}});
+                         "replica not initialized"}}));
             return result;
         }
 
@@ -2807,9 +2859,10 @@ struct Peer::Impl {
 
         auto hr = replica->handle_message(forwarded);
 
-        for (auto& m : hr.messages) {
-            result.messages.push_back(
-                PeerMessage{SenderRole::AsReplica, std::move(m)});
+        for (auto& om : hr.messages) {
+            result.messages.push_back(PeerOutMessage{
+                PeerMessage{SenderRole::AsReplica, std::move(om.msg)},
+                om.delivery});
         }
         result.changes = std::move(hr.changes);
         result.subscriptions = std::move(hr.subscriptions);
@@ -2839,7 +2892,7 @@ Peer::~Peer() = default;
 Peer::Peer(Peer&&) noexcept = default;
 Peer& Peer::operator=(Peer&&) noexcept = default;
 
-std::vector<PeerMessage> Peer::start() {
+std::vector<PeerOutMessage> Peer::start() {
     if (impl_->state != State::Init) {
         throw Error(ErrorCode::InvalidState, "start() already called");
     }
@@ -2867,23 +2920,27 @@ std::vector<PeerMessage> Peer::start() {
     impl_->create_master();
     impl_->create_replica();
 
-    auto hello = impl_->replica->hello();
-    auto& h = std::get<HelloMsg>(hello);
+    auto hello_out = impl_->replica->hello();
+    auto& h = std::get<HelloMsg>(hello_out.msg);
     h.owned_tables = impl_->my_tables;
     h.last_seq = -1;  // Peer directions use different seq keys
 
-    return {PeerMessage{SenderRole::AsReplica, std::move(hello)}};
+    return {PeerOutMessage{
+        PeerMessage{SenderRole::AsReplica, std::move(hello_out.msg)},
+        hello_out.delivery}};
 }
 
-std::vector<PeerMessage> Peer::flush() {
+std::vector<PeerOutMessage> Peer::flush() {
     if (!impl_->master) return {};
     if (impl_->state != State::Live && impl_->state != State::Diffing) return {};
 
     auto msgs = impl_->master->flush();
-    std::vector<PeerMessage> result;
+    std::vector<PeerOutMessage> result;
     result.reserve(msgs.size());
-    for (auto& m : msgs) {
-        result.push_back(PeerMessage{SenderRole::AsMaster, std::move(m)});
+    for (auto& om : msgs) {
+        result.push_back(PeerOutMessage{
+            PeerMessage{SenderRole::AsMaster, std::move(om.msg)},
+            om.delivery});
     }
     return result;
 }
@@ -2934,17 +2991,17 @@ const std::set<std::string>& Peer::remote_tables() const {
 // ── Convenience utilities ────────────────────────────────────────
 
 void sync_handshake(Master& master, Replica& replica) {
-    auto pending = master.handle_message(replica.hello());
+    auto pending = master.handle_message(replica.hello().msg);
     while (!pending.empty()) {
-        std::vector<Message> for_master;
-        for (const auto& msg : pending) {
-            auto hr = replica.handle_message(msg);
+        std::vector<OutMessage> for_master;
+        for (const auto& out : pending) {
+            auto hr = replica.handle_message(out.msg);
             for_master.insert(for_master.end(),
                               hr.messages.begin(), hr.messages.end());
         }
         pending.clear();
-        for (const auto& msg : for_master) {
-            auto resp = master.handle_message(msg);
+        for (const auto& out : for_master) {
+            auto resp = master.handle_message(out.msg);
             pending.insert(pending.end(), resp.begin(), resp.end());
         }
     }
@@ -2984,9 +3041,9 @@ struct Relay::Impl {
 
     void broadcast() {
         auto msgs = master.flush();
-        for (auto& msg : msgs) {
+        for (auto& out : msgs) {
             for (auto& [_, cb] : sinks) {
-                cb(msg);
+                cb(out);
             }
         }
     }
@@ -3009,17 +3066,17 @@ void Relay::remove_sink(std::size_t id) {
     impl_->sinks.erase(id);
 }
 
-Message Relay::hello() {
+OutMessage Relay::hello() {
     return impl_->replica.hello();
 }
 
-std::vector<Message> Relay::handle_upstream(const Message& msg) {
+std::vector<OutMessage> Relay::handle_upstream(const Message& msg) {
     auto hr = impl_->replica.handle_message(msg);
     impl_->broadcast();
     return std::move(hr.messages);
 }
 
-std::vector<Message> Relay::handle_downstream(const Message& msg) {
+std::vector<OutMessage> Relay::handle_downstream(const Message& msg) {
     return impl_->master.handle_message(msg);
 }
 
@@ -3042,15 +3099,15 @@ void sync_handshake(Peer& client, Peer& server) {
     while (!pending_for_server.empty() ||
            client.state() != Peer::State::Live ||
            server.state() != Peer::State::Live) {
-        std::vector<PeerMessage> pending_for_client;
-        for (const auto& msg : pending_for_server) {
-            auto hr = server.handle_message(msg);
+        std::vector<PeerOutMessage> pending_for_client;
+        for (const auto& pout : pending_for_server) {
+            auto hr = server.handle_message(pout.msg);
             pending_for_client.insert(pending_for_client.end(),
                                       hr.messages.begin(), hr.messages.end());
         }
         pending_for_server.clear();
-        for (const auto& msg : pending_for_client) {
-            auto hr = client.handle_message(msg);
+        for (const auto& pout : pending_for_client) {
+            auto hr = client.handle_message(pout.msg);
             pending_for_server.insert(pending_for_server.end(),
                                       hr.messages.begin(), hr.messages.end());
         }
@@ -3063,16 +3120,16 @@ void sync_handshake(Peer& client, Peer& server) {
 }
 
 void sync_handshake(Master& master, Relay& relay) {
-    auto pending = master.handle_message(relay.hello());
+    auto pending = master.handle_message(relay.hello().msg);
     while (!pending.empty()) {
-        std::vector<Message> for_master;
-        for (const auto& msg : pending) {
-            auto resp = relay.handle_upstream(msg);
+        std::vector<OutMessage> for_master;
+        for (const auto& out : pending) {
+            auto resp = relay.handle_upstream(out.msg);
             for_master.insert(for_master.end(), resp.begin(), resp.end());
         }
         pending.clear();
-        for (const auto& msg : for_master) {
-            auto resp = master.handle_message(msg);
+        for (const auto& out : for_master) {
+            auto resp = master.handle_message(out.msg);
             pending.insert(pending.end(), resp.begin(), resp.end());
         }
     }

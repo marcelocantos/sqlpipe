@@ -165,25 +165,28 @@ func deserializeHello(r *reader) (HelloMsg, error) {
 	if err != nil {
 		return HelloMsg{}, err
 	}
-	m := HelloMsg{ProtocolVersion: pv, SchemaVersion: SchemaVersion(sv)}
-	if !r.atEnd() {
-		count, err := r.readU32()
+	m := HelloMsg{ProtocolVersion: pv, SchemaVersion: SchemaVersion(sv), LastSeq: -1}
+	count, err := r.readU32()
+	if err != nil {
+		return HelloMsg{}, err
+	}
+	if err := checkCount(count); err != nil {
+		return HelloMsg{}, err
+	}
+	m.OwnedTables = make([]string, count)
+	for i := uint32(0); i < count; i++ {
+		s, err := r.readString()
 		if err != nil {
 			return HelloMsg{}, err
 		}
-		if err := checkCount(count); err != nil {
-			return HelloMsg{}, err
-		}
-		m.OwnedTables = make([]string, count)
-		for i := uint32(0); i < count; i++ {
-			s, err := r.readString()
-			if err != nil {
-				return HelloMsg{}, err
-			}
-			m.OwnedTables[i] = s
-		}
-		sort.Strings(m.OwnedTables)
+		m.OwnedTables[i] = s
 	}
+	sort.Strings(m.OwnedTables)
+	lastSeq, err := r.readI64()
+	if err != nil {
+		return HelloMsg{}, err
+	}
+	m.LastSeq = Seq(lastSeq)
 	return m, nil
 }
 
