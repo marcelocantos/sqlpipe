@@ -106,7 +106,8 @@
   - Tests verify subscriptions fire through Peer after bidirectional sync
   - Go wrapper, Wasm C API, and TypeScript wrapper updated
 - **Context**: Discovered by an agent using sqlpipe. Peer wraps Master+Replica but doesn't expose the Replica's subscription API, forcing users to manage a separate QueryWatch.
-- **Status**: close — C++ API, Wasm C API, and TypeScript wrapper done; Go wrapper missing Peer.Subscribe/Unsubscribe and PeerHandleResult.Subscriptions
+- **Status**: achieved
+- **Achieved**: 2026-03-30
 - **Discovered**: 2026-03-15
 
 ### 🎯T6 Go wrapper is self-contained (no mattn/go-sqlite3 dependency)
