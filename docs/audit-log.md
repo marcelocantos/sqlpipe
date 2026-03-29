@@ -87,3 +87,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `b7f1b08`
 - **Outcome**: Released v0.14.0. Protocol v6 (fast reconnect), explicit PeerRole, prediction API, seq continuity check, Relay class, fan-out and chain replication tests.
+
+## 2026-03-30 — /release v0.15.0
+
+- **Commit**: `5e25bd8`
+- **Outcome**: Released v0.15.0. Transport delivery hints (OutMessage/PeerOutMessage), changeset queue for fast reconnect replay, predicate-aware subscription invalidation via relational algebra and bytecode VM, liteparser integration, column relevance tracking, SQL three-valued NULL semantics. STABILITY.md updated, NOTICES updated for liteparser.
