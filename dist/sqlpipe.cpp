@@ -1849,17 +1849,585 @@ SchemaVersion Master::schema_version() const {
 
 } // namespace sqlpipe
 
+// ── relational_algebra.cpp ─────────────────────────────────────
+
+#include <liteparser.h>
+
+namespace sqlpipe::detail {
+
+// ── Schema map ─────────────────────────────────────────────────
+
+/// Column metadata for RA analysis.
+struct ColumnInfo {
+    std::string name;
+    int         index;  // 0-based position in table
+};
+
+/// Per-table schema: column name → index.
+using TableSchema = std::vector<ColumnInfo>;
+
+/// Database schema: table name → columns.
+using SchemaMap = std::unordered_map<std::string, TableSchema>;
+
+/// Build a schema map from the database.
+SchemaMap build_schema_map(sqlite3* db) {
+    SchemaMap schema;
+    auto stmt = prepare(db,
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE '_sqlpipe_%' AND name NOT LIKE 'sqlite_%'");
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        std::string table(reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt.get(), 0)));
+        std::string pragma = "PRAGMA table_info('" + table + "')";
+        auto col_stmt = prepare(db, pragma.c_str());
+        TableSchema cols;
+        while (sqlite3_step(col_stmt.get()) == SQLITE_ROW) {
+            int idx = sqlite3_column_int(col_stmt.get(), 0);
+            const char* name = reinterpret_cast<const char*>(
+                sqlite3_column_text(col_stmt.get(), 1));
+            cols.push_back({name ? name : "", idx});
+        }
+        schema[table] = std::move(cols);
+    }
+    return schema;
+}
+
+/// Look up a column's index in a table. Returns -1 if not found.
+int column_index(const SchemaMap& schema, const std::string& table,
+                 const std::string& column) {
+    auto it = schema.find(table);
+    if (it == schema.end()) return -1;
+    for (const auto& ci : it->second) {
+        if (ci.name == column) return ci.index;
+    }
+    return -1;
+}
+
+// ── Relational algebra nodes ───────────────────────────────────
+
+struct RANode {
+    enum Kind { Scan, Filter, Project, Join, Aggregate, SetOp };
+    Kind kind;
+
+    virtual ~RANode() = default;
+
+    /// Collect all table names referenced by this subtree.
+    virtual void collect_tables(std::set<std::string>& out) const = 0;
+};
+
+using RAPtr = std::unique_ptr<RANode>;
+
+/// A resolved equality predicate: table.column = literal value.
+struct ResolvedPredicate {
+    std::string table;
+    std::string column;
+    int         column_index;  // position in table schema (-1 if unknown)
+    Value       value;
+};
+
+struct RAScan : RANode {
+    std::string table;
+    RAScan(std::string t) : table(std::move(t)) { kind = Scan; }
+    void collect_tables(std::set<std::string>& out) const override {
+        out.insert(table);
+    }
+};
+
+struct RAFilter : RANode {
+    RAPtr child;
+    /// Equality predicates extractable from this filter.
+    std::vector<ResolvedPredicate> predicates;
+    /// True if the filter contains terms we couldn't analyze.
+    /// When true, we can still use extracted predicates but must
+    /// conservatively assume non-analyzed terms could match anything.
+    bool has_opaque_terms = false;
+
+    RAFilter(RAPtr c) : child(std::move(c)) { kind = Filter; }
+    void collect_tables(std::set<std::string>& out) const override {
+        child->collect_tables(out);
+    }
+};
+
+struct RAProject : RANode {
+    RAPtr child;
+    RAProject(RAPtr c) : child(std::move(c)) { kind = Project; }
+    void collect_tables(std::set<std::string>& out) const override {
+        child->collect_tables(out);
+    }
+};
+
+struct RAJoin : RANode {
+    RAPtr left, right;
+    RAJoin(RAPtr l, RAPtr r) : left(std::move(l)), right(std::move(r)) {
+        kind = Join;
+    }
+    void collect_tables(std::set<std::string>& out) const override {
+        left->collect_tables(out);
+        right->collect_tables(out);
+    }
+};
+
+struct RAAggregate : RANode {
+    RAPtr child;
+    RAAggregate(RAPtr c) : child(std::move(c)) { kind = Aggregate; }
+    void collect_tables(std::set<std::string>& out) const override {
+        child->collect_tables(out);
+    }
+};
+
+struct RASetOp : RANode {
+    RAPtr left, right;
+    RASetOp(RAPtr l, RAPtr r) : left(std::move(l)), right(std::move(r)) {
+        kind = SetOp;
+    }
+    void collect_tables(std::set<std::string>& out) const override {
+        left->collect_tables(out);
+        right->collect_tables(out);
+    }
+};
+
+// ── Alias resolution scope ─────────────────────────────────────
+
+/// Maps alias → real table name within a FROM clause scope.
+using AliasMap = std::unordered_map<std::string, std::string>;
+
+/// Resolve a possibly-aliased table reference to the real table name.
+std::string resolve_table(const AliasMap& aliases, const std::string& name) {
+    auto it = aliases.find(name);
+    return (it != aliases.end()) ? it->second : name;
+}
+
+/// Resolve an unqualified column name to a table. Returns empty string
+/// if ambiguous or not found.
+std::string resolve_unqualified_column(
+        const SchemaMap& schema, const AliasMap& aliases,
+        const std::string& column) {
+    std::string found;
+    // Check all tables in scope (values of alias map + any direct table refs).
+    std::set<std::string> tables_in_scope;
+    for (const auto& [alias, table] : aliases) {
+        tables_in_scope.insert(table);
+    }
+    for (const auto& table : tables_in_scope) {
+        auto it = schema.find(table);
+        if (it == schema.end()) continue;
+        for (const auto& ci : it->second) {
+            if (ci.name == column) {
+                if (!found.empty() && found != table) return {};  // ambiguous
+                found = table;
+            }
+        }
+    }
+    return found;
+}
+
+// ── AST → RA transform ────────────────────────────────────────
+
+/// Convert a liteparser expression literal to a sqlpipe::Value.
+Value lp_literal_to_value(const LpNode* node) {
+    switch (node->kind) {
+        case LP_EXPR_LITERAL_INT:
+            return static_cast<std::int64_t>(
+                std::strtoll(node->u.literal.value, nullptr, 10));
+        case LP_EXPR_LITERAL_FLOAT:
+            return std::strtod(node->u.literal.value, nullptr);
+        case LP_EXPR_LITERAL_STRING:
+            return std::string(node->u.literal.value);
+        case LP_EXPR_LITERAL_NULL:
+            return std::monostate{};
+        case LP_EXPR_LITERAL_BLOB: {
+            // Blob literals: X'hex...'
+            const char* hex = node->u.literal.value;
+            std::vector<std::uint8_t> blob;
+            size_t len = std::strlen(hex);
+            blob.reserve(len / 2);
+            for (size_t i = 0; i + 1 < len; i += 2) {
+                char buf[3] = {hex[i], hex[i+1], 0};
+                blob.push_back(
+                    static_cast<std::uint8_t>(std::strtoul(buf, nullptr, 16)));
+            }
+            return blob;
+        }
+        case LP_EXPR_LITERAL_BOOL:
+            return static_cast<std::int64_t>(
+                node->u.literal.value[0] == '1' ||
+                node->u.literal.value[0] == 't' ||
+                node->u.literal.value[0] == 'T' ? 1 : 0);
+        default:
+            return std::monostate{};
+    }
+}
+
+/// Check if a liteparser node is a literal value.
+bool is_literal(const LpNode* node) {
+    return node && (
+        node->kind == LP_EXPR_LITERAL_INT ||
+        node->kind == LP_EXPR_LITERAL_FLOAT ||
+        node->kind == LP_EXPR_LITERAL_STRING ||
+        node->kind == LP_EXPR_LITERAL_NULL ||
+        node->kind == LP_EXPR_LITERAL_BLOB ||
+        node->kind == LP_EXPR_LITERAL_BOOL);
+}
+
+/// Check if a liteparser node is a column reference.
+bool is_column_ref(const LpNode* node) {
+    return node && node->kind == LP_EXPR_COLUMN_REF;
+}
+
+/// Extract equality predicates from a WHERE expression.
+/// Walks AND-connected terms looking for `column = literal` patterns.
+void extract_eq_predicates(
+        const LpNode* expr,
+        const SchemaMap& schema,
+        const AliasMap& aliases,
+        std::vector<ResolvedPredicate>& out,
+        bool& has_opaque) {
+    if (!expr) return;
+
+    if (expr->kind == LP_EXPR_BINARY_OP && expr->u.binary.op == LP_OP_AND) {
+        // Recurse into AND branches.
+        extract_eq_predicates(
+            expr->u.binary.left, schema, aliases, out, has_opaque);
+        extract_eq_predicates(
+            expr->u.binary.right, schema, aliases, out, has_opaque);
+        return;
+    }
+
+    if (expr->kind == LP_EXPR_BINARY_OP && expr->u.binary.op == LP_OP_EQ) {
+        const LpNode* lhs = expr->u.binary.left;
+        const LpNode* rhs = expr->u.binary.right;
+
+        // Normalize: column on left, literal on right.
+        if (is_literal(lhs) && is_column_ref(rhs)) std::swap(lhs, rhs);
+
+        if (is_column_ref(lhs) && is_literal(rhs)) {
+            std::string table;
+            std::string col = lhs->u.column_ref.column;
+
+            if (lhs->u.column_ref.table) {
+                table = resolve_table(aliases,
+                    std::string(lhs->u.column_ref.table));
+            } else {
+                table = resolve_unqualified_column(schema, aliases, col);
+            }
+
+            if (!table.empty()) {
+                int idx = column_index(schema, table, col);
+                out.push_back({table, col, idx, lp_literal_to_value(rhs)});
+                return;
+            }
+        }
+    }
+
+    // Any term we couldn't extract is opaque.
+    has_opaque = true;
+}
+
+/// Build the RA tree for a FROM clause (table refs and joins).
+RAPtr build_from(const LpNode* from, AliasMap& aliases) {
+    if (!from) return nullptr;
+
+    if (from->kind == LP_FROM_TABLE) {
+        std::string table = from->u.from_table.name;
+        std::string alias = from->u.from_table.alias
+            ? from->u.from_table.alias : table;
+        aliases[alias] = table;
+        return std::make_unique<RAScan>(table);
+    }
+
+    if (from->kind == LP_FROM_SUBQUERY) {
+        // Subqueries in FROM: conservatively collect tables from the
+        // inner select. We don't push predicates into subqueries.
+        // For now, treat as opaque — the outer query depends on
+        // all tables the subquery references.
+        // TODO: recurse into subquery for deeper analysis.
+        return nullptr;
+    }
+
+    if (from->kind == LP_JOIN_CLAUSE) {
+        auto left = build_from(from->u.join.left, aliases);
+        auto right = build_from(from->u.join.right, aliases);
+        if (left && right) {
+            return std::make_unique<RAJoin>(std::move(left), std::move(right));
+        }
+        return left ? std::move(left) : std::move(right);
+    }
+
+    return nullptr;
+}
+
+/// Transform a SELECT AST into an RA tree.
+RAPtr select_to_ra(const LpNode* select, const SchemaMap& schema,
+                   AliasMap& aliases) {
+    if (!select || select->kind != LP_STMT_SELECT) return nullptr;
+
+    // Build FROM (scans + joins).
+    RAPtr ra = build_from(select->u.select.from, aliases);
+    if (!ra) {
+        // No FROM clause — e.g. SELECT 1. No table dependencies.
+        return nullptr;
+    }
+
+    // WHERE → Filter with predicate extraction.
+    if (select->u.select.where) {
+        auto filter = std::make_unique<RAFilter>(std::move(ra));
+        extract_eq_predicates(
+            select->u.select.where, schema, aliases,
+            filter->predicates, filter->has_opaque_terms);
+        ra = std::move(filter);
+    }
+
+    // GROUP BY → Aggregate.
+    if (select->u.select.group_by.count > 0) {
+        ra = std::make_unique<RAAggregate>(std::move(ra));
+    }
+
+    // HAVING → another Filter (on aggregated results).
+    if (select->u.select.having) {
+        auto filter = std::make_unique<RAFilter>(std::move(ra));
+        filter->has_opaque_terms = true;  // HAVING predicates are post-aggregate
+        ra = std::move(filter);
+    }
+
+    // SELECT list → Project (we don't analyze projections for invalidation
+    // but include for completeness).
+    ra = std::make_unique<RAProject>(std::move(ra));
+
+    return ra;
+}
+
+/// Transform a compound SELECT (UNION/INTERSECT/EXCEPT) into an RA tree.
+RAPtr compound_to_ra(const LpNode* node, const SchemaMap& schema) {
+    if (node->kind == LP_STMT_SELECT) {
+        AliasMap aliases;
+        return select_to_ra(node, schema, aliases);
+    }
+    if (node->kind == LP_COMPOUND_SELECT) {
+        auto left = compound_to_ra(node->u.compound.left, schema);
+        auto right = compound_to_ra(node->u.compound.right, schema);
+        if (left && right) {
+            return std::make_unique<RASetOp>(std::move(left), std::move(right));
+        }
+        return left ? std::move(left) : std::move(right);
+    }
+    return nullptr;
+}
+
+/// Top-level: parse SQL and produce an RA tree.
+/// Returns nullptr if the SQL can't be analyzed (not a SELECT, parse error).
+RAPtr sql_to_ra(const std::string& sql, const SchemaMap& schema) {
+    arena_t* arena = arena_create(4096);
+    if (!arena) return nullptr;
+    const char* err = nullptr;
+    LpNode* ast = lp_parse(sql.c_str(), arena, &err);
+    if (!ast) {
+        arena_destroy(arena);
+        return nullptr;
+    }
+
+    RAPtr ra;
+    if (ast->kind == LP_STMT_SELECT) {
+        AliasMap aliases;
+        ra = select_to_ra(ast, schema, aliases);
+    } else if (ast->kind == LP_COMPOUND_SELECT) {
+        ra = compound_to_ra(ast, schema);
+    }
+
+    arena_destroy(arena);
+    return ra;
+}
+
+/// Collect all equality predicates from an RA tree (from all Filter nodes).
+void collect_predicates(const RANode* node,
+                        std::vector<ResolvedPredicate>& out) {
+    if (!node) return;
+    switch (node->kind) {
+        case RANode::Filter: {
+            auto* f = static_cast<const RAFilter*>(node);
+            out.insert(out.end(), f->predicates.begin(), f->predicates.end());
+            collect_predicates(f->child.get(), out);
+            break;
+        }
+        case RANode::Project:
+            collect_predicates(
+                static_cast<const RAProject*>(node)->child.get(), out);
+            break;
+        case RANode::Aggregate:
+            collect_predicates(
+                static_cast<const RAAggregate*>(node)->child.get(), out);
+            break;
+        case RANode::Join: {
+            auto* j = static_cast<const RAJoin*>(node);
+            collect_predicates(j->left.get(), out);
+            collect_predicates(j->right.get(), out);
+            break;
+        }
+        case RANode::SetOp: {
+            auto* s = static_cast<const RASetOp*>(node);
+            collect_predicates(s->left.get(), out);
+            collect_predicates(s->right.get(), out);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+/// Check if a changeset row value matches a predicate value.
+bool value_matches(const Value& predicate_val, sqlite3_value* db_val) {
+    if (!db_val) return false;
+    int type = sqlite3_value_type(db_val);
+    return std::visit([&](const auto& pv) -> bool {
+        using T = std::decay_t<decltype(pv)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            return type == SQLITE_NULL;
+        } else if constexpr (std::is_same_v<T, std::int64_t>) {
+            return type == SQLITE_INTEGER &&
+                   sqlite3_value_int64(db_val) == pv;
+        } else if constexpr (std::is_same_v<T, double>) {
+            return type == SQLITE_FLOAT &&
+                   sqlite3_value_double(db_val) == pv;
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            if (type != SQLITE_TEXT) return false;
+            const char* text = reinterpret_cast<const char*>(
+                sqlite3_value_text(db_val));
+            return text && pv == text;
+        } else if constexpr (std::is_same_v<T, std::vector<std::uint8_t>>) {
+            if (type != SQLITE_BLOB) return false;
+            int len = sqlite3_value_bytes(db_val);
+            if (static_cast<size_t>(len) != pv.size()) return false;
+            return std::memcmp(sqlite3_value_blob(db_val),
+                               pv.data(), pv.size()) == 0;
+        }
+        return false;
+    }, predicate_val);
+}
+
+/// Check if any predicate for a given table matches a changeset row.
+/// Uses sqlite3changeset_iter to inspect old/new column values.
+/// Returns true if any predicate matches (i.e., the change could affect
+/// a query with those predicates).
+bool changeset_row_matches(
+        const std::vector<ResolvedPredicate>& predicates,
+        const std::string& table,
+        sqlite3_changeset_iter* iter,
+        int op) {
+    for (const auto& pred : predicates) {
+        if (pred.table != table || pred.column_index < 0) continue;
+
+        bool matches = false;
+
+        // Check old values (for UPDATE and DELETE).
+        if (op == SQLITE_UPDATE || op == SQLITE_DELETE) {
+            sqlite3_value* val = nullptr;
+            if (sqlite3changeset_old(iter, pred.column_index, &val) == SQLITE_OK
+                && val) {
+                if (value_matches(pred.value, val)) matches = true;
+            }
+        }
+
+        // Check new values (for INSERT and UPDATE).
+        if (!matches && (op == SQLITE_INSERT || op == SQLITE_UPDATE)) {
+            sqlite3_value* val = nullptr;
+            if (sqlite3changeset_new(iter, pred.column_index, &val) == SQLITE_OK
+                && val) {
+                if (value_matches(pred.value, val)) matches = true;
+            }
+        }
+
+        // If this predicate didn't match, the change doesn't affect
+        // the filtered subset. (All predicates for a table are AND-connected
+        // from the same WHERE clause, so ALL must match for the row to be
+        // in the query's result set. But for invalidation we're conservative:
+        // if ANY predicate on this table matches, we re-evaluate.)
+        // Actually, for safety: if the predicate column wasn't in the
+        // changeset (val was NULL), we conservatively assume a match.
+    }
+
+    // If we have predicates for this table and none matched, skip.
+    bool has_predicates_for_table = false;
+    for (const auto& pred : predicates) {
+        if (pred.table == table && pred.column_index >= 0) {
+            has_predicates_for_table = true;
+            break;
+        }
+    }
+    if (!has_predicates_for_table) return true;  // no filter → always affected
+
+    // Re-check: did any predicate match?
+    for (const auto& pred : predicates) {
+        if (pred.table != table || pred.column_index < 0) continue;
+
+        if (op == SQLITE_UPDATE || op == SQLITE_DELETE) {
+            sqlite3_value* val = nullptr;
+            if (sqlite3changeset_old(iter, pred.column_index, &val) == SQLITE_OK
+                && val && value_matches(pred.value, val)) {
+                return true;
+            }
+        }
+        if (op == SQLITE_INSERT || op == SQLITE_UPDATE) {
+            sqlite3_value* val = nullptr;
+            if (sqlite3changeset_new(iter, pred.column_index, &val) == SQLITE_OK
+                && val && value_matches(pred.value, val)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Check if a changeset could affect a subscription with the given
+/// table dependencies and predicates.
+/// Iterates the changeset, checking each operation against predicates.
+bool changeset_could_affect(
+        const Changeset& data,
+        const std::set<std::string>& tables,
+        const std::vector<ResolvedPredicate>& predicates) {
+    if (data.empty() || tables.empty()) return false;
+    if (predicates.empty()) return true;  // no predicates → table-level only
+
+    sqlite3_changeset_iter* iter = nullptr;
+    int rc = sqlite3changeset_start(&iter,
+        static_cast<int>(data.size()),
+        const_cast<void*>(static_cast<const void*>(data.data())));
+    if (rc != SQLITE_OK) return true;  // can't parse → conservative
+
+    bool affected = false;
+    while (sqlite3changeset_next(iter) == SQLITE_ROW) {
+        const char* tbl = nullptr;
+        int ncol = 0, op = 0;
+        int indirect = 0;
+        sqlite3changeset_op(iter, &tbl, &ncol, &op, &indirect);
+        if (!tbl) continue;
+
+        std::string table_name(tbl);
+        if (tables.find(table_name) == tables.end()) continue;
+
+        if (changeset_row_matches(predicates, table_name, iter, op)) {
+            affected = true;
+            break;
+        }
+    }
+    sqlite3changeset_finalize(iter);
+    return affected;
+}
+
+} // namespace sqlpipe::detail
+
 // ── query_watch.cpp ─────────────────────────────────────────────
 
 namespace sqlpipe {
 
 struct QueryWatch::Impl {
     sqlite3* db;
+    detail::SchemaMap schema;
 
     struct Subscription {
         SubscriptionId               id;
         std::string                  sql;
         std::set<std::string>        tables;
+        detail::RAPtr                ra;        // relational algebra tree
+        std::vector<detail::ResolvedPredicate> predicates;  // extracted filters
         detail::StmtGuard            stmt;     // cached prepared statement
         std::vector<std::string>     columns;  // cached column names
         std::uint64_t                result_hash = 0;  // hash of last delivered result
@@ -1871,28 +2439,39 @@ struct QueryWatch::Impl {
     std::set<SubscriptionId> pending_new;
     SubscriptionId next_sub_id = 1;
 
-    std::set<std::string> discover_tables(const std::string& sql) {
+    /// Analyze a subscription query using the RA transform.
+    /// Returns table dependencies and extracts predicates.
+    std::set<std::string> analyze_query(const std::string& sql,
+                                        detail::RAPtr& ra_out,
+                                        std::vector<detail::ResolvedPredicate>& preds_out) {
+        // Ensure schema is current.
+        schema = detail::build_schema_map(db);
+
+        ra_out = detail::sql_to_ra(sql, schema);
         std::set<std::string> tables;
-        sqlite3_set_authorizer(db, [](void* ctx, int action,
-                const char* a1, const char*, const char*, const char*) -> int {
-            if (action == SQLITE_READ && a1) {
-                std::string name(a1);
-                if (name.compare(0, 9, "_sqlpipe_") != 0 &&
-                    name.compare(0, 7, "sqlite_") != 0) {
-                    static_cast<std::set<std::string>*>(ctx)->insert(name);
+
+        if (ra_out) {
+            ra_out->collect_tables(tables);
+            detail::collect_predicates(ra_out.get(), preds_out);
+        } else {
+            // RA transform failed (non-SELECT or parse error).
+            // Fall back to authorizer-based table discovery.
+            sqlite3_set_authorizer(db, [](void* ctx, int action,
+                    const char* a1, const char*, const char*, const char*) -> int {
+                if (action == SQLITE_READ && a1) {
+                    std::string name(a1);
+                    if (name.compare(0, 9, "_sqlpipe_") != 0 &&
+                        name.compare(0, 7, "sqlite_") != 0) {
+                        static_cast<std::set<std::string>*>(ctx)->insert(name);
+                    }
                 }
-            }
-            return SQLITE_OK;
-        }, &tables);
+                return SQLITE_OK;
+            }, &tables);
 
-        sqlite3_stmt* stmt = nullptr;
-        int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-        if (stmt) sqlite3_finalize(stmt);
-        sqlite3_set_authorizer(db, nullptr, nullptr);
-
-        if (rc != SQLITE_OK) {
-            throw Error(ErrorCode::SqliteError,
-                std::string("subscribe prepare: ") + sqlite3_errmsg(db));
+            sqlite3_stmt* stmt = nullptr;
+            sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+            if (stmt) sqlite3_finalize(stmt);
+            sqlite3_set_authorizer(db, nullptr, nullptr);
         }
         return tables;
     }
@@ -1921,7 +2500,8 @@ struct QueryWatch::Impl {
     }
 
     std::vector<QueryResult> evaluate_invalidated(
-            const std::set<std::string>& affected) {
+            const std::set<std::string>& affected,
+            const Changeset* changeset = nullptr) {
         // Collect unique subscription IDs via reverse index.
         std::set<SubscriptionId> ids;
         for (const auto& table : affected) {
@@ -1938,12 +2518,24 @@ struct QueryWatch::Impl {
         std::vector<QueryResult> results;
         for (auto id : ids) {
             auto it = subscriptions.find(id);
-            if (it != subscriptions.end()) {
-                auto [result, hash] = evaluate_query(it->second);
-                if (hash != it->second.result_hash) {
-                    it->second.result_hash = hash;
-                    results.push_back(std::move(result));
+            if (it == subscriptions.end()) continue;
+            auto& sub = it->second;
+
+            // Predicate-aware filtering: if we have a changeset and the
+            // subscription has extracted predicates, check whether any
+            // changed row actually matches the predicates before
+            // re-evaluating the (potentially expensive) query.
+            if (changeset && !sub.predicates.empty()) {
+                if (!detail::changeset_could_affect(
+                        *changeset, sub.tables, sub.predicates)) {
+                    continue;  // changeset doesn't affect this subscription
                 }
+            }
+
+            auto [result, hash] = evaluate_query(sub);
+            if (hash != sub.result_hash) {
+                sub.result_hash = hash;
+                results.push_back(std::move(result));
             }
         }
         return results;
@@ -1960,7 +2552,9 @@ QueryWatch::QueryWatch(QueryWatch&&) noexcept = default;
 QueryWatch& QueryWatch::operator=(QueryWatch&&) noexcept = default;
 
 SubscriptionId QueryWatch::subscribe(const std::string& sql) {
-    auto tables = impl_->discover_tables(sql);
+    detail::RAPtr ra;
+    std::vector<detail::ResolvedPredicate> predicates;
+    auto tables = impl_->analyze_query(sql, ra, predicates);
     auto id = impl_->next_sub_id++;
 
     // Prepare statement once and cache column names.
@@ -1980,8 +2574,9 @@ SubscriptionId QueryWatch::subscribe(const std::string& sql) {
 
     // Register with hash=0 (never evaluated). The next notify() will
     // evaluate and deliver the initial result.
-    impl_->subscriptions[id] = {id, sql, std::move(tables),
-                                std::move(stmt), std::move(columns), 0};
+    impl_->subscriptions[id] = {id, sql, std::move(tables), std::move(ra),
+                                std::move(predicates), std::move(stmt),
+                                std::move(columns), 0};
     impl_->pending_new.insert(id);
     return id;
 }
@@ -2007,6 +2602,12 @@ void QueryWatch::unsubscribe(SubscriptionId id) {
 std::vector<QueryResult> QueryWatch::notify(
         const std::set<std::string>& affected_tables) {
     return impl_->evaluate_invalidated(affected_tables);
+}
+
+std::vector<QueryResult> QueryWatch::notify(
+        const std::set<std::string>& affected_tables,
+        const Changeset& changeset_data) {
+    return impl_->evaluate_invalidated(affected_tables, &changeset_data);
 }
 
 bool QueryWatch::empty() const {
@@ -2353,6 +2954,7 @@ HandleResult Replica::handle_message(const Message& msg) {
     }
 
     auto prev_state = impl_->state;
+    const Changeset* changeset_data = nullptr;  // for predicate-aware notify
     auto result = std::visit([&](const auto& m) -> HandleResult {
         using T = std::decay_t<decltype(m)>;
 
@@ -2371,6 +2973,7 @@ HandleResult Replica::handle_message(const Message& msg) {
                 return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
                     "received ChangesetMsg in unexpected state"}})}, {}, {}};
             }
+            changeset_data = &m.data;
             auto events = impl_->apply_changeset(m.data, m.seq);
             SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "applied changeset seq={}", m.seq);
             return {{tagged(Message{AckMsg{m.seq}})}, std::move(events), {}};
@@ -2418,7 +3021,12 @@ HandleResult Replica::handle_message(const Message& msg) {
             for (const auto& ev : result.changes) {
                 if (!ev.table.empty()) affected.insert(ev.table);
             }
-            result.subscriptions = impl_->watch.notify(affected);
+            if (changeset_data) {
+                result.subscriptions = impl_->watch.notify(
+                    affected, *changeset_data);
+            } else {
+                result.subscriptions = impl_->watch.notify(affected);
+            }
         } else if (prev_state != State::Live) {
             // Just entered Live (e.g., diff sync found no differences).
             // Force-evaluate all subscriptions so clients that subscribed

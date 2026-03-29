@@ -197,6 +197,12 @@ public:
     /// Returns results only for subscriptions whose output actually changed.
     std::vector<QueryResult> notify(const std::set<std::string>& affected_tables);
 
+    /// Re-evaluate subscriptions with predicate-aware filtering.
+    /// Subscriptions with extractable predicates skip re-evaluation when
+    /// the changeset doesn't contain matching rows.
+    std::vector<QueryResult> notify(const std::set<std::string>& affected_tables,
+                                    const Changeset& changeset_data);
+
     /// Returns true if there are no active subscriptions.
     bool empty() const;
 
