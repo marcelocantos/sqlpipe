@@ -179,4 +179,19 @@
 - **Discovered**: 2026-03-22
 - **Achieved**: 2026-03-22
 
+### 🎯T10 sqlpipe replicates over tern with dual-channel transport
+
+- **Weight**: 5 (value 13 / cost 8)
+- **Estimated-cost**: 8
+- **Acceptance**:
+  - Go integration layer connects sqlpipe's Go wrapper to tern's `Conn` API
+  - `Delivery::Reliable` messages route to `tern.Conn.Send()` (QUIC stream)
+  - `Delivery::BestEffort` messages route to `tern.Conn.SendDatagram()` (QUIC datagram)
+  - Changeset queue provides fast reconnect over the reliable channel
+  - Convergence loop runs over datagrams for loss-tolerant state sync
+  - End-to-end test: two Go processes replicate through a tern relay
+- **Context**: tern provides both reliable streams and unreliable datagrams over QUIC. sqlpipe's `OutMessage` delivery hints (shipped in v0.15.0) map directly to these channels. The convergence loop replaces the linear diff sync handshake with a continuous, loss-tolerant state comparison protocol — bucket hashes over datagrams, with the diff protocol regenerating on loss rather than requiring retransmission.
+- **Status**: identified
+- **Discovered**: 2026-03-30
+
 ## Achieved
