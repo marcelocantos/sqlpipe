@@ -3005,16 +3005,160 @@ RAPtr optimize_ra(RAPtr ra) {
     return ra;
 }
 
-// ── Predicate check engine ──────────────────────────────────────
+// ── Predicate VM ────────────────────────────────────────────────
+//
+// A small bytecode VM that evaluates subscription predicates against
+// changeset rows. Compiled once at subscribe time from the RA's
+// pushed-down Filter predicates. Evaluated per changeset row.
+//
+// The program is run twice per row — once against old values, once
+// against new values. If either run returns true, the subscription
+// is affected. This correctly handles AND semantics: all predicates
+// must match on the SAME row state (old or new), not across states.
 
-/// A single predicate check compiled from the RA.
-struct PredicateCheck {
-    CheckOp            op;
-    Value              value;   // for Eq/Ne/Lt/Le/Gt/Ge
-    std::vector<Value> values;  // for InList
+/// VM opcodes.
+enum class VMOp : std::uint8_t {
+    LoadCol,    // push column value; next byte = column index
+    ConstInt,   // push int64; next 8 bytes = value (LE)
+    ConstFloat, // push double; next 8 bytes = value (LE)
+    ConstStr,   // push string; next 2 bytes = length (LE), then chars
+    ConstNull,  // push null
+    ConstBlob,  // push blob; next 4 bytes = length (LE), then bytes
+    Eq,         // pop 2, push (a == b)
+    Ne,         // pop 2, push (a != b)
+    Lt,         // pop 2, push (a < b)
+    Le,         // pop 2, push (a <= b)
+    Gt,         // pop 2, push (a > b)
+    Ge,         // pop 2, push (a >= b)
+    IsNull,     // pop 1, push (a is null)
+    IsNotNull,  // pop 1, push (a is not null)
+    InList,     // next byte = count N; pop value + N items, push (value in items)
+    And,        // pop 2 bools, push (a && b)
+    Or,         // pop 2 bools, push (a || b)
+    Not,        // pop 1 bool, push (!a)
+    True,       // push true
+    Halt,       // stop; result = top of stack as bool
 };
 
-/// Convert a sqlite3_value to a sqlpipe::Value for comparison.
+/// A compiled predicate program for one (subscription, table) pair.
+using Program = std::vector<std::uint8_t>;
+
+/// Compilation: emit helpers.
+void emit_op(Program& p, VMOp op) { p.push_back(static_cast<uint8_t>(op)); }
+void emit_u8(Program& p, uint8_t v) { p.push_back(v); }
+void emit_u16(Program& p, uint16_t v) {
+    p.push_back(v & 0xFF); p.push_back((v >> 8) & 0xFF);
+}
+void emit_i64(Program& p, int64_t v) {
+    auto u = static_cast<uint64_t>(v);
+    for (int i = 0; i < 8; ++i) p.push_back((u >> (i * 8)) & 0xFF);
+}
+void emit_f64(Program& p, double v) {
+    uint64_t u;
+    std::memcpy(&u, &v, 8);
+    for (int i = 0; i < 8; ++i) p.push_back((u >> (i * 8)) & 0xFF);
+}
+
+/// Emit a constant value push.
+void emit_const(Program& p, const Value& val) {
+    std::visit([&](const auto& v) {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            emit_op(p, VMOp::ConstNull);
+        } else if constexpr (std::is_same_v<T, std::int64_t>) {
+            emit_op(p, VMOp::ConstInt);
+            emit_i64(p, v);
+        } else if constexpr (std::is_same_v<T, double>) {
+            emit_op(p, VMOp::ConstFloat);
+            emit_f64(p, v);
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            emit_op(p, VMOp::ConstStr);
+            emit_u16(p, static_cast<uint16_t>(v.size()));
+            p.insert(p.end(), v.begin(), v.end());
+        } else if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
+            emit_op(p, VMOp::ConstBlob);
+            uint32_t len = static_cast<uint32_t>(v.size());
+            for (int i = 0; i < 4; ++i)
+                p.push_back((len >> (i * 8)) & 0xFF);
+            p.insert(p.end(), v.begin(), v.end());
+        }
+    }, val);
+}
+
+/// Emit a single predicate check: [LoadCol col][const value][cmp op].
+void emit_predicate(Program& p, const ResolvedPredicate& pred) {
+    if (pred.column_index < 0) {
+        // Unknown column → conservative: always true.
+        emit_op(p, VMOp::True);
+        return;
+    }
+
+    switch (pred.op) {
+        case CheckOp::Eq: case CheckOp::Ne:
+        case CheckOp::Lt: case CheckOp::Le:
+        case CheckOp::Gt: case CheckOp::Ge:
+            emit_op(p, VMOp::LoadCol);
+            emit_u8(p, static_cast<uint8_t>(pred.column_index));
+            emit_const(p, pred.value);
+            switch (pred.op) {
+                case CheckOp::Eq: emit_op(p, VMOp::Eq); break;
+                case CheckOp::Ne: emit_op(p, VMOp::Ne); break;
+                case CheckOp::Lt: emit_op(p, VMOp::Lt); break;
+                case CheckOp::Le: emit_op(p, VMOp::Le); break;
+                case CheckOp::Gt: emit_op(p, VMOp::Gt); break;
+                case CheckOp::Ge: emit_op(p, VMOp::Ge); break;
+                default: break;
+            }
+            break;
+        case CheckOp::IsNull:
+            emit_op(p, VMOp::LoadCol);
+            emit_u8(p, static_cast<uint8_t>(pred.column_index));
+            emit_op(p, VMOp::IsNull);
+            break;
+        case CheckOp::IsNotNull:
+            emit_op(p, VMOp::LoadCol);
+            emit_u8(p, static_cast<uint8_t>(pred.column_index));
+            emit_op(p, VMOp::IsNotNull);
+            break;
+        case CheckOp::InList:
+            // Push the column value, then all list values, then InList.
+            emit_op(p, VMOp::LoadCol);
+            emit_u8(p, static_cast<uint8_t>(pred.column_index));
+            for (const auto& v : pred.values) emit_const(p, v);
+            emit_op(p, VMOp::InList);
+            emit_u8(p, static_cast<uint8_t>(pred.values.size()));
+            break;
+    }
+}
+
+/// Compile predicates for a specific table into a bytecode program.
+/// All predicates for the table are AND-connected.
+/// Returns an empty program if no predicates apply (= always affected).
+Program compile_predicates(
+        const std::vector<ResolvedPredicate>& predicates,
+        const std::string& table) {
+    // Collect predicates for this table.
+    std::vector<const ResolvedPredicate*> mine;
+    for (const auto& pred : predicates) {
+        if (pred.table == table && pred.column_index >= 0) {
+            mine.push_back(&pred);
+        }
+    }
+    if (mine.empty()) return {};  // no predicates → no program
+
+    Program prog;
+    emit_predicate(prog, *mine[0]);
+    for (size_t i = 1; i < mine.size(); ++i) {
+        emit_predicate(prog, *mine[i]);
+        emit_op(prog, VMOp::And);
+    }
+    emit_op(prog, VMOp::Halt);
+    return prog;
+}
+
+// ── VM evaluator ────────────────────────────────────────────────
+
+/// Convert a sqlite3_value to a sqlpipe::Value.
 Value sqlite3_value_to_value(sqlite3_value* v) {
     if (!v) return std::monostate{};
     switch (sqlite3_value_type(v)) {
@@ -3038,16 +3182,13 @@ Value sqlite3_value_to_value(sqlite3_value* v) {
 }
 
 /// Compare two Values. Returns <0, 0, >0 following SQLite affinity rules.
-/// NULL is less than everything.
 int compare_values(const Value& a, const Value& b) {
-    // Null handling.
     bool a_null = std::holds_alternative<std::monostate>(a);
     bool b_null = std::holds_alternative<std::monostate>(b);
     if (a_null && b_null) return 0;
     if (a_null) return -1;
     if (b_null) return 1;
 
-    // Same-type comparison.
     if (auto* ai = std::get_if<std::int64_t>(&a)) {
         if (auto* bi = std::get_if<std::int64_t>(&b))
             return (*ai < *bi) ? -1 : (*ai > *bi) ? 1 : 0;
@@ -3076,84 +3217,191 @@ int compare_values(const Value& a, const Value& b) {
         }
     }
 
-    // Cross-type: use SQLite's type ordering (NULL < INT/REAL < TEXT < BLOB).
     auto type_rank = [](const Value& v) -> int {
         if (std::holds_alternative<std::monostate>(v)) return 0;
         if (std::holds_alternative<std::int64_t>(v)) return 1;
         if (std::holds_alternative<double>(v)) return 1;
         if (std::holds_alternative<std::string>(v)) return 2;
-        return 3;  // blob
+        return 3;
     };
-    int ra = type_rank(a), rb = type_rank(b);
-    return (ra < rb) ? -1 : (ra > rb) ? 1 : 0;
+    return type_rank(a) < type_rank(b) ? -1 :
+           type_rank(a) > type_rank(b) ? 1 : 0;
 }
 
-/// Evaluate a PredicateCheck against a column value.
-bool check_matches(const PredicateCheck& check, const Value& col_val) {
-    switch (check.op) {
-        case CheckOp::Eq:
-            return col_val == check.value;
-        case CheckOp::Ne:
-            return col_val != check.value;
-        case CheckOp::Lt:
-            return compare_values(col_val, check.value) < 0;
-        case CheckOp::Le:
-            return compare_values(col_val, check.value) <= 0;
-        case CheckOp::Gt:
-            return compare_values(col_val, check.value) > 0;
-        case CheckOp::Ge:
-            return compare_values(col_val, check.value) >= 0;
-        case CheckOp::IsNull:
-            return std::holds_alternative<std::monostate>(col_val);
-        case CheckOp::IsNotNull:
-            return !std::holds_alternative<std::monostate>(col_val);
-        case CheckOp::InList:
-            for (const auto& v : check.values) {
-                if (col_val == v) return true;
+/// VM execution context: provides column values for LoadCol.
+struct VMContext {
+    sqlite3_changeset_iter* iter;
+    int op;   // SQLITE_INSERT, SQLITE_UPDATE, or SQLITE_DELETE
+    bool use_new;  // true = LoadCol reads new values, false = old values
+};
+
+/// Read a LE uint16 from program at position pc. Advances pc.
+uint16_t read_u16(const Program& p, size_t& pc) {
+    uint16_t v = p[pc] | (p[pc+1] << 8);
+    pc += 2;
+    return v;
+}
+
+/// Read a LE int64 from program at position pc. Advances pc.
+int64_t read_i64(const Program& p, size_t& pc) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(p[pc+i]) << (i*8);
+    pc += 8;
+    return static_cast<int64_t>(v);
+}
+
+/// Read a LE double from program at position pc. Advances pc.
+double read_f64(const Program& p, size_t& pc) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(p[pc+i]) << (i*8);
+    pc += 8;
+    double d;
+    std::memcpy(&d, &v, 8);
+    return d;
+}
+
+/// Run a program against a changeset row context. Returns true if matched.
+bool vm_run(const Program& prog, const VMContext& ctx) {
+    if (prog.empty()) return true;  // no program → conservative match
+
+    std::vector<Value> stack;
+    stack.reserve(8);
+    size_t pc = 0;
+
+    while (pc < prog.size()) {
+        auto op = static_cast<VMOp>(prog[pc++]);
+        switch (op) {
+            case VMOp::LoadCol: {
+                uint8_t col = prog[pc++];
+                sqlite3_value* val = nullptr;
+                if (ctx.use_new &&
+                    (ctx.op == SQLITE_INSERT || ctx.op == SQLITE_UPDATE)) {
+                    sqlite3changeset_new(ctx.iter, col, &val);
+                } else if (!ctx.use_new &&
+                    (ctx.op == SQLITE_UPDATE || ctx.op == SQLITE_DELETE)) {
+                    sqlite3changeset_old(ctx.iter, col, &val);
+                }
+                stack.push_back(sqlite3_value_to_value(val));
+                break;
             }
-            return false;
+            case VMOp::ConstInt:
+                stack.push_back(read_i64(prog, pc));
+                break;
+            case VMOp::ConstFloat:
+                stack.push_back(read_f64(prog, pc));
+                break;
+            case VMOp::ConstStr: {
+                uint16_t len = read_u16(prog, pc);
+                stack.push_back(std::string(
+                    reinterpret_cast<const char*>(&prog[pc]), len));
+                pc += len;
+                break;
+            }
+            case VMOp::ConstNull:
+                stack.push_back(std::monostate{});
+                break;
+            case VMOp::ConstBlob: {
+                uint32_t len = 0;
+                for (int i = 0; i < 4; ++i)
+                    len |= static_cast<uint32_t>(prog[pc+i]) << (i*8);
+                pc += 4;
+                stack.push_back(std::vector<uint8_t>(&prog[pc], &prog[pc+len]));
+                pc += len;
+                break;
+            }
+            case VMOp::Eq: case VMOp::Ne:
+            case VMOp::Lt: case VMOp::Le:
+            case VMOp::Gt: case VMOp::Ge: {
+                auto b = stack.back(); stack.pop_back();
+                auto a = stack.back(); stack.pop_back();
+                int cmp = compare_values(a, b);
+                bool result;
+                switch (op) {
+                    case VMOp::Eq: result = (a == b); break;
+                    case VMOp::Ne: result = (a != b); break;
+                    case VMOp::Lt: result = cmp < 0; break;
+                    case VMOp::Le: result = cmp <= 0; break;
+                    case VMOp::Gt: result = cmp > 0; break;
+                    case VMOp::Ge: result = cmp >= 0; break;
+                    default: result = true; break;
+                }
+                stack.push_back(result ? std::int64_t{1} : std::int64_t{0});
+                break;
+            }
+            case VMOp::IsNull: {
+                auto v = stack.back(); stack.pop_back();
+                stack.push_back(std::holds_alternative<std::monostate>(v)
+                    ? std::int64_t{1} : std::int64_t{0});
+                break;
+            }
+            case VMOp::IsNotNull: {
+                auto v = stack.back(); stack.pop_back();
+                stack.push_back(!std::holds_alternative<std::monostate>(v)
+                    ? std::int64_t{1} : std::int64_t{0});
+                break;
+            }
+            case VMOp::InList: {
+                uint8_t count = prog[pc++];
+                // Stack: [... value, list_item_0, ..., list_item_(count-1)]
+                // The list items are on top, value is below them.
+                bool found = false;
+                std::vector<Value> items(
+                    stack.end() - count, stack.end());
+                stack.resize(stack.size() - count);
+                auto val = stack.back(); stack.pop_back();
+                for (const auto& item : items) {
+                    if (val == item) { found = true; break; }
+                }
+                stack.push_back(found ? std::int64_t{1} : std::int64_t{0});
+                break;
+            }
+            case VMOp::And: {
+                auto b = std::get<std::int64_t>(stack.back()); stack.pop_back();
+                auto a = std::get<std::int64_t>(stack.back()); stack.pop_back();
+                stack.push_back(std::int64_t{(a && b) ? 1 : 0});
+                break;
+            }
+            case VMOp::Or: {
+                auto b = std::get<std::int64_t>(stack.back()); stack.pop_back();
+                auto a = std::get<std::int64_t>(stack.back()); stack.pop_back();
+                stack.push_back(std::int64_t{(a || b) ? 1 : 0});
+                break;
+            }
+            case VMOp::Not: {
+                auto a = std::get<std::int64_t>(stack.back()); stack.pop_back();
+                stack.push_back(std::int64_t{a ? 0 : 1});
+                break;
+            }
+            case VMOp::True:
+                stack.push_back(std::int64_t{1});
+                break;
+            case VMOp::Halt:
+                goto done;
+        }
     }
-    return true;  // unknown op → conservative
+done:
+    if (stack.empty()) return true;  // empty program → conservative
+    return std::holds_alternative<std::int64_t>(stack.back()) &&
+           std::get<std::int64_t>(stack.back()) != 0;
 }
 
-/// Per-column check entry in the predicate index.
-struct ColumnCheck {
+// ── Predicate index using VM programs ───────────────────────────
+
+/// Per-(subscription, table) compiled program.
+struct SubProgram {
     SubscriptionId sub_id;
-    PredicateCheck check;
+    Program        program;  // empty = no predicates for this table → always affected
 };
 
-/// Key for the predicate index: (table, column_index).
-struct TableColumnKey {
-    std::string table;
-    int         column_index;
-    bool operator==(const TableColumnKey& o) const {
-        return table == o.table && column_index == o.column_index;
-    }
-};
+/// The predicate index: maps table → list of compiled programs.
+using ProgramIndex = std::unordered_map<std::string, std::vector<SubProgram>>;
 
-struct TableColumnKeyHash {
-    std::size_t operator()(const TableColumnKey& k) const {
-        return std::hash<std::string>{}(k.table) ^
-               (std::hash<int>{}(k.column_index) << 1);
-    }
-};
-
-/// The predicate index: maps (table, column_index) to subscription checks.
-/// Built once from all subscriptions. Evaluated per changeset row.
-using PredicateIndex = std::unordered_map<
-    TableColumnKey, std::vector<ColumnCheck>, TableColumnKeyHash>;
-
-/// Build a PredicateCheck from a ResolvedPredicate.
-PredicateCheck resolved_to_check(const ResolvedPredicate& pred) {
-    return {pred.op, pred.value, pred.values};
-}
-
-/// Evaluate a changeset against the predicate index.
-/// Returns the set of subscription IDs affected by the changeset.
-/// Iterates the changeset once, checking all indexed predicates per row.
+/// Evaluate a changeset against compiled VM programs.
+/// Runs each program twice (old values, new values) per changeset row.
+/// Returns the set of subscription IDs affected.
 std::set<SubscriptionId> evaluate_changeset(
         const Changeset& data,
-        const PredicateIndex& index,
+        const ProgramIndex& index,
         const std::unordered_map<std::string, std::set<SubscriptionId>>& table_subs) {
     std::set<SubscriptionId> affected;
     if (data.empty()) return affected;
@@ -3163,7 +3411,6 @@ std::set<SubscriptionId> evaluate_changeset(
         static_cast<int>(data.size()),
         const_cast<void*>(static_cast<const void*>(data.data())));
     if (rc != SQLITE_OK) {
-        // Can't parse changeset — conservatively mark all as affected.
         for (const auto& [_, subs] : table_subs) {
             affected.insert(subs.begin(), subs.end());
         }
@@ -3172,71 +3419,65 @@ std::set<SubscriptionId> evaluate_changeset(
 
     while (sqlite3changeset_next(iter) == SQLITE_ROW) {
         const char* tbl = nullptr;
-        int ncol = 0, op = 0, indirect = 0;
-        sqlite3changeset_op(iter, &tbl, &ncol, &op, &indirect);
+        int ncol = 0, cs_op = 0, indirect = 0;
+        sqlite3changeset_op(iter, &tbl, &ncol, &cs_op, &indirect);
         if (!tbl) continue;
 
         std::string table_name(tbl);
+        auto idx_it = index.find(table_name);
 
-        // Find subscriptions for this table that have NO predicates —
-        // they're always affected by any change to their tables.
+        // Subscriptions with no program for this table → check table_subs.
         auto ts_it = table_subs.find(table_name);
         if (ts_it == table_subs.end()) continue;
 
-        // For each subscription on this table, track whether ANY
-        // predicate on this table matched for this row.
-        // Subscriptions with no predicates for this table are
-        // immediately affected.
-        // Use a map: sub_id → has_predicate_for_table.
-        // We mark affected if: no predicates, or any predicate matches.
-
-        // Collect all column checks for this table.
-        std::unordered_map<SubscriptionId, bool> sub_matched;
-        std::set<SubscriptionId> sub_has_check;
-
-        for (int col = 0; col < ncol; ++col) {
-            TableColumnKey key{table_name, col};
-            auto idx_it = index.find(key);
-            if (idx_it == index.end()) continue;
-
-            // Extract old and new values for this column.
-            Value old_val = std::monostate{};
-            Value new_val = std::monostate{};
-            if (op == SQLITE_UPDATE || op == SQLITE_DELETE) {
-                sqlite3_value* v = nullptr;
-                if (sqlite3changeset_old(iter, col, &v) == SQLITE_OK && v) {
-                    old_val = sqlite3_value_to_value(v);
-                }
+        if (idx_it == index.end()) {
+            // No programs at all for this table → all subs are affected.
+            for (auto sub_id : ts_it->second) {
+                affected.insert(sub_id);
             }
-            if (op == SQLITE_INSERT || op == SQLITE_UPDATE) {
-                sqlite3_value* v = nullptr;
-                if (sqlite3changeset_new(iter, col, &v) == SQLITE_OK && v) {
-                    new_val = sqlite3_value_to_value(v);
-                }
+            continue;
+        }
+
+        // Run each subscription's program.
+        for (const auto& sp : idx_it->second) {
+            if (affected.count(sp.sub_id)) continue;
+
+            if (sp.program.empty()) {
+                // No predicates for this table → always affected.
+                affected.insert(sp.sub_id);
+                continue;
             }
 
-            // Check each subscription's predicate on this column.
-            for (const auto& cc : idx_it->second) {
-                sub_has_check.insert(cc.sub_id);
-                if (affected.count(cc.sub_id)) continue;  // already affected
+            VMContext ctx{iter, cs_op, false};
+            bool old_match = false, new_match = false;
 
-                bool old_match = (op == SQLITE_UPDATE || op == SQLITE_DELETE)
-                    && check_matches(cc.check, old_val);
-                bool new_match = (op == SQLITE_INSERT || op == SQLITE_UPDATE)
-                    && check_matches(cc.check, new_val);
+            // Run against old values (UPDATE, DELETE).
+            if (cs_op == SQLITE_UPDATE || cs_op == SQLITE_DELETE) {
+                ctx.use_new = false;
+                old_match = vm_run(sp.program, ctx);
+            }
 
-                if (old_match || new_match) {
-                    sub_matched[cc.sub_id] = true;
-                }
+            // Run against new values (INSERT, UPDATE).
+            if (!old_match &&
+                (cs_op == SQLITE_INSERT || cs_op == SQLITE_UPDATE)) {
+                ctx.use_new = true;
+                new_match = vm_run(sp.program, ctx);
+            }
+
+            if (old_match || new_match) {
+                affected.insert(sp.sub_id);
             }
         }
 
-        // Subscriptions on this table with no checks → always affected.
+        // Also check for subscriptions on this table with NO entry in
+        // the program index (they have no predicates at all).
         for (auto sub_id : ts_it->second) {
             if (affected.count(sub_id)) continue;
-            if (sub_has_check.count(sub_id) == 0) {
-                affected.insert(sub_id);
-            } else if (sub_matched.count(sub_id)) {
+            bool has_program = false;
+            for (const auto& sp : idx_it->second) {
+                if (sp.sub_id == sub_id) { has_program = true; break; }
+            }
+            if (!has_program) {
                 affected.insert(sub_id);
             }
         }
@@ -3269,20 +3510,22 @@ struct QueryWatch::Impl {
     std::map<SubscriptionId, Subscription> subscriptions;
     // Reverse index: table name → subscription IDs that depend on it.
     std::unordered_map<std::string, std::set<SubscriptionId>> table_subs;
-    // Predicate index: (table, column) → subscription checks.
-    detail::PredicateIndex pred_index;
+    // Program index: table → compiled VM programs per subscription.
+    detail::ProgramIndex prog_index;
     // Subscriptions registered since last notify — need initial evaluation.
     std::set<SubscriptionId> pending_new;
     SubscriptionId next_sub_id = 1;
 
-    /// Rebuild the predicate index from all subscriptions.
-    void rebuild_pred_index() {
-        pred_index.clear();
+    /// Rebuild the program index from all subscriptions.
+    void rebuild_prog_index() {
+        prog_index.clear();
         for (const auto& [id, sub] : subscriptions) {
-            for (const auto& pred : sub.predicates) {
-                if (pred.column_index < 0) continue;
-                detail::TableColumnKey key{pred.table, pred.column_index};
-                pred_index[key].push_back({id, detail::resolved_to_check(pred)});
+            // For each table this subscription depends on, compile a
+            // program from the predicates that apply to that table.
+            for (const auto& table : sub.tables) {
+                auto program = detail::compile_predicates(
+                    sub.predicates, table);
+                prog_index[table].push_back({id, std::move(program)});
             }
         }
     }
@@ -3355,11 +3598,11 @@ struct QueryWatch::Impl {
         // Determine which subscriptions to evaluate.
         std::set<SubscriptionId> ids;
 
-        if (changeset && !changeset->empty() && !pred_index.empty()) {
-            // Batch evaluation: iterate changeset once, check all
-            // subscription predicates via the index.
+        if (changeset && !changeset->empty() && !prog_index.empty()) {
+            // VM evaluation: iterate changeset once, run compiled
+            // programs for each subscription.
             ids = detail::evaluate_changeset(
-                *changeset, pred_index, table_subs);
+                *changeset, prog_index, table_subs);
         } else {
             // No changeset or no predicates — table-level invalidation.
             for (const auto& table : affected) {
@@ -3427,7 +3670,7 @@ SubscriptionId QueryWatch::subscribe(const std::string& sql) {
                                 std::move(predicates), std::move(stmt),
                                 std::move(columns), 0};
     impl_->pending_new.insert(id);
-    impl_->rebuild_pred_index();
+    impl_->rebuild_prog_index();
     return id;
 }
 
@@ -3446,7 +3689,7 @@ void QueryWatch::unsubscribe(SubscriptionId id) {
         }
         impl_->pending_new.erase(id);
         impl_->subscriptions.erase(it);
-        impl_->rebuild_pred_index();
+        impl_->rebuild_prog_index();
     }
 }
 
