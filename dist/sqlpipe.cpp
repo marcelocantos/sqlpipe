@@ -1956,8 +1956,22 @@ struct RAProject : RANode {
     }
 };
 
+/// A column equivalence from an equijoin ON clause:
+/// left_table.left_column = right_table.right_column.
+struct JoinEquality {
+    std::string left_table;
+    std::string left_column;
+    int         left_index;    // column position (-1 if unknown)
+    std::string right_table;
+    std::string right_column;
+    int         right_index;   // column position (-1 if unknown)
+};
+
 struct RAJoin : RANode {
     RAPtr left, right;
+    /// Equijoin conditions extracted from the ON clause.
+    std::vector<JoinEquality> equalities;
+
     RAJoin(RAPtr l, RAPtr r) : left(std::move(l)), right(std::move(r)) {
         kind = Join;
     }
@@ -2123,8 +2137,57 @@ void extract_eq_predicates(
     has_opaque = true;
 }
 
+/// Extract column=column equalities from a JOIN ON expression.
+void extract_join_equalities(
+        const LpNode* expr,
+        const SchemaMap& schema,
+        const AliasMap& aliases,
+        std::vector<JoinEquality>& out) {
+    if (!expr) return;
+
+    if (expr->kind == LP_EXPR_BINARY_OP && expr->u.binary.op == LP_OP_AND) {
+        extract_join_equalities(
+            expr->u.binary.left, schema, aliases, out);
+        extract_join_equalities(
+            expr->u.binary.right, schema, aliases, out);
+        return;
+    }
+
+    if (expr->kind == LP_EXPR_BINARY_OP && expr->u.binary.op == LP_OP_EQ) {
+        const LpNode* lhs = expr->u.binary.left;
+        const LpNode* rhs = expr->u.binary.right;
+
+        // Both sides must be column references for an equijoin.
+        if (is_column_ref(lhs) && is_column_ref(rhs)) {
+            std::string lt, lc, rt, rc;
+            lc = lhs->u.column_ref.column;
+            rc = rhs->u.column_ref.column;
+
+            if (lhs->u.column_ref.table) {
+                lt = resolve_table(aliases,
+                    std::string(lhs->u.column_ref.table));
+            } else {
+                lt = resolve_unqualified_column(schema, aliases, lc);
+            }
+            if (rhs->u.column_ref.table) {
+                rt = resolve_table(aliases,
+                    std::string(rhs->u.column_ref.table));
+            } else {
+                rt = resolve_unqualified_column(schema, aliases, rc);
+            }
+
+            if (!lt.empty() && !rt.empty()) {
+                int li = column_index(schema, lt, lc);
+                int ri = column_index(schema, rt, rc);
+                out.push_back({lt, lc, li, rt, rc, ri});
+            }
+        }
+    }
+}
+
 /// Build the RA tree for a FROM clause (table refs and joins).
-RAPtr build_from(const LpNode* from, AliasMap& aliases) {
+RAPtr build_from(const LpNode* from, const SchemaMap& schema,
+                 AliasMap& aliases) {
     if (!from) return nullptr;
 
     if (from->kind == LP_FROM_TABLE) {
@@ -2145,10 +2208,18 @@ RAPtr build_from(const LpNode* from, AliasMap& aliases) {
     }
 
     if (from->kind == LP_JOIN_CLAUSE) {
-        auto left = build_from(from->u.join.left, aliases);
-        auto right = build_from(from->u.join.right, aliases);
+        auto left = build_from(from->u.join.left, schema, aliases);
+        auto right = build_from(from->u.join.right, schema, aliases);
         if (left && right) {
-            return std::make_unique<RAJoin>(std::move(left), std::move(right));
+            auto join = std::make_unique<RAJoin>(
+                std::move(left), std::move(right));
+            // Extract equijoin conditions from ON clause.
+            if (from->u.join.on_expr) {
+                extract_join_equalities(
+                    from->u.join.on_expr, schema, aliases,
+                    join->equalities);
+            }
+            return join;
         }
         return left ? std::move(left) : std::move(right);
     }
@@ -2161,8 +2232,8 @@ RAPtr select_to_ra(const LpNode* select, const SchemaMap& schema,
                    AliasMap& aliases) {
     if (!select || select->kind != LP_STMT_SELECT) return nullptr;
 
-    // Build FROM (scans + joins).
-    RAPtr ra = build_from(select->u.select.from, aliases);
+    // Build FROM (scans + joins), extracting equijoin conditions.
+    RAPtr ra = build_from(select->u.select.from, schema, aliases);
     if (!ra) {
         // No FROM clause — e.g. SELECT 1. No table dependencies.
         return nullptr;
@@ -2270,6 +2341,103 @@ void collect_predicates(const RANode* node,
         }
         default:
             break;
+    }
+}
+
+/// Collect all equijoin conditions from an RA tree.
+void collect_equijoins(const RANode* node,
+                       std::vector<JoinEquality>& out) {
+    if (!node) return;
+    switch (node->kind) {
+        case RANode::Join: {
+            auto* j = static_cast<const RAJoin*>(node);
+            out.insert(out.end(), j->equalities.begin(), j->equalities.end());
+            collect_equijoins(j->left.get(), out);
+            collect_equijoins(j->right.get(), out);
+            break;
+        }
+        case RANode::Filter:
+            collect_equijoins(
+                static_cast<const RAFilter*>(node)->child.get(), out);
+            break;
+        case RANode::Project:
+            collect_equijoins(
+                static_cast<const RAProject*>(node)->child.get(), out);
+            break;
+        case RANode::Aggregate:
+            collect_equijoins(
+                static_cast<const RAAggregate*>(node)->child.get(), out);
+            break;
+        case RANode::SetOp: {
+            auto* s = static_cast<const RASetOp*>(node);
+            collect_equijoins(s->left.get(), out);
+            collect_equijoins(s->right.get(), out);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+/// Propagate predicates through equijoin conditions.
+/// For each predicate {table.column = value} and equijoin
+/// {A.col1 = B.col2}, if table.column matches one side, derive
+/// a predicate for the other side.
+/// Repeats until no new predicates are derived (transitive closure).
+void propagate_predicates(
+        std::vector<ResolvedPredicate>& predicates,
+        const std::vector<JoinEquality>& equijoins) {
+    if (equijoins.empty()) return;
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& eq : equijoins) {
+            for (size_t i = 0, n = predicates.size(); i < n; ++i) {
+                const auto& pred = predicates[i];
+
+                // Check if predicate matches the left side of the equijoin.
+                if (pred.table == eq.left_table &&
+                    pred.column == eq.left_column) {
+                    // Derive: right_table.right_column = pred.value
+                    bool already_exists = false;
+                    for (const auto& p : predicates) {
+                        if (p.table == eq.right_table &&
+                            p.column == eq.right_column &&
+                            p.value == pred.value) {
+                            already_exists = true;
+                            break;
+                        }
+                    }
+                    if (!already_exists) {
+                        predicates.push_back({
+                            eq.right_table, eq.right_column,
+                            eq.right_index, pred.value});
+                        changed = true;
+                    }
+                }
+
+                // Check the right side of the equijoin.
+                if (pred.table == eq.right_table &&
+                    pred.column == eq.right_column) {
+                    bool already_exists = false;
+                    for (const auto& p : predicates) {
+                        if (p.table == eq.left_table &&
+                            p.column == eq.left_column &&
+                            p.value == pred.value) {
+                            already_exists = true;
+                            break;
+                        }
+                    }
+                    if (!already_exists) {
+                        predicates.push_back({
+                            eq.left_table, eq.left_column,
+                            eq.left_index, pred.value});
+                        changed = true;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2453,6 +2621,10 @@ struct QueryWatch::Impl {
         if (ra_out) {
             ra_out->collect_tables(tables);
             detail::collect_predicates(ra_out.get(), preds_out);
+            // Propagate predicates through equijoin conditions.
+            std::vector<detail::JoinEquality> equijoins;
+            detail::collect_equijoins(ra_out.get(), equijoins);
+            detail::propagate_predicates(preds_out, equijoins);
         } else {
             // RA transform failed (non-SELECT or parse error).
             // Fall back to authorizer-based table discovery.

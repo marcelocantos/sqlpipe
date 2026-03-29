@@ -1338,6 +1338,62 @@ TEST_CASE("integration: predicate on joined table filters correctly") {
     // Either way, the predicate check correctly allowed re-evaluation.
 }
 
+TEST_CASE("integration: transitive predicate propagation through join") {
+    DB master_db, replica_db;
+    master_db.exec(
+        "CREATE TABLE client (id INTEGER PRIMARY KEY, name TEXT);"
+        "CREATE TABLE invoice (id INTEGER PRIMARY KEY, client_id INTEGER, total REAL)");
+    replica_db.exec(
+        "CREATE TABLE client (id INTEGER PRIMARY KEY, name TEXT);"
+        "CREATE TABLE invoice (id INTEGER PRIMARY KEY, client_id INTEGER, total REAL)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Populate client 1 and client 2.
+    master_db.exec("INSERT INTO client VALUES (1, 'Alice')");
+    master_db.exec("INSERT INTO client VALUES (2, 'Bob')");
+    deliver(master.flush(), replica);
+    deliver(master.flush(), replica);
+
+    // Subscribe to client 1's invoices via join.
+    // Predicate: client.id = 1
+    // Join: invoice.client_id = client.id
+    // Derived: invoice.client_id = 1
+    replica.subscribe(
+        "SELECT i.id, i.total, c.name FROM invoice i "
+        "JOIN client c ON i.client_id = c.id "
+        "WHERE c.id = 1");
+
+    // Insert invoice for client 2 — should NOT fire because the
+    // propagated predicate invoice.client_id = 1 doesn't match.
+    master_db.exec("INSERT INTO invoice VALUES (100, 2, 500.0)");
+    auto msgs = master.flush();
+    auto result = deliver(msgs, replica);
+    CHECK(result.subscriptions.empty());
+
+    // Insert invoice for client 1 — SHOULD fire.
+    master_db.exec("INSERT INTO invoice VALUES (101, 1, 250.0)");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.size() == 1);
+
+    // Insert another invoice for client 1.
+    master_db.exec("INSERT INTO invoice VALUES (102, 1, 750.0)");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.size() == 2);
+
+    // Change client 2's name — should NOT fire (predicate client.id=1).
+    master_db.exec("UPDATE client SET name='Robert' WHERE id=2");
+    msgs = master.flush();
+    result = deliver(msgs, replica);
+    CHECK(result.subscriptions.empty());
+}
+
 TEST_CASE("integration: update moves row in/out of predicate scope") {
     DB master_db, replica_db;
     const char* schema =
