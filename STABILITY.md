@@ -26,22 +26,23 @@ API surface complexity:
 
 The clock starts from the last breaking change to the interaction surface.
 
-Current surface: ~75 items → 3 months. Last breaking change: v0.14.0
-(PeerRole breaking change + protocol v6, 2026-03-22).
-(subscribe() returns SubscriptionId instead of QueryResult, 2026-03-21).
-Eligible: 2026-06-22.
+Current surface: ~92 items → 3 months. Last breaking change: v0.15.0
+(OutMessage return types replace raw Message in Master, Replica, Peer, Relay;
+FlushCallback/SinkCallback signature changes; HelloMsg added last_seq field,
+2026-03-30).
+Eligible: 2026-06-30.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.14.0. Items annotated with stability assessments.
+Snapshot as of v0.15.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.14.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.15.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `14` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `15` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 
 ### Type aliases
@@ -58,7 +59,8 @@ Snapshot as of v0.14.0. Items annotated with stability assessments.
 | `LogCallback` | `std::function<void(LogLevel, std::string_view)>` | **Stable** |
 | `SchemaMismatchCallback` | `std::function<bool(SchemaVersion remote, SchemaVersion local, const std::string& remote_schema_sql)>` | **Stable** |
 | `ApproveOwnershipCallback` | `std::function<bool(const std::set<std::string>&)>` | **Stable** |
-| `FlushCallback` | `std::function<void(const std::vector<Message>&)>` | **Stable** |
+| `FlushCallback` | `std::function<void(const std::vector<OutMessage>&)>` | **Breaking** (was `vector<Message>`, now `vector<OutMessage>`) |
+| `SinkCallback` | `std::function<void(const OutMessage&)>` | **Needs review** (new in v0.15.0) |
 
 ### Enums
 
@@ -72,6 +74,8 @@ Snapshot as of v0.14.0. Items annotated with stability assessments.
 | `LogLevel` | `Debug=0, Info, Warn, Error` | **Stable** |
 | `MessageTag` | `Hello=0x01, Changeset=0x03, Ack=0x08, Error=0x09, BucketHashes=0x0A, NeedBuckets=0x0B, RowHashes=0x0C, DiffReady=0x0D` | **Stable** |
 | `SenderRole` | `AsMaster=0, AsReplica=1` | **Stable** |
+| `Delivery` | `Reliable=0, BestEffort=1` | **Needs review** (new in v0.15.0) |
+| `PeerRole` | `Client, Server` | **Needs review** (new in v0.15.0) |
 | `Replica::State` | `Init, Handshake, DiffBuckets, DiffRows, Live, Error` | **Stable** |
 | `Peer::State` | `Init, Negotiating, Diffing, Live, Error` | **Stable** |
 
@@ -82,15 +86,17 @@ Snapshot as of v0.14.0. Items annotated with stability assessments.
 | `ChangeEvent` | `table, op, pk_flags, old_values, new_values` | **Stable** |
 | `QueryResult` | `id, columns, rows` | **Stable** |
 | `DiffProgress` | `phase, table, items_done, items_total` | **Stable** |
-| `HandleResult` | `messages, changes, subscriptions` | **Stable** |
-| `PeerHandleResult` | `messages, changes, subscriptions` | **Stable** |
+| `OutMessage` | `msg, delivery` | **Needs review** (new in v0.15.0) |
+| `PeerOutMessage` | `msg, delivery` | **Needs review** (new in v0.15.0) |
+| `HandleResult` | `messages, changes, subscriptions` | **Breaking** (`messages` is now `vector<OutMessage>`, was `vector<Message>`) |
+| `PeerHandleResult` | `messages, changes, subscriptions` | **Breaking** (`messages` is now `vector<PeerOutMessage>`, was `vector<PeerMessage>`) |
 | `PeerMessage` | `sender_role, payload` | **Stable** |
 
 ### Message structs
 
 | Struct | Fields | Stability |
 |---|---|---|
-| `HelloMsg` | `protocol_version, schema_version, owned_tables` | **Stable** |
+| `HelloMsg` | `protocol_version, schema_version, owned_tables, last_seq` | **Breaking** (added `last_seq` field, default -1) |
 | `ChangesetMsg` | `seq, data` | **Stable** |
 | `AckMsg` | `seq` | **Stable** |
 | `ErrorMsg` | `code, detail, remote_schema_version, remote_schema_sql` | **Stable** |
@@ -109,9 +115,10 @@ Snapshot as of v0.14.0. Items annotated with stability assessments.
 
 | Struct | Fields | Stability |
 |---|---|---|
-| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, on_flush` | **Stable** |
+| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, on_flush, changeset_queue_size` | **Breaking** (added `changeset_queue_size`, default 64) |
 | `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log` | **Stable** |
-| `PeerConfig` | `owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch, on_log` | **Stable** |
+| `PeerConfig` | `role, owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch, on_log` | **Breaking** (added `role` field, default `PeerRole::Client`) |
+| `RelayConfig` | `table_filter, on_conflict, on_schema_mismatch, on_log` | **Needs review** (new in v0.15.0) |
 
 ### Constants
 
@@ -143,14 +150,14 @@ class Master {
     Master& operator=(Master&&) noexcept;
 
     void exec(const std::string& sql);
-    std::vector<Message> flush();
-    std::vector<Message> handle_message(const Message& msg);
+    std::vector<OutMessage> flush();
+    std::vector<OutMessage> handle_message(const Message& msg);
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 };
 ```
 
-**Stability**: **Stable**
+**Stability**: **Breaking** (`flush()` and `handle_message()` now return `vector<OutMessage>` instead of `vector<Message>`)
 
 ### Replica class
 
@@ -161,11 +168,14 @@ class Replica {
     Replica(Replica&&) noexcept;
     Replica& operator=(Replica&&) noexcept;
 
-    Message hello() const;
+    OutMessage hello() const;
     HandleResult handle_message(const Message& msg);
     HandleResult handle_messages(std::span<const Message> msgs);
-    QueryResult subscribe(const std::string& sql);
+    SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
+    void begin_prediction();
+    void commit_prediction();
+    void rollback_prediction();
     void reset();
     Seq current_seq() const;
     SchemaVersion schema_version() const;
@@ -173,7 +183,7 @@ class Replica {
 };
 ```
 
-**Stability**: **Stable**
+**Stability**: **Breaking** (`hello()` returns `OutMessage` instead of `Message`; `subscribe()` returns `SubscriptionId` instead of `QueryResult`)
 
 ### Peer class
 
@@ -184,19 +194,41 @@ class Peer {
     Peer(Peer&&) noexcept;
     Peer& operator=(Peer&&) noexcept;
 
-    std::vector<PeerMessage> start();
-    std::vector<PeerMessage> flush();
+    std::vector<PeerOutMessage> start();
+    std::vector<PeerOutMessage> flush();
     PeerHandleResult handle_message(const PeerMessage& msg);
+    SubscriptionId subscribe(const std::string& sql);
+    void unsubscribe(SubscriptionId id);
     void reset();
     State state() const;
-    QueryResult subscribe(const std::string& sql);
-    void unsubscribe(SubscriptionId id);
     const std::set<std::string>& owned_tables() const;
     const std::set<std::string>& remote_tables() const;
 };
 ```
 
-**Stability**: **Stable**
+**Stability**: **Breaking** (`start()` and `flush()` return `vector<PeerOutMessage>` instead of `vector<PeerMessage>`; `subscribe()` returns `SubscriptionId` instead of `QueryResult`)
+
+### Relay class
+
+```cpp
+class Relay {
+    explicit Relay(sqlite3* db, RelayConfig config = {});
+    ~Relay();
+    Relay(Relay&&) noexcept;
+    Relay& operator=(Relay&&) noexcept;
+
+    std::size_t add_sink(SinkCallback cb);
+    void remove_sink(std::size_t id);
+    OutMessage hello();
+    std::vector<OutMessage> handle_upstream(const Message& msg);
+    std::vector<OutMessage> handle_downstream(const Message& msg);
+    SubscriptionId subscribe(const std::string& sql);
+    void unsubscribe(SubscriptionId id);
+    void reset();
+};
+```
+
+**Stability**: **Needs review** (new in v0.15.0)
 
 ### QueryWatch class
 
@@ -207,14 +239,16 @@ class QueryWatch {
     QueryWatch(QueryWatch&&) noexcept;
     QueryWatch& operator=(QueryWatch&&) noexcept;
 
-    QueryResult subscribe(const std::string& sql);
+    SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
     std::vector<QueryResult> notify(const std::set<std::string>& affected_tables);
+    std::vector<QueryResult> notify(const std::set<std::string>& affected_tables,
+                                    const Changeset& changeset_data);
     bool empty() const;
 };
 ```
 
-**Stability**: **Stable**
+**Stability**: **Breaking** (`subscribe()` returns `SubscriptionId` instead of `QueryResult`; new `notify` overload with `changeset_data` parameter)
 
 ### Free functions
 
@@ -224,8 +258,14 @@ class QueryWatch {
 | `Message deserialize(std::span<const uint8_t>)` | **Stable** |
 | `std::vector<uint8_t> serialize(const PeerMessage&)` | **Stable** |
 | `PeerMessage deserialize_peer(std::span<const uint8_t>)` | **Stable** |
+| `Delivery delivery_for(const Message&)` | **Needs review** (new in v0.15.0) |
+| `OutMessage tagged(Message)` | **Needs review** (new in v0.15.0) |
+| `std::vector<OutMessage> tagged(std::vector<Message>)` | **Needs review** (new in v0.15.0) |
+| `PeerOutMessage tagged(PeerMessage)` | **Needs review** (new in v0.15.0) |
+| `std::vector<PeerOutMessage> tagged(std::vector<PeerMessage>)` | **Needs review** (new in v0.15.0) |
 | `void sync_handshake(Master&, Replica&)` | **Stable** |
 | `void sync_handshake(Peer& client, Peer& server)` | **Stable** |
+| `void sync_handshake(Master&, Relay&)` | **Needs review** (new in v0.15.0) |
 | `QueryResult query(sqlite3* db, const std::string& sql)` | **Stable** |
 
 ### Wire format
@@ -243,6 +283,14 @@ class QueryWatch {
 | `_sqlpipe_meta` | `CREATE TABLE _sqlpipe_meta(key TEXT PRIMARY KEY, value)` | **Stable** |
 
 Keys: `seq` (Master/Replica solo), `master_seq` / `replica_seq` (Peer mode).
+
+## Gaps
+
+- liteparser vendored for SQL analysis — internal only, not part of the public
+  API surface.
+- Predicate-aware subscription invalidation — internal optimisation. The only
+  public surface change is the `QueryWatch::notify(affected_tables, changeset_data)`
+  overload (catalogued above).
 
 ## Out of scope for 1.0
 
