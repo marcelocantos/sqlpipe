@@ -441,6 +441,7 @@ std::vector<std::uint8_t> serialize(const Message& msg) {
         }
         else if constexpr (std::is_same_v<T, BucketHashesMsg>) {
             put_u8(buf, static_cast<std::uint8_t>(MessageTag::BucketHashes));
+            put_i64(buf, m.last_seq);
             put_u32(buf, static_cast<std::uint32_t>(m.buckets.size()));
             for (const auto& b : m.buckets) {
                 put_string(buf, b.table);
@@ -563,6 +564,7 @@ Message deserialize(std::span<const std::uint8_t> buf) {
     }
     case MessageTag::BucketHashes: {
         BucketHashesMsg m;
+        m.last_seq = r.read_i64();
         auto count = r.read_u32();
         check_count(count);
         m.buckets.resize(count);
@@ -1557,6 +1559,37 @@ struct Master::Impl {
         // Accept BucketHashes in any state — enables convergence loop
         // where the replica can initiate diff sync at any time, including
         // re-convergence checks while already Live.
+
+        // Fast path: if the replica's seq is behind but within the
+        // changeset queue, replay from the queue instead of diffing.
+        if (msg.last_seq > 0 && msg.last_seq < seq &&
+            !changeset_queue.empty() &&
+            msg.last_seq >= changeset_queue.front().seq - 1) {
+            std::vector<OutMessage> result;
+            std::size_t replayed = 0;
+            for (const auto& qc : changeset_queue) {
+                if (qc.seq > msg.last_seq) {
+                    result.push_back(tagged(Message{
+                        ChangesetMsg{qc.seq, qc.data}}));
+                    ++replayed;
+                }
+            }
+            if (replayed > 0) {
+                // Send an empty DiffReady first to transition the replica
+                // from DiffBuckets to Live, then the queued changesets.
+                std::vector<OutMessage> out;
+                out.push_back(tagged(Message{
+                    NeedBucketsMsg{}}));
+                out.push_back(tagged(Message{
+                    DiffReadyMsg{msg.last_seq, {}, {}}}));
+                out.insert(out.end(), result.begin(), result.end());
+                hs_state = HSState::Live;
+                SQLPIPE_LOG(config.on_log, LogLevel::Info,
+                            "converge: queue replay {} changesets (seq {}→{})",
+                            replayed, msg.last_seq + 1, seq);
+                return out;
+            }
+        }
 
         // Compute our own bucket hashes.
         report(DiffPhase::ComputingBuckets, {},
@@ -4349,8 +4382,8 @@ struct Replica::Impl {
                static_cast<std::int64_t>(buckets.size()),
                static_cast<std::int64_t>(buckets.size()));
         state = Replica::State::DiffBuckets;
-        SQLPIPE_LOG(config.on_log, LogLevel::Info, "sending {} bucket hashes", buckets.size());
-        return {{tagged(Message{BucketHashesMsg{std::move(buckets)}})}, {}, {}};
+        SQLPIPE_LOG(config.on_log, LogLevel::Info, "sending {} bucket hashes (seq={})", buckets.size(), seq);
+        return {{tagged(Message{BucketHashesMsg{std::move(buckets), seq}})}, {}, {}};
     }
 
     HandleResult handle_need_buckets(const NeedBucketsMsg& m) {
@@ -4553,8 +4586,9 @@ std::vector<OutMessage> Replica::converge() {
 
     impl_->state = State::DiffBuckets;
     SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info,
-                "converge: sending {} bucket hashes", buckets.size());
-    return {tagged(Message{BucketHashesMsg{std::move(buckets)}})};
+                "converge: sending {} bucket hashes (seq={})",
+                buckets.size(), impl_->seq);
+    return {tagged(Message{BucketHashesMsg{std::move(buckets), impl_->seq}})};
 }
 
 HandleResult Replica::handle_message(const Message& msg) {

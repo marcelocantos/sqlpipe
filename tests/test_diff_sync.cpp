@@ -436,6 +436,57 @@ TEST_CASE("convergence: re-convergence check while live") {
     CHECK(replica_db.count("t1") == 1);
 }
 
+TEST_CASE("convergence: queue replay via converge()") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    MasterConfig cfg;
+    cfg.changeset_queue_size = 16;
+    Master master(master_db.db, cfg);
+    Replica replica(replica_db.db);
+
+    // Initial sync.
+    sync_handshake(master, replica);
+    CHECK(replica.state() == Replica::State::Live);
+
+    // Deliver first changeset normally.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    auto msgs = master.flush();
+    for (const auto& om : msgs) replica.handle_message(om.msg);
+    CHECK(replica.current_seq() == 1);
+
+    // Master writes more, but we "lose" the delivery.
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    master.flush();
+    master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
+    master.flush();
+    CHECK(master.current_seq() == 3);
+    CHECK(replica.current_seq() == 1);
+
+    // Replica converges — seq=1 is in the queue, so master replays
+    // changesets 2 and 3 from the queue instead of doing full diff.
+    auto bucket_msgs = replica.converge();
+    auto master_resp = master.handle_message(bucket_msgs[0].msg);
+
+    // Should get: NeedBuckets(empty) + DiffReady(empty) + Changeset(2) + Changeset(3).
+    REQUIRE(master_resp.size() == 4);
+    CHECK(std::holds_alternative<NeedBucketsMsg>(master_resp[0].msg));
+    CHECK(std::holds_alternative<DiffReadyMsg>(master_resp[1].msg));
+    CHECK(std::holds_alternative<ChangesetMsg>(master_resp[2].msg));
+    CHECK(std::get<ChangesetMsg>(master_resp[2].msg).seq == 2);
+    CHECK(std::holds_alternative<ChangesetMsg>(master_resp[3].msg));
+    CHECK(std::get<ChangesetMsg>(master_resp[3].msg).seq == 3);
+
+    // Feed to replica.
+    for (const auto& om : master_resp) {
+        replica.handle_message(om.msg);
+    }
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica.current_seq() == 3);
+    CHECK(replica_db.count("t1") == 3);
+}
+
 TEST_CASE("convergence: re-convergence discovers missed changes") {
     DB master_db, replica_db;
     master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");

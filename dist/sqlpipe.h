@@ -298,6 +298,7 @@ struct BucketHashEntry {
 /// Contains per-table bucket hashes for the diff protocol.
 struct BucketHashesMsg {
     std::vector<BucketHashEntry> buckets;
+    Seq last_seq = -1;  ///< Sender's last applied seq (-1 = unknown).
 };
 
 /// One bucket range the master needs row-level detail for.
