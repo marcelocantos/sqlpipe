@@ -7,16 +7,20 @@ sqlite_flags = -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_E
 cflags   = -w $sqlite_flags
 cxxflags = -Wall -Wextra -Wpedantic $sqlite_flags
 
-vendor   = vendor
-sqldeep  = ../sqldeep
-incflags = -Idist -I$vendor/include
+vendor      = vendor
+sqldeep     = ../sqldeep
+liteparser  = $vendor/github.com/sqliteai/liteparser
+incflags    = -Idist -I$vendor/include -I$liteparser/src
 
 # ── Sources ──────────────────────────────────────────────────────────
 test_srcs = tests/doctest_main.cpp $[wildcard tests/test_*.cpp]
 test_objs = $[patsubst %.cpp,build/%.o,$test_srcs]
 
 # ── Default target ───────────────────────────────────────────────────
-build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlift.o build/sqlpipe.o
+lp_srcs = arena liteparser lp_tokenize lp_unparse parse
+lp_objs = $[patsubst %,build/liteparser/%.o,$lp_srcs]
+
+build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlift.o build/sqlpipe.o $lp_objs
     $ar rcs $target $inputs
 
 # ── Tasks ────────────────────────────────────────────────────────────
@@ -97,3 +101,6 @@ build/tests/{name}.o: tests/{name}.cpp
 
 build/examples/{name}.o: examples/{name}.cpp
     $cxx $cxxflags $incflags -c $input -o $target
+
+build/liteparser/{name}.o: $liteparser/src/{name}.c
+    $cc -w -O2 -c $input -o $target
