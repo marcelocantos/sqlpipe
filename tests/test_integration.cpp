@@ -1484,6 +1484,321 @@ TEST_CASE("integration: predicate correctness — skipped re-eval implies identi
     CHECK(result.subscriptions[0].rows.size() == 2);  // original + new
 }
 
+TEST_CASE("integration: AND predicate correctness — result-changing operations") {
+    // Test that operations which DO change the query result trigger re-evaluation.
+    // For AND predicates, test transitions that actually affect whether rows
+    // enter or leave the result set.
+    DB master_db, replica_db;
+    master_db.exec(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT, amount REAL)");
+    replica_db.exec(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT, amount REAL)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Insert test data - initially no rows match the AND condition
+    master_db.exec("INSERT INTO orders VALUES (1, 'active', 50.0)");   // doesn't match (amount too low)
+    master_db.exec("INSERT INTO orders VALUES (2, 'pending', 150.0)"); // doesn't match (status wrong)
+    for (int i = 0; i < 2; ++i) deliver(master.flush(), replica);
+
+    // Subscribe to orders that are active AND have amount > 100
+    auto sub_id = replica.subscribe(
+        "SELECT id, status, amount FROM orders WHERE status = 'active' AND amount > 100");
+
+    // Trigger initial evaluation
+    master_db.exec("INSERT INTO orders VALUES (99, 'dummy', 0.0)");
+    auto init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+    CHECK(init.subscriptions[0].rows.size() == 0); // none match initially
+
+    // Test operations that make rows enter the result
+    master_db.exec("UPDATE orders SET amount = 120.0 WHERE id = 1"); // now matches both
+    auto msgs1 = master.flush();
+    auto result1 = deliver(msgs1, replica);
+    REQUIRE(result1.subscriptions.size() == 1);
+    CHECK(result1.subscriptions[0].rows.size() == 1); // order 1 now matches
+
+    master_db.exec("UPDATE orders SET status = 'active' WHERE id = 2"); // now matches both
+    auto msgs2 = master.flush();
+    auto result2 = deliver(msgs2, replica);
+    REQUIRE(result2.subscriptions.size() == 1);
+    CHECK(result2.subscriptions[0].rows.size() == 2); // both orders match
+
+    // Test operation that makes a row exit the result
+    master_db.exec("UPDATE orders SET status = 'pending' WHERE id = 1"); // no longer matches
+    auto msgs3 = master.flush();
+    auto result3 = deliver(msgs3, replica);
+    REQUIRE(result3.subscriptions.size() == 1);
+    CHECK(result3.subscriptions[0].rows.size() == 1); // only order 2 matches
+}
+
+TEST_CASE("integration: range predicate correctness — result changes") {
+    // Test that range predicates correctly trigger re-evaluation for changes
+    // that cross the threshold and affect the result.
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE products (id INTEGER PRIMARY KEY, price REAL)");
+    replica_db.exec("CREATE TABLE products (id INTEGER PRIMARY KEY, price REAL)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Insert products below and above the threshold
+    master_db.exec("INSERT INTO products VALUES (1, 50.0)");   // below 100
+    master_db.exec("INSERT INTO products VALUES (2, 150.0)");  // above 100
+    master_db.exec("INSERT INTO products VALUES (3, 200.0)");  // above 100
+    for (int i = 0; i < 3; ++i) deliver(master.flush(), replica);
+
+    // Subscribe to expensive products (price > 100)
+    auto sub_id = replica.subscribe("SELECT id, price FROM products WHERE price > 100");
+
+    // Trigger initial evaluation
+    master_db.exec("INSERT INTO products VALUES (99, 0.0)");
+    auto init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+    CHECK(init.subscriptions[0].rows.size() == 2); // products 2 and 3
+
+    // Test operations that change the result (crossing threshold)
+    master_db.exec("UPDATE products SET price = 120.0 WHERE id = 1"); // below→above
+    auto msgs1 = master.flush();
+    auto result1 = deliver(msgs1, replica);
+    REQUIRE(result1.subscriptions.size() == 1);
+    CHECK(result1.subscriptions[0].rows.size() == 3); // now includes product 1
+
+    master_db.exec("UPDATE products SET price = 80.0 WHERE id = 2"); // above→below
+    auto msgs2 = master.flush();
+    auto result2 = deliver(msgs2, replica);
+    REQUIRE(result2.subscriptions.size() == 1);
+    CHECK(result2.subscriptions[0].rows.size() == 2); // product 2 removed
+
+    // Additional test: insert new product above threshold
+    master_db.exec("INSERT INTO products VALUES (4, 300.0)"); // new above threshold
+    auto msgs3 = master.flush();
+    auto result3 = deliver(msgs3, replica);
+    REQUIRE(result3.subscriptions.size() == 1);
+    CHECK(result3.subscriptions[0].rows.size() == 3); // added product 4
+}
+
+TEST_CASE("integration: IN-list predicate correctness — membership changes") {
+    // Test that IN-list predicates correctly trigger re-evaluation for changes
+    // that affect list membership.
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE tasks (id INTEGER PRIMARY KEY, status TEXT)");
+    replica_db.exec("CREATE TABLE tasks (id INTEGER PRIMARY KEY, status TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Insert tasks with various statuses
+    master_db.exec("INSERT INTO tasks VALUES (1, 'active')");   // in list
+    master_db.exec("INSERT INTO tasks VALUES (2, 'pending')");  // in list
+    master_db.exec("INSERT INTO tasks VALUES (3, 'done')");     // not in list
+    master_db.exec("INSERT INTO tasks VALUES (4, 'cancelled')"); // not in list
+    for (int i = 0; i < 4; ++i) deliver(master.flush(), replica);
+
+    // Subscribe to active or pending tasks
+    auto sub_id = replica.subscribe("SELECT id, status FROM tasks WHERE status IN ('active', 'pending')");
+
+    // Trigger initial evaluation
+    master_db.exec("INSERT INTO tasks VALUES (99, 'dummy')");
+    auto init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+    CHECK(init.subscriptions[0].rows.size() == 2); // tasks 1 and 2
+
+    // Test operations that change membership
+    master_db.exec("UPDATE tasks SET status = 'done' WHERE id = 1"); // active→done (exit)
+    auto msgs1 = master.flush();
+    auto result1 = deliver(msgs1, replica);
+    REQUIRE(result1.subscriptions.size() == 1);
+    CHECK(result1.subscriptions[0].rows.size() == 1); // only task 2
+
+    master_db.exec("UPDATE tasks SET status = 'active' WHERE id = 3"); // done→active (enter)
+    auto msgs2 = master.flush();
+    auto result2 = deliver(msgs2, replica);
+    REQUIRE(result2.subscriptions.size() == 1);
+    CHECK(result2.subscriptions[0].rows.size() == 2); // tasks 2 and 3
+
+    master_db.exec("INSERT INTO tasks VALUES (5, 'pending')"); // insert new in list
+    auto msgs3 = master.flush();
+    auto result3 = deliver(msgs3, replica);
+    REQUIRE(result3.subscriptions.size() == 1);
+    CHECK(result3.subscriptions[0].rows.size() == 3); // added task 5
+}
+
+TEST_CASE("integration: IS NULL predicate correctness — nullability changes") {
+    // Test that IS NULL predicates correctly trigger re-evaluation for changes
+    // that affect nullability.
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, deleted_at TEXT)");
+    replica_db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, deleted_at TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Insert items, some deleted (not null), some active (null)
+    master_db.exec("INSERT INTO items VALUES (1, 'item1', NULL)");       // active
+    master_db.exec("INSERT INTO items VALUES (2, 'item2', NULL)");       // active
+    master_db.exec("INSERT INTO items VALUES (3, 'item3', '2023-01-01')"); // deleted
+    master_db.exec("INSERT INTO items VALUES (4, 'item4', '2023-02-01')"); // deleted
+    for (int i = 0; i < 4; ++i) deliver(master.flush(), replica);
+
+    // Subscribe to active items (not deleted)
+    auto sub_id = replica.subscribe("SELECT id, name FROM items WHERE deleted_at IS NULL");
+
+    // Trigger initial evaluation
+    master_db.exec("INSERT INTO items VALUES (99, 'dummy', 'deleted')");
+    auto init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+    CHECK(init.subscriptions[0].rows.size() == 2); // items 1 and 2
+
+    // Test operations that change nullability
+    master_db.exec("UPDATE items SET deleted_at = '2023-03-01' WHERE id = 1"); // NULL→not NULL
+    auto msgs1 = master.flush();
+    auto result1 = deliver(msgs1, replica);
+    REQUIRE(result1.subscriptions.size() == 1);
+    CHECK(result1.subscriptions[0].rows.size() == 1); // only item 2
+
+    master_db.exec("UPDATE items SET deleted_at = NULL WHERE id = 3"); // not NULL→NULL
+    auto msgs2 = master.flush();
+    auto result2 = deliver(msgs2, replica);
+    REQUIRE(result2.subscriptions.size() == 1);
+    CHECK(result2.subscriptions[0].rows.size() == 2); // items 2 and 3
+
+    // Test insert with null
+    master_db.exec("INSERT INTO items VALUES (5, 'item5', NULL)"); // insert active item
+    auto msgs3 = master.flush();
+    auto result3 = deliver(msgs3, replica);
+    REQUIRE(result3.subscriptions.size() == 1);
+    CHECK(result3.subscriptions[0].rows.size() == 3); // added item 5
+}
+
+TEST_CASE("integration: multi-table propagation correctness — result changes") {
+    // Test that multi-table JOIN subscriptions correctly trigger re-evaluation
+    // for changes that affect the join condition or filtered columns.
+    DB master_db, replica_db;
+    master_db.exec(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER);"
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, content TEXT)");
+    replica_db.exec(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER);"
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, content TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Insert users first
+    master_db.exec("INSERT INTO users VALUES (1, 'Alice', 1)");    // active
+    master_db.exec("INSERT INTO users VALUES (2, 'Bob', 0)");      // inactive
+    deliver(master.flush(), replica);
+    deliver(master.flush(), replica);
+
+    // Then insert posts
+    master_db.exec("INSERT INTO posts VALUES (1, 1, 'Hello')");    // Alice's post
+    master_db.exec("INSERT INTO posts VALUES (2, 1, 'World')");    // Alice's post
+    deliver(master.flush(), replica);
+    deliver(master.flush(), replica);
+
+    // Subscribe to posts by active users (JOIN query)
+    auto sub_id = replica.subscribe(
+        "SELECT p.id, p.content, u.name FROM posts p "
+        "JOIN users u ON p.user_id = u.id WHERE u.active = 1");
+
+    // Trigger initial evaluation (dummy post is for Alice, so it matches too).
+    master_db.exec("INSERT INTO posts VALUES (99, 1, 'dummy')");
+    auto init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+    CHECK(init.subscriptions[0].rows.size() == 3); // Alice's 2 posts + dummy
+
+    // Test operations that change the result
+    master_db.exec("UPDATE users SET active = 0 WHERE id = 1"); // deactivate Alice
+    auto msgs1 = master.flush();
+    auto result1 = deliver(msgs1, replica);
+    REQUIRE(result1.subscriptions.size() == 1);
+    CHECK(result1.subscriptions[0].rows.size() == 0); // no active users' posts
+
+    // Activate Bob — predicate matches (new active=1), but Bob has no posts.
+    // Query result is still 0 rows (same as before), so subscription
+    // doesn't fire (hash unchanged). This is correct.
+    master_db.exec("UPDATE users SET active = 1 WHERE id = 2");
+    auto msgs2 = master.flush();
+    auto result2 = deliver(msgs2, replica);
+    CHECK(result2.subscriptions.empty());
+
+    // Add a post for Bob — now there's a result change.
+    master_db.exec("INSERT INTO posts VALUES (3, 2, 'Bob says hi')");
+    auto msgs2b = master.flush();
+    auto result2b = deliver(msgs2b, replica);
+    REQUIRE(result2b.subscriptions.size() == 1);
+    CHECK(result2b.subscriptions[0].rows.size() == 1); // Bob's post
+
+    // Add a post for Alice (inactive) — result doesn't change (still
+    // just Bob's post), so subscription doesn't fire.
+    master_db.exec("INSERT INTO posts VALUES (4, 1, 'New post')");
+    auto msgs3 = master.flush();
+    auto result3 = deliver(msgs3, replica);
+    CHECK(result3.subscriptions.empty()); // result unchanged
+
+    // Add another post for Bob — result changes.
+    master_db.exec("INSERT INTO posts VALUES (5, 2, 'Bob again')");
+    auto msgs4 = master.flush();
+    auto result4 = deliver(msgs4, replica);
+    REQUIRE(result4.subscriptions.size() == 1);
+    CHECK(result4.subscriptions[0].rows.size() == 2); // Bob's 2 posts
+}
+
+TEST_CASE("integration: BETWEEN predicate correctness — boundary crossings") {
+    // Test that BETWEEN predicates correctly trigger re-evaluation for changes
+    // that cross range boundaries.
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE events (id INTEGER PRIMARY KEY, seq INTEGER, data TEXT)");
+    replica_db.exec("CREATE TABLE events (id INTEGER PRIMARY KEY, seq INTEGER, data TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Insert events with seq values inside, outside, and at boundaries
+    master_db.exec("INSERT INTO events VALUES (1, 5, 'early')");    // below range
+    master_db.exec("INSERT INTO events VALUES (2, 10, 'start')");   // at lower bound
+    master_db.exec("INSERT INTO events VALUES (3, 15, 'middle')");  // inside range
+    master_db.exec("INSERT INTO events VALUES (4, 20, 'end')");     // at upper bound
+    master_db.exec("INSERT INTO events VALUES (5, 25, 'late')");    // above range
+    for (int i = 0; i < 5; ++i) deliver(master.flush(), replica);
+
+    // Subscribe to events in the middle range (10-20 inclusive)
+    auto sub_id = replica.subscribe("SELECT id, seq, data FROM events WHERE seq BETWEEN 10 AND 20");
+
+    // Trigger initial evaluation
+    master_db.exec("INSERT INTO events VALUES (99, 0, 'dummy')");
+    auto init = deliver(master.flush(), replica);
+    REQUIRE(init.subscriptions.size() == 1);
+    CHECK(init.subscriptions[0].rows.size() == 3); // events 2, 3, 4
+
+    // Test operations that cross boundaries
+    master_db.exec("UPDATE events SET seq = 12 WHERE id = 1"); // below→inside
+    auto msgs1 = master.flush();
+    auto result1 = deliver(msgs1, replica);
+    REQUIRE(result1.subscriptions.size() == 1);
+    CHECK(result1.subscriptions[0].rows.size() == 4); // added event 1
+
+    master_db.exec("UPDATE events SET seq = 8 WHERE id = 2"); // inside→below
+    auto msgs2 = master.flush();
+    auto result2 = deliver(msgs2, replica);
+    REQUIRE(result2.subscriptions.size() == 1);
+    CHECK(result2.subscriptions[0].rows.size() == 3); // removed event 2
+
+    master_db.exec("INSERT INTO events VALUES (6, 18, 'new')"); // insert inside range
+    auto msgs3 = master.flush();
+    auto result3 = deliver(msgs3, replica);
+    REQUIRE(result3.subscriptions.size() == 1);
+    CHECK(result3.subscriptions[0].rows.size() == 4); // added event 6
+}
+
 TEST_CASE("integration: update moves row in/out of predicate scope") {
     DB master_db, replica_db;
     const char* schema =

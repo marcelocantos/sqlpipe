@@ -2741,7 +2741,7 @@ RAPtr inject_propagated_predicates(
     }
 }
 
-// optimize_ra defined below, after collect/propagate functions.
+// RA-RA transforms for optimization.
 RAPtr optimize_ra(RAPtr ra);
 
 /// Transform a SELECT AST into an RA tree.
@@ -3233,6 +3233,7 @@ struct VMContext {
     sqlite3_changeset_iter* iter;
     int op;   // SQLITE_INSERT, SQLITE_UPDATE, or SQLITE_DELETE
     bool use_new;  // true = LoadCol reads new values, false = old values
+    bool unknown_column = false;  // set when LoadCol can't read a value
 };
 
 /// Read a LE uint16 from program at position pc. Advances pc.
@@ -3261,7 +3262,7 @@ double read_f64(const Program& p, size_t& pc) {
 }
 
 /// Run a program against a changeset row context. Returns true if matched.
-bool vm_run(const Program& prog, const VMContext& ctx) {
+bool vm_run(const Program& prog, VMContext& ctx) {
     if (prog.empty()) return true;  // no program → conservative match
 
     std::vector<Value> stack;
@@ -3274,12 +3275,35 @@ bool vm_run(const Program& prog, const VMContext& ctx) {
             case VMOp::LoadCol: {
                 uint8_t col = prog[pc++];
                 sqlite3_value* val = nullptr;
-                if (ctx.use_new &&
-                    (ctx.op == SQLITE_INSERT || ctx.op == SQLITE_UPDATE)) {
+                if (ctx.op == SQLITE_INSERT) {
                     sqlite3changeset_new(ctx.iter, col, &val);
-                } else if (!ctx.use_new &&
-                    (ctx.op == SQLITE_UPDATE || ctx.op == SQLITE_DELETE)) {
+                } else if (ctx.op == SQLITE_DELETE) {
                     sqlite3changeset_old(ctx.iter, col, &val);
+                } else if (ctx.op == SQLITE_UPDATE) {
+                    // For UPDATE, the changeset only includes PK + changed
+                    // columns. Try the preferred direction first, then fall
+                    // back. If neither has a value, the column didn't change
+                    // and its value is unknown from the changeset alone.
+                    if (ctx.use_new) {
+                        sqlite3changeset_new(ctx.iter, col, &val);
+                        if (!val) sqlite3changeset_old(ctx.iter, col, &val);
+                    } else {
+                        sqlite3changeset_old(ctx.iter, col, &val);
+                        if (!val) sqlite3changeset_new(ctx.iter, col, &val);
+                    }
+                    if (!val) {
+                        // Column value unknown — push sentinel.
+                        // Any comparison with unknown must be conservative
+                        // (assume could match). We use a special int value
+                        // and short-circuit in comparisons. Actually, the
+                        // simplest correct approach: if ANY LoadCol returns
+                        // unknown, the whole expression is indeterminate →
+                        // return true (conservative).
+                        // Set a flag and bail.
+                        ctx.unknown_column = true;
+                        stack.push_back(std::monostate{}); // placeholder
+                        break;
+                    }
                 }
                 stack.push_back(sqlite3_value_to_value(val));
                 break;
@@ -3378,6 +3402,9 @@ bool vm_run(const Program& prog, const VMContext& ctx) {
             case VMOp::Halt:
                 goto done;
         }
+        // If a LoadCol couldn't determine the column value, the expression
+        // is indeterminate. Conservatively return true (could match).
+        if (ctx.unknown_column) return true;
     }
 done:
     if (stack.empty()) return true;  // empty program → conservative
@@ -3448,12 +3475,13 @@ std::set<SubscriptionId> evaluate_changeset(
                 continue;
             }
 
-            VMContext ctx{iter, cs_op, false};
+            VMContext ctx{iter, cs_op, false, false};
             bool old_match = false, new_match = false;
 
             // Run against old values (UPDATE, DELETE).
             if (cs_op == SQLITE_UPDATE || cs_op == SQLITE_DELETE) {
                 ctx.use_new = false;
+                ctx.unknown_column = false;
                 old_match = vm_run(sp.program, ctx);
             }
 
@@ -3461,6 +3489,7 @@ std::set<SubscriptionId> evaluate_changeset(
             if (!old_match &&
                 (cs_op == SQLITE_INSERT || cs_op == SQLITE_UPDATE)) {
                 ctx.use_new = true;
+                ctx.unknown_column = false;
                 new_match = vm_run(sp.program, ctx);
             }
 
@@ -3520,8 +3549,6 @@ struct QueryWatch::Impl {
     void rebuild_prog_index() {
         prog_index.clear();
         for (const auto& [id, sub] : subscriptions) {
-            // For each table this subscription depends on, compile a
-            // program from the predicates that apply to that table.
             for (const auto& table : sub.tables) {
                 auto program = detail::compile_predicates(
                     sub.predicates, table);
