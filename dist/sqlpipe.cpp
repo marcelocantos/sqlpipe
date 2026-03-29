@@ -3458,18 +3458,67 @@ int compare_values(const Value& a, const Value& b) {
            type_rank(a) > type_rank(b) ? 1 : 0;
 }
 
+/// Loaded row values for UPDATE operations where the changeset
+/// doesn't carry all columns needed by multi-column predicates.
+struct LoadedRow {
+    std::vector<Value> old_values;
+    std::vector<Value> new_values;
+};
+
+/// Load old and new row state for an UPDATE changeset entry.
+/// The changeset has already been applied, so the current DB state
+/// is the new row. Old state is reconstructed by overlaying changeset
+/// old values (PK + changed columns) onto the current row (unchanged
+/// columns are the same in old and new).
+LoadedRow load_update_row(sqlite3* db, const std::string& table,
+                          sqlite3_changeset_iter* iter, int ncol) {
+    LoadedRow row;
+    // Get rowid from changeset PK.
+    sqlite3_value* pk_val = nullptr;
+    sqlite3changeset_old(iter, 0, &pk_val);
+    if (!pk_val) return row;
+    int64_t rowid = sqlite3_value_int64(pk_val);
+
+    // Read current row from DB (= new state).
+    std::string sql = "SELECT * FROM \"" + table + "\" WHERE rowid = ?";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        if (stmt) sqlite3_finalize(stmt);
+        return row;
+    }
+    sqlite3_bind_int64(stmt, 1, rowid);
+
+    row.new_values.resize(static_cast<size_t>(ncol));
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        for (int i = 0; i < ncol; ++i) {
+            row.new_values[static_cast<size_t>(i)] =
+                sqlite3_value_to_value(sqlite3_column_value(stmt, i));
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    // Old = new, then overlay changeset old values for changed columns.
+    row.old_values = row.new_values;
+    for (int i = 0; i < ncol; ++i) {
+        sqlite3_value* val = nullptr;
+        sqlite3changeset_old(iter, i, &val);
+        if (val) {
+            row.old_values[static_cast<size_t>(i)] =
+                sqlite3_value_to_value(val);
+        }
+    }
+    return row;
+}
+
 /// VM execution context: provides column values for LoadCol.
 struct VMContext {
     sqlite3_changeset_iter* iter;
     int op;   // SQLITE_INSERT, SQLITE_UPDATE, or SQLITE_DELETE
     bool use_new;  // true = LoadCol reads new values, false = old values
 
-    /// Preloaded row values for UPDATE operations.
-    /// old_row and new_row contain the full row state, with unknown columns
-    /// filled from the database. Empty if not preloaded.
-    std::vector<Value> old_row;
-    std::vector<Value> new_row;
-    bool preloaded = false;
+    /// Loaded full row for UPDATE with multi-column predicates.
+    /// When set, LoadCol reads from here instead of the changeset.
+    const LoadedRow* loaded = nullptr;
 };
 
 /// Read a LE uint16 from program at position pc. Advances pc.
@@ -3511,25 +3560,25 @@ bool vm_run(const Program& prog, VMContext& ctx) {
             case VMOp::LoadCol: {
                 uint8_t col = prog[pc++];
 
-                // If row is preloaded (UPDATE with DB lookup), use it.
-                if (ctx.preloaded) {
-                    const auto& row = ctx.use_new ? ctx.new_row : ctx.old_row;
-                    if (col < row.size()) {
-                        stack.push_back(row[col]);
-                    } else {
-                        stack.push_back(std::monostate{});
-                    }
+                // If we have a loaded full row, use it directly.
+                if (ctx.loaded) {
+                    const auto& row = ctx.use_new
+                        ? ctx.loaded->new_values
+                        : ctx.loaded->old_values;
+                    stack.push_back(col < row.size()
+                        ? row[col] : Value{std::monostate{}});
                     break;
                 }
 
-                // Otherwise read directly from changeset.
+                // Read directly from changeset.
                 sqlite3_value* val = nullptr;
                 if (ctx.op == SQLITE_INSERT) {
                     sqlite3changeset_new(ctx.iter, col, &val);
                 } else if (ctx.op == SQLITE_DELETE) {
                     sqlite3changeset_old(ctx.iter, col, &val);
                 } else if (ctx.op == SQLITE_UPDATE) {
-                    // Fallback path for non-preloaded UPDATEs.
+                    // Single-column predicate path: try preferred direction,
+                    // fall back to other. If neither has a value, bail.
                     if (ctx.use_new) {
                         sqlite3changeset_new(ctx.iter, col, &val);
                         if (!val) sqlite3changeset_old(ctx.iter, col, &val);
@@ -3537,11 +3586,7 @@ bool vm_run(const Program& prog, VMContext& ctx) {
                         sqlite3changeset_old(ctx.iter, col, &val);
                         if (!val) sqlite3changeset_new(ctx.iter, col, &val);
                     }
-                    if (!val) {
-                        // Column value unknown — conservative bail-out.
-                        // This path only hits if preloading wasn't done.
-                        return true;
-                    }
+                    if (!val) return true;  // conservative
                 }
                 stack.push_back(sqlite3_value_to_value(val));
                 break;
@@ -3655,55 +3700,8 @@ struct SubProgram {
     Program        program;       // empty = no predicates for this table → always affected
     std::set<int>  columns_used;  // columns the query reads from this table
                                   // empty = unknown → conservative (all columns relevant)
-    bool needs_preload = false;   // true if program references columns that may be
-                                  // absent from UPDATE changesets (multi-column predicates)
+    bool needs_preload = false;   // true if program has multi-column predicates
 };
-
-/// Preload old and new row state for an UPDATE changeset entry.
-/// Reads the current DB row (which reflects the NEW state since the
-/// changeset has already been applied), then reconstructs old state
-/// from changeset old values for changed columns.
-void preload_update_row(VMContext& ctx, sqlite3* db,
-                        const std::string& table, int ncol) {
-    // Get rowid from changeset — it's the PK, always in old values.
-    // For integer primary key tables, the PK column value IS the rowid.
-    sqlite3_value* pk_val = nullptr;
-    sqlite3changeset_old(ctx.iter, 0, &pk_val);
-    if (!pk_val) return;  // can't determine rowid
-    int64_t rowid = sqlite3_value_int64(pk_val);
-
-    // Read current row from DB (= new state).
-    std::string sql = "SELECT * FROM \"" + table + "\" WHERE rowid = ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-        if (stmt) sqlite3_finalize(stmt);
-        return;
-    }
-    sqlite3_bind_int64(stmt, 1, rowid);
-
-    ctx.new_row.resize(static_cast<size_t>(ncol));
-    ctx.old_row.resize(static_cast<size_t>(ncol));
-
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        for (int i = 0; i < ncol; ++i) {
-            ctx.new_row[static_cast<size_t>(i)] =
-                sqlite3_value_to_value(sqlite3_column_value(stmt, i));
-        }
-    }
-    sqlite3_finalize(stmt);
-
-    // Old row = new row, then overlay with changeset old values for
-    // changed columns.
-    ctx.old_row = ctx.new_row;
-    for (int i = 0; i < ncol; ++i) {
-        sqlite3_value* val = nullptr;
-        sqlite3changeset_old(ctx.iter, i, &val);
-        if (val) {
-            ctx.old_row[static_cast<size_t>(i)] = sqlite3_value_to_value(val);
-        }
-    }
-    ctx.preloaded = true;
-}
 
 /// The predicate index: maps table → list of compiled programs.
 using ProgramIndex = std::unordered_map<std::string, std::vector<SubProgram>>;
@@ -3784,13 +3782,17 @@ std::set<SubscriptionId> evaluate_changeset(
                 continue;
             }
 
-            VMContext ctx{iter, cs_op, false, {}, {}, false};
+            VMContext ctx{iter, cs_op, false, nullptr};
             bool old_match = false, new_match = false;
 
-            // For UPDATE with multi-column predicates, preload the
-            // full row from the database to fill in unchanged columns.
+            // For UPDATE with multi-column predicates, load the full
+            // row from the DB to provide unchanged column values.
+            LoadedRow loaded_row;
             if (cs_op == SQLITE_UPDATE && sp.needs_preload && db) {
-                preload_update_row(ctx, db, table_name, ncol);
+                loaded_row = load_update_row(db, table_name, iter, ncol);
+                if (!loaded_row.old_values.empty()) {
+                    ctx.loaded = &loaded_row;
+                }
             }
 
             // Run against old values (UPDATE, DELETE).
@@ -4053,6 +4055,7 @@ std::vector<QueryResult> QueryWatch::notify(
 bool QueryWatch::empty() const {
     return impl_->subscriptions.empty();
 }
+
 
 // ── query (one-shot) ────────────────────────────────────────────
 
