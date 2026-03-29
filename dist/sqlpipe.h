@@ -559,6 +559,20 @@ public:
     /// Generate the initial HelloMsg to send to the master.
     OutMessage hello() const;
 
+    /// Initiate a convergence round. Computes and returns bucket hashes
+    /// for the current local state. The master compares these against its
+    /// own state and responds with NeedBuckets/DiffReady.
+    ///
+    /// Can be called in any state — Init, Live, or after reset().
+    /// Unlike hello(), does not require a handshake sequence. The master
+    /// processes the BucketHashes directly without a prior HelloMsg.
+    ///
+    /// Use this for:
+    /// - Periodic convergence checks (are we still in sync?)
+    /// - Reconnection without full handshake
+    /// - Loss-tolerant sync over unreliable channels
+    std::vector<OutMessage> converge();
+
     /// Process an incoming message from the master.
     HandleResult handle_message(const Message& msg);
 

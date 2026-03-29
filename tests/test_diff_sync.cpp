@@ -351,3 +351,125 @@ TEST_CASE("diff sync: no fast reconnect when seq differs") {
     CHECK(replica3.state() == Replica::State::Live);
     CHECK(replica_db.count("t1") == 2);
 }
+
+// ── Convergence loop tests ─────────────────────────────────────────
+
+TEST_CASE("convergence: replica-initiated sync without hello") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    // Populate master.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    Master master(master_db.db);
+    master.flush();
+    master.flush();
+
+    Replica replica(replica_db.db);
+
+    // Instead of hello → handshake, use converge() directly.
+    auto bucket_msgs = replica.converge();
+    REQUIRE(!bucket_msgs.empty());
+    CHECK(std::holds_alternative<BucketHashesMsg>(bucket_msgs[0].msg));
+    CHECK(bucket_msgs[0].delivery == Delivery::BestEffort);
+
+    // Feed bucket hashes to master — no prior HelloMsg needed.
+    auto master_resp = master.handle_message(bucket_msgs[0].msg);
+    REQUIRE(!master_resp.empty());
+
+    // Master responds with NeedBuckets (+ maybe DiffReady).
+    // Feed all responses to replica.
+    for (const auto& om : master_resp) {
+        auto hr = replica.handle_message(om.msg);
+        // Feed replica responses back to master.
+        for (const auto& rom : hr.messages) {
+            auto mr = master.handle_message(rom.msg);
+            // Continue relay if needed.
+            for (const auto& m : mr) {
+                replica.handle_message(m.msg);
+            }
+        }
+    }
+
+    // Replica should reach Live and have the data.
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 2);
+}
+
+TEST_CASE("convergence: re-convergence check while live") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+    CHECK(replica.state() == Replica::State::Live);
+
+    // Insert and deliver one row.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
+    auto msgs = master.flush();
+    for (const auto& om : msgs) replica.handle_message(om.msg);
+    CHECK(replica_db.count("t1") == 1);
+
+    // Run a convergence check while already Live.
+    // This verifies the master and replica are still in sync.
+    auto bucket_msgs = replica.converge();
+    REQUIRE(!bucket_msgs.empty());
+
+    auto master_resp = master.handle_message(bucket_msgs[0].msg);
+    // All buckets should match — master responds with empty NeedBuckets + DiffReady.
+    REQUIRE(master_resp.size() == 2);
+    CHECK(std::holds_alternative<NeedBucketsMsg>(master_resp[0].msg));
+    CHECK(std::get<NeedBucketsMsg>(master_resp[0].msg).ranges.empty());
+    CHECK(std::holds_alternative<DiffReadyMsg>(master_resp[1].msg));
+    auto& dr = std::get<DiffReadyMsg>(master_resp[1].msg);
+    CHECK(dr.patchset.empty());
+    CHECK(dr.deletes.empty());
+
+    // Feed back to replica — should stay Live and data unchanged.
+    for (const auto& om : master_resp) {
+        replica.handle_message(om.msg);
+    }
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 1);
+}
+
+TEST_CASE("convergence: re-convergence discovers missed changes") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Master writes but we "lose" the changeset (don't deliver).
+    master_db.exec("INSERT INTO t1 VALUES (1, 'lost')");
+    master.flush();  // changesets generated but not delivered
+    master_db.exec("INSERT INTO t1 VALUES (2, 'also lost')");
+    master.flush();
+
+    CHECK(master_db.count("t1") == 2);
+    CHECK(replica_db.count("t1") == 0);
+
+    // Replica initiates convergence — discovers the gap.
+    auto bucket_msgs = replica.converge();
+    auto master_resp = master.handle_message(bucket_msgs[0].msg);
+
+    // Relay the diff exchange.
+    for (const auto& om : master_resp) {
+        auto hr = replica.handle_message(om.msg);
+        for (const auto& rom : hr.messages) {
+            auto mr = master.handle_message(rom.msg);
+            for (const auto& m : mr) {
+                replica.handle_message(m.msg);
+            }
+        }
+    }
+
+    // Replica should now have both rows.
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 2);
+}

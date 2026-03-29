@@ -1554,10 +1554,9 @@ struct Master::Impl {
     }
 
     std::vector<OutMessage> handle_bucket_hashes(const BucketHashesMsg& msg) {
-        if (hs_state != HSState::WaitBucketHashes) {
-            return {tagged(Message{ErrorMsg{ErrorCode::InvalidState,
-                "unexpected BucketHashesMsg"}})};
-        }
+        // Accept BucketHashes in any state — enables convergence loop
+        // where the replica can initiate diff sync at any time, including
+        // re-convergence checks while already Live.
 
         // Compute our own bucket hashes.
         report(DiffPhase::ComputingBuckets, {},
@@ -1655,9 +1654,12 @@ struct Master::Impl {
     }
 
     std::vector<OutMessage> handle_row_hashes(const RowHashesMsg& msg) {
-        if (hs_state != HSState::WaitRowHashes) {
+        // Accept RowHashes when we have pending ranges (from a prior
+        // BucketHashes comparison). This enables convergence loop
+        // without strict state gating.
+        if (pending_ranges.empty()) {
             return {tagged(Message{ErrorMsg{ErrorCode::InvalidState,
-                "unexpected RowHashesMsg"}})};
+                "RowHashesMsg without pending ranges"}})};
         }
 
         // Build map of replica's rows: table → (rowid → hash).
@@ -4352,7 +4354,9 @@ struct Replica::Impl {
     }
 
     HandleResult handle_need_buckets(const NeedBucketsMsg& m) {
-        if (state != Replica::State::DiffBuckets) {
+        // Accept in DiffBuckets (normal handshake) or Live (re-convergence).
+        if (state != Replica::State::DiffBuckets &&
+            state != Replica::State::Live) {
             state = Replica::State::Error;
             return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
                 "received NeedBucketsMsg in unexpected state"}})}, {}, {}};
@@ -4415,8 +4419,10 @@ struct Replica::Impl {
     }
 
     HandleResult handle_diff_ready(const DiffReadyMsg& m) {
+        // Accept in DiffRows, DiffBuckets (normal handshake), or Live (re-convergence).
         if (state != Replica::State::DiffRows &&
-            state != Replica::State::DiffBuckets) {
+            state != Replica::State::DiffBuckets &&
+            state != Replica::State::Live) {
             state = Replica::State::Error;
             return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
                 "received DiffReadyMsg in unexpected state"}})}, {}, {}};
@@ -4530,6 +4536,25 @@ OutMessage Replica::hello() const {
     return tagged(Message{HelloMsg{kProtocolVersion,
                     detail::compute_schema_fingerprint(impl_->db, f), {},
                     impl_->seq}});
+}
+
+std::vector<OutMessage> Replica::converge() {
+    // Compute bucket hashes and transition to DiffBuckets, waiting for
+    // the master's NeedBuckets response. Can be called in any state.
+    const auto* f = impl_->config.table_filter
+        ? &*impl_->config.table_filter : nullptr;
+
+    impl_->report(DiffPhase::ComputingBuckets, {}, 0, 0);
+    auto buckets = detail::compute_all_buckets(
+        impl_->db, f, impl_->config.bucket_size);
+    impl_->report(DiffPhase::ComputingBuckets, {},
+               static_cast<std::int64_t>(buckets.size()),
+               static_cast<std::int64_t>(buckets.size()));
+
+    impl_->state = State::DiffBuckets;
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info,
+                "converge: sending {} bucket hashes", buckets.size());
+    return {tagged(Message{BucketHashesMsg{std::move(buckets)}})};
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
