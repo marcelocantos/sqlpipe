@@ -442,6 +442,8 @@ std::vector<std::uint8_t> serialize(const Message& msg) {
         else if constexpr (std::is_same_v<T, BucketHashesMsg>) {
             put_u8(buf, static_cast<std::uint8_t>(MessageTag::BucketHashes));
             put_i64(buf, m.last_seq);
+            put_u32(buf, m.protocol_version);
+            put_i32(buf, m.schema_version);
             put_u32(buf, static_cast<std::uint32_t>(m.buckets.size()));
             for (const auto& b : m.buckets) {
                 put_string(buf, b.table);
@@ -565,6 +567,8 @@ Message deserialize(std::span<const std::uint8_t> buf) {
     case MessageTag::BucketHashes: {
         BucketHashesMsg m;
         m.last_seq = r.read_i64();
+        m.protocol_version = r.read_u32();
+        m.schema_version = r.read_i32();
         auto count = r.read_u32();
         check_count(count);
         m.buckets.resize(count);
@@ -1559,6 +1563,39 @@ struct Master::Impl {
         // Accept BucketHashes in any state — enables convergence loop
         // where the replica can initiate diff sync at any time, including
         // re-convergence checks while already Live.
+
+        // Protocol version check (if provided).
+        if (msg.protocol_version != 0 &&
+            msg.protocol_version != kProtocolVersion) {
+            return {tagged(Message{ErrorMsg{ErrorCode::ProtocolError,
+                "unsupported protocol version: " +
+                std::to_string(msg.protocol_version)}})};
+        }
+
+        // Schema check (if provided).
+        if (msg.schema_version != 0) {
+            auto my_sv = detail::compute_schema_fingerprint(db, filter());
+            if (msg.schema_version != my_sv) {
+                if (config.on_schema_mismatch &&
+                    config.on_schema_mismatch(msg.schema_version, my_sv, "")) {
+                    cached_sv = detail::compute_schema_fingerprint(db, filter());
+                    scan_tables();
+                    recreate_session();
+                    my_sv = cached_sv;
+                }
+                if (msg.schema_version != my_sv) {
+                    SQLPIPE_LOG(config.on_log, LogLevel::Info,
+                                "schema mismatch (replica={}, master={})",
+                                msg.schema_version, my_sv);
+                    return {tagged(Message{ErrorMsg{ErrorCode::SchemaMismatch,
+                        "schema mismatch: replica=" +
+                        std::to_string(msg.schema_version) +
+                        " master=" + std::to_string(my_sv),
+                        my_sv,
+                        detail::get_schema_sql(db, filter())}})};
+                }
+            }
+        }
 
         // Fast path: if the replica's seq is behind but within the
         // changeset queue, replay from the queue instead of diffing.
@@ -4383,7 +4420,9 @@ struct Replica::Impl {
                static_cast<std::int64_t>(buckets.size()));
         state = Replica::State::DiffBuckets;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "sending {} bucket hashes (seq={})", buckets.size(), seq);
-        return {{tagged(Message{BucketHashesMsg{std::move(buckets), seq}})}, {}, {}};
+        return {{tagged(Message{BucketHashesMsg{
+            std::move(buckets), seq, kProtocolVersion,
+            detail::compute_schema_fingerprint(db, filter())}})}, {}, {}};
     }
 
     HandleResult handle_need_buckets(const NeedBucketsMsg& m) {
@@ -4584,11 +4623,14 @@ std::vector<OutMessage> Replica::converge() {
                static_cast<std::int64_t>(buckets.size()),
                static_cast<std::int64_t>(buckets.size()));
 
+    auto sv = detail::compute_schema_fingerprint(impl_->db, f);
+
     impl_->state = State::DiffBuckets;
     SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info,
                 "converge: sending {} bucket hashes (seq={})",
                 buckets.size(), impl_->seq);
-    return {tagged(Message{BucketHashesMsg{std::move(buckets), impl_->seq}})};
+    return {tagged(Message{BucketHashesMsg{
+        std::move(buckets), impl_->seq, kProtocolVersion, sv}})};
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
