@@ -1366,6 +1366,14 @@ TEST_CASE("integration: transitive predicate propagation through join") {
         "JOIN client c ON i.client_id = c.id "
         "WHERE c.id = 1");
 
+    // Trigger initial subscription delivery with an unrelated change.
+    // The first notify after subscribe always evaluates (initial result).
+    master_db.exec("INSERT INTO invoice VALUES (99, 2, 1.0)");
+    auto init_msgs = master.flush();
+    auto init_result = deliver(init_msgs, replica);
+    REQUIRE(init_result.subscriptions.size() == 1);  // initial delivery
+    CHECK(init_result.subscriptions[0].rows.empty()); // no rows for client 1
+
     // Insert invoice for client 2 — should NOT fire because the
     // propagated predicate invoice.client_id = 1 doesn't match.
     master_db.exec("INSERT INTO invoice VALUES (100, 2, 500.0)");
@@ -1392,6 +1400,88 @@ TEST_CASE("integration: transitive predicate propagation through join") {
     msgs = master.flush();
     result = deliver(msgs, replica);
     CHECK(result.subscriptions.empty());
+}
+
+TEST_CASE("integration: predicate correctness — skipped re-eval implies identical result") {
+    // Synthetic correctness test: if the analysis engine says a changeset
+    // doesn't affect a subscription, verify the query result is actually
+    // unchanged by evaluating before and after.
+    DB master_db, replica_db;
+    master_db.exec(
+        "CREATE TABLE client (id INTEGER PRIMARY KEY, name TEXT);"
+        "CREATE TABLE invoice (id INTEGER PRIMARY KEY, client_id INTEGER, "
+        "  amount REAL, status TEXT)");
+    replica_db.exec(
+        "CREATE TABLE client (id INTEGER PRIMARY KEY, name TEXT);"
+        "CREATE TABLE invoice (id INTEGER PRIMARY KEY, client_id INTEGER, "
+        "  amount REAL, status TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Populate base data.
+    master_db.exec("INSERT INTO client VALUES (1, 'Alice')");
+    master_db.exec("INSERT INTO client VALUES (2, 'Bob')");
+    master_db.exec("INSERT INTO invoice VALUES (1, 1, 100.0, 'paid')");
+    master_db.exec("INSERT INTO invoice VALUES (2, 2, 200.0, 'pending')");
+    for (int i = 0; i < 4; ++i) deliver(master.flush(), replica);
+
+    // Subscribe to Alice's invoices.
+    auto sub_id = replica.subscribe(
+        "SELECT i.id, i.amount, i.status FROM invoice i "
+        "JOIN client c ON i.client_id = c.id "
+        "WHERE c.id = 1");
+
+    // Get initial result.
+    master_db.exec("INSERT INTO invoice VALUES (99, 2, 0.01, 'x')");
+    auto init = deliver(master.flush(), replica);  // triggers initial eval
+    REQUIRE(init.subscriptions.size() == 1);
+    auto baseline = init.subscriptions[0];
+
+    // Now perform a series of operations that should NOT affect Alice's invoices.
+    struct { const char* sql; const char* desc; } ops[] = {
+        {"INSERT INTO invoice VALUES (10, 2, 300.0, 'new')",
+         "insert for Bob"},
+        {"UPDATE invoice SET amount = 999.0 WHERE id = 2",
+         "update Bob's invoice"},
+        {"UPDATE client SET name = 'Robert' WHERE id = 2",
+         "rename Bob"},
+        {"INSERT INTO client VALUES (3, 'Charlie')",
+         "insert new client"},
+        {"DELETE FROM invoice WHERE id = 10",
+         "delete Bob's invoice"},
+    };
+
+    for (const auto& op : ops) {
+        // Snapshot: query result before the operation.
+        auto before = sqlpipe::query(replica_db.db,
+            "SELECT i.id, i.amount, i.status FROM invoice i "
+            "JOIN client c ON i.client_id = c.id "
+            "WHERE c.id = 1");
+
+        // Apply the operation.
+        master_db.exec(op.sql);
+        auto msgs = master.flush();
+        auto result = deliver(msgs, replica);
+
+        // If the engine says no re-evaluation needed...
+        if (result.subscriptions.empty()) {
+            // ...verify the query result is actually unchanged.
+            auto after = sqlpipe::query(replica_db.db,
+                "SELECT i.id, i.amount, i.status FROM invoice i "
+                "JOIN client c ON i.client_id = c.id "
+                "WHERE c.id = 1");
+            CHECK(before.rows == after.rows);
+        }
+    }
+
+    // Verify operations that DO affect Alice's invoices are detected.
+    master_db.exec("INSERT INTO invoice VALUES (20, 1, 500.0, 'new')");
+    auto msgs = master.flush();
+    auto result = deliver(msgs, replica);
+    REQUIRE(result.subscriptions.size() == 1);
+    CHECK(result.subscriptions[0].rows.size() == 2);  // original + new
 }
 
 TEST_CASE("integration: update moves row in/out of predicate scope") {

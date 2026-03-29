@@ -1917,12 +1917,27 @@ struct RANode {
 
 using RAPtr = std::unique_ptr<RANode>;
 
-/// A resolved equality predicate: table.column = literal value.
+/// Comparison operator for predicate checks.
+enum class CheckOp : std::uint8_t {
+    Eq,        // column = value
+    Ne,        // column != value
+    Lt,        // column < value
+    Le,        // column <= value
+    Gt,        // column > value
+    Ge,        // column >= value
+    IsNull,    // column IS NULL
+    IsNotNull, // column IS NOT NULL
+    InList,    // column IN (v1, v2, ...)
+};
+
+/// A resolved predicate: table.column <op> literal value(s).
 struct ResolvedPredicate {
-    std::string table;
-    std::string column;
-    int         column_index;  // position in table schema (-1 if unknown)
-    Value       value;
+    std::string        table;
+    std::string        column;
+    int                column_index;  // position in table schema (-1 if unknown)
+    CheckOp            op = CheckOp::Eq;
+    Value              value;   // for Eq/Ne/Lt/Le/Gt/Ge
+    std::vector<Value> values;  // for InList
 };
 
 struct RAScan : RANode {
@@ -2090,7 +2105,51 @@ bool is_column_ref(const LpNode* node) {
 
 /// Extract equality predicates from a WHERE expression.
 /// Walks AND-connected terms looking for `column = literal` patterns.
-void extract_eq_predicates(
+/// Resolve a column reference to (table, column, column_index).
+/// Returns false if resolution fails.
+bool resolve_column(const LpNode* col_node, const SchemaMap& schema,
+                    const AliasMap& aliases, std::string& table_out,
+                    std::string& col_out, int& idx_out) {
+    if (!is_column_ref(col_node)) return false;
+    col_out = col_node->u.column_ref.column;
+    if (col_node->u.column_ref.table) {
+        table_out = resolve_table(aliases,
+            std::string(col_node->u.column_ref.table));
+    } else {
+        table_out = resolve_unqualified_column(schema, aliases, col_out);
+    }
+    if (table_out.empty()) return false;
+    idx_out = column_index(schema, table_out, col_out);
+    return true;
+}
+
+/// Map liteparser binary op to CheckOp. Returns nullopt for non-comparison ops.
+std::optional<CheckOp> binop_to_checkop(LpBinOp op) {
+    switch (op) {
+        case LP_OP_EQ:  return CheckOp::Eq;
+        case LP_OP_NE:  return CheckOp::Ne;
+        case LP_OP_LT:  return CheckOp::Lt;
+        case LP_OP_LE:  return CheckOp::Le;
+        case LP_OP_GT:  return CheckOp::Gt;
+        case LP_OP_GE:  return CheckOp::Ge;
+        case LP_OP_IS:  return CheckOp::Eq;  // IS is like = for non-NULL
+        case LP_OP_ISNOT: return CheckOp::Ne;
+        default:        return std::nullopt;
+    }
+}
+
+/// Flip a comparison op (for normalizing literal on left).
+CheckOp flip_checkop(CheckOp op) {
+    switch (op) {
+        case CheckOp::Lt: return CheckOp::Gt;
+        case CheckOp::Le: return CheckOp::Ge;
+        case CheckOp::Gt: return CheckOp::Lt;
+        case CheckOp::Ge: return CheckOp::Le;
+        default: return op;  // Eq, Ne are symmetric
+    }
+}
+
+void extract_predicates(
         const LpNode* expr,
         const SchemaMap& schema,
         const AliasMap& aliases,
@@ -2098,40 +2157,107 @@ void extract_eq_predicates(
         bool& has_opaque) {
     if (!expr) return;
 
+    // AND → recurse into branches.
     if (expr->kind == LP_EXPR_BINARY_OP && expr->u.binary.op == LP_OP_AND) {
-        // Recurse into AND branches.
-        extract_eq_predicates(
+        extract_predicates(
             expr->u.binary.left, schema, aliases, out, has_opaque);
-        extract_eq_predicates(
+        extract_predicates(
             expr->u.binary.right, schema, aliases, out, has_opaque);
         return;
     }
 
-    if (expr->kind == LP_EXPR_BINARY_OP && expr->u.binary.op == LP_OP_EQ) {
-        const LpNode* lhs = expr->u.binary.left;
-        const LpNode* rhs = expr->u.binary.right;
+    // Comparison operators: =, !=, <, <=, >, >=, IS, IS NOT.
+    if (expr->kind == LP_EXPR_BINARY_OP) {
+        auto check_op = binop_to_checkop(expr->u.binary.op);
+        if (check_op) {
+            const LpNode* lhs = expr->u.binary.left;
+            const LpNode* rhs = expr->u.binary.right;
 
-        // Normalize: column on left, literal on right.
-        if (is_literal(lhs) && is_column_ref(rhs)) std::swap(lhs, rhs);
-
-        if (is_column_ref(lhs) && is_literal(rhs)) {
-            std::string table;
-            std::string col = lhs->u.column_ref.column;
-
-            if (lhs->u.column_ref.table) {
-                table = resolve_table(aliases,
-                    std::string(lhs->u.column_ref.table));
-            } else {
-                table = resolve_unqualified_column(schema, aliases, col);
+            // Normalize: column on left, literal on right.
+            bool flipped = false;
+            if (is_literal(lhs) && is_column_ref(rhs)) {
+                std::swap(lhs, rhs);
+                flipped = true;
             }
 
-            if (!table.empty()) {
-                int idx = column_index(schema, table, col);
-                out.push_back({table, col, idx, lp_literal_to_value(rhs)});
+            if (is_column_ref(lhs) && is_literal(rhs)) {
+                std::string table, col;
+                int idx;
+                if (resolve_column(lhs, schema, aliases, table, col, idx)) {
+                    auto op = flipped ? flip_checkop(*check_op) : *check_op;
+                    out.push_back({table, col, idx, op,
+                                   lp_literal_to_value(rhs), {}});
+                    return;
+                }
+            }
+
+            // IS NULL / IS NOT NULL via `column IS NULL` (LP_OP_IS with NULL literal).
+            if ((*check_op == CheckOp::Eq || *check_op == CheckOp::Ne) &&
+                is_column_ref(lhs) && rhs && rhs->kind == LP_EXPR_LITERAL_NULL) {
+                std::string table, col;
+                int idx;
+                if (resolve_column(lhs, schema, aliases, table, col, idx)) {
+                    auto op = (*check_op == CheckOp::Eq)
+                        ? CheckOp::IsNull : CheckOp::IsNotNull;
+                    out.push_back({table, col, idx, op, {}, {}});
+                    return;
+                }
+            }
+        }
+    }
+
+    // IN list: column IN (val1, val2, ...).
+    if (expr->kind == LP_EXPR_IN && !expr->u.in.is_not) {
+        const LpNode* col_expr = expr->u.in.expr;
+        // Only handle literal value lists (not subqueries).
+        if (is_column_ref(col_expr) && !expr->u.in.select &&
+            expr->u.in.values.count > 0) {
+            std::string table, col;
+            int idx;
+            if (resolve_column(col_expr, schema, aliases, table, col, idx)) {
+                // Check all values are literals.
+                std::vector<Value> vals;
+                bool all_literal = true;
+                for (int i = 0; i < expr->u.in.values.count; ++i) {
+                    if (is_literal(expr->u.in.values.items[i])) {
+                        vals.push_back(
+                            lp_literal_to_value(expr->u.in.values.items[i]));
+                    } else {
+                        all_literal = false;
+                        break;
+                    }
+                }
+                if (all_literal) {
+                    out.push_back({table, col, idx, CheckOp::InList,
+                                   {}, std::move(vals)});
+                    return;
+                }
+            }
+        }
+    }
+
+    // BETWEEN: column BETWEEN low AND high → column >= low AND column <= high.
+    if (expr->kind == LP_EXPR_BETWEEN && !expr->u.between.is_not) {
+        const LpNode* col_expr = expr->u.between.expr;
+        if (is_column_ref(col_expr) &&
+            is_literal(expr->u.between.low) &&
+            is_literal(expr->u.between.high)) {
+            std::string table, col;
+            int idx;
+            if (resolve_column(col_expr, schema, aliases, table, col, idx)) {
+                out.push_back({table, col, idx, CheckOp::Ge,
+                               lp_literal_to_value(expr->u.between.low), {}});
+                out.push_back({table, col, idx, CheckOp::Le,
+                               lp_literal_to_value(expr->u.between.high), {}});
                 return;
             }
         }
     }
+
+    // ISNULL / NOTNULL unary expressions.
+    // These appear as expr kind LP_EXPR_UNARY_OP with various forms.
+    // liteparser may represent `x IS NULL` as a binary IS op (handled above).
+    // For explicit `x ISNULL` / `x NOTNULL`, check unary forms if needed.
 
     // Any term we couldn't extract is opaque.
     has_opaque = true;
@@ -2633,7 +2759,7 @@ RAPtr select_to_ra(const LpNode* select, const SchemaMap& schema,
     // WHERE → Filter with predicate extraction + implicit join detection.
     if (select->u.select.where) {
         auto filter = std::make_unique<RAFilter>(std::move(ra));
-        extract_eq_predicates(
+        extract_predicates(
             select->u.select.where, schema, aliases,
             filter->predicates, filter->has_opaque_terms);
 
@@ -2788,6 +2914,12 @@ void collect_equijoins(const RANode* node,
 /// {A.col1 = B.col2}, if table.column matches one side, derive
 /// a predicate for the other side.
 /// Repeats until no new predicates are derived (transitive closure).
+/// Check if two predicates are structurally identical.
+bool predicates_match(const ResolvedPredicate& a, const ResolvedPredicate& b) {
+    return a.table == b.table && a.column == b.column &&
+           a.op == b.op && a.value == b.value && a.values == b.values;
+}
+
 void propagate_predicates(
         std::vector<ResolvedPredicate>& predicates,
         const std::vector<JoinEquality>& equijoins) {
@@ -2803,40 +2935,35 @@ void propagate_predicates(
                 // Check if predicate matches the left side of the equijoin.
                 if (pred.table == eq.left_table &&
                     pred.column == eq.left_column) {
-                    // Derive: right_table.right_column = pred.value
-                    bool already_exists = false;
+                    ResolvedPredicate derived{
+                        eq.right_table, eq.right_column,
+                        eq.right_index, pred.op, pred.value, pred.values};
+                    bool exists = false;
                     for (const auto& p : predicates) {
-                        if (p.table == eq.right_table &&
-                            p.column == eq.right_column &&
-                            p.value == pred.value) {
-                            already_exists = true;
-                            break;
+                        if (predicates_match(p, derived)) {
+                            exists = true; break;
                         }
                     }
-                    if (!already_exists) {
-                        predicates.push_back({
-                            eq.right_table, eq.right_column,
-                            eq.right_index, pred.value});
+                    if (!exists) {
+                        predicates.push_back(std::move(derived));
                         changed = true;
                     }
                 }
 
-                // Check the right side of the equijoin.
+                // Check the right side.
                 if (pred.table == eq.right_table &&
                     pred.column == eq.right_column) {
-                    bool already_exists = false;
+                    ResolvedPredicate derived{
+                        eq.left_table, eq.left_column,
+                        eq.left_index, pred.op, pred.value, pred.values};
+                    bool exists = false;
                     for (const auto& p : predicates) {
-                        if (p.table == eq.left_table &&
-                            p.column == eq.left_column &&
-                            p.value == pred.value) {
-                            already_exists = true;
-                            break;
+                        if (predicates_match(p, derived)) {
+                            exists = true; break;
                         }
                     }
-                    if (!already_exists) {
-                        predicates.push_back({
-                            eq.left_table, eq.left_column,
-                            eq.left_index, pred.value});
+                    if (!exists) {
+                        predicates.push_back(std::move(derived));
                         changed = true;
                     }
                 }
@@ -2878,141 +3005,243 @@ RAPtr optimize_ra(RAPtr ra) {
     return ra;
 }
 
-/// Check if a changeset row value matches a predicate value.
-bool value_matches(const Value& predicate_val, sqlite3_value* db_val) {
-    if (!db_val) return false;
-    int type = sqlite3_value_type(db_val);
-    return std::visit([&](const auto& pv) -> bool {
-        using T = std::decay_t<decltype(pv)>;
-        if constexpr (std::is_same_v<T, std::monostate>) {
-            return type == SQLITE_NULL;
-        } else if constexpr (std::is_same_v<T, std::int64_t>) {
-            return type == SQLITE_INTEGER &&
-                   sqlite3_value_int64(db_val) == pv;
-        } else if constexpr (std::is_same_v<T, double>) {
-            return type == SQLITE_FLOAT &&
-                   sqlite3_value_double(db_val) == pv;
-        } else if constexpr (std::is_same_v<T, std::string>) {
-            if (type != SQLITE_TEXT) return false;
-            const char* text = reinterpret_cast<const char*>(
-                sqlite3_value_text(db_val));
-            return text && pv == text;
-        } else if constexpr (std::is_same_v<T, std::vector<std::uint8_t>>) {
-            if (type != SQLITE_BLOB) return false;
-            int len = sqlite3_value_bytes(db_val);
-            if (static_cast<size_t>(len) != pv.size()) return false;
-            return std::memcmp(sqlite3_value_blob(db_val),
-                               pv.data(), pv.size()) == 0;
+// ── Predicate check engine ──────────────────────────────────────
+
+/// A single predicate check compiled from the RA.
+struct PredicateCheck {
+    CheckOp            op;
+    Value              value;   // for Eq/Ne/Lt/Le/Gt/Ge
+    std::vector<Value> values;  // for InList
+};
+
+/// Convert a sqlite3_value to a sqlpipe::Value for comparison.
+Value sqlite3_value_to_value(sqlite3_value* v) {
+    if (!v) return std::monostate{};
+    switch (sqlite3_value_type(v)) {
+        case SQLITE_INTEGER:
+            return sqlite3_value_int64(v);
+        case SQLITE_FLOAT:
+            return sqlite3_value_double(v);
+        case SQLITE_TEXT: {
+            const char* t = reinterpret_cast<const char*>(
+                sqlite3_value_text(v));
+            return t ? std::string(t) : std::string{};
         }
-        return false;
-    }, predicate_val);
+        case SQLITE_BLOB: {
+            int len = sqlite3_value_bytes(v);
+            auto* p = static_cast<const std::uint8_t*>(sqlite3_value_blob(v));
+            return std::vector<std::uint8_t>(p, p + len);
+        }
+        default:
+            return std::monostate{};
+    }
 }
 
-/// Check if any predicate for a given table matches a changeset row.
-/// Uses sqlite3changeset_iter to inspect old/new column values.
-/// Returns true if any predicate matches (i.e., the change could affect
-/// a query with those predicates).
-bool changeset_row_matches(
-        const std::vector<ResolvedPredicate>& predicates,
-        const std::string& table,
-        sqlite3_changeset_iter* iter,
-        int op) {
-    for (const auto& pred : predicates) {
-        if (pred.table != table || pred.column_index < 0) continue;
+/// Compare two Values. Returns <0, 0, >0 following SQLite affinity rules.
+/// NULL is less than everything.
+int compare_values(const Value& a, const Value& b) {
+    // Null handling.
+    bool a_null = std::holds_alternative<std::monostate>(a);
+    bool b_null = std::holds_alternative<std::monostate>(b);
+    if (a_null && b_null) return 0;
+    if (a_null) return -1;
+    if (b_null) return 1;
 
-        bool matches = false;
-
-        // Check old values (for UPDATE and DELETE).
-        if (op == SQLITE_UPDATE || op == SQLITE_DELETE) {
-            sqlite3_value* val = nullptr;
-            if (sqlite3changeset_old(iter, pred.column_index, &val) == SQLITE_OK
-                && val) {
-                if (value_matches(pred.value, val)) matches = true;
-            }
+    // Same-type comparison.
+    if (auto* ai = std::get_if<std::int64_t>(&a)) {
+        if (auto* bi = std::get_if<std::int64_t>(&b))
+            return (*ai < *bi) ? -1 : (*ai > *bi) ? 1 : 0;
+        if (auto* bd = std::get_if<double>(&b))
+            return (static_cast<double>(*ai) < *bd) ? -1 :
+                   (static_cast<double>(*ai) > *bd) ? 1 : 0;
+    }
+    if (auto* ad = std::get_if<double>(&a)) {
+        if (auto* bd = std::get_if<double>(&b))
+            return (*ad < *bd) ? -1 : (*ad > *bd) ? 1 : 0;
+        if (auto* bi = std::get_if<std::int64_t>(&b))
+            return (*ad < static_cast<double>(*bi)) ? -1 :
+                   (*ad > static_cast<double>(*bi)) ? 1 : 0;
+    }
+    if (auto* as = std::get_if<std::string>(&a)) {
+        if (auto* bs = std::get_if<std::string>(&b))
+            return as->compare(*bs);
+    }
+    if (auto* ab = std::get_if<std::vector<std::uint8_t>>(&a)) {
+        if (auto* bb = std::get_if<std::vector<std::uint8_t>>(&b)) {
+            auto minlen = std::min(ab->size(), bb->size());
+            int cmp = std::memcmp(ab->data(), bb->data(), minlen);
+            if (cmp != 0) return cmp;
+            return (ab->size() < bb->size()) ? -1 :
+                   (ab->size() > bb->size()) ? 1 : 0;
         }
-
-        // Check new values (for INSERT and UPDATE).
-        if (!matches && (op == SQLITE_INSERT || op == SQLITE_UPDATE)) {
-            sqlite3_value* val = nullptr;
-            if (sqlite3changeset_new(iter, pred.column_index, &val) == SQLITE_OK
-                && val) {
-                if (value_matches(pred.value, val)) matches = true;
-            }
-        }
-
-        // If this predicate didn't match, the change doesn't affect
-        // the filtered subset. (All predicates for a table are AND-connected
-        // from the same WHERE clause, so ALL must match for the row to be
-        // in the query's result set. But for invalidation we're conservative:
-        // if ANY predicate on this table matches, we re-evaluate.)
-        // Actually, for safety: if the predicate column wasn't in the
-        // changeset (val was NULL), we conservatively assume a match.
     }
 
-    // If we have predicates for this table and none matched, skip.
-    bool has_predicates_for_table = false;
-    for (const auto& pred : predicates) {
-        if (pred.table == table && pred.column_index >= 0) {
-            has_predicates_for_table = true;
-            break;
-        }
-    }
-    if (!has_predicates_for_table) return true;  // no filter → always affected
-
-    // Re-check: did any predicate match?
-    for (const auto& pred : predicates) {
-        if (pred.table != table || pred.column_index < 0) continue;
-
-        if (op == SQLITE_UPDATE || op == SQLITE_DELETE) {
-            sqlite3_value* val = nullptr;
-            if (sqlite3changeset_old(iter, pred.column_index, &val) == SQLITE_OK
-                && val && value_matches(pred.value, val)) {
-                return true;
-            }
-        }
-        if (op == SQLITE_INSERT || op == SQLITE_UPDATE) {
-            sqlite3_value* val = nullptr;
-            if (sqlite3changeset_new(iter, pred.column_index, &val) == SQLITE_OK
-                && val && value_matches(pred.value, val)) {
-                return true;
-            }
-        }
-    }
-    return false;
+    // Cross-type: use SQLite's type ordering (NULL < INT/REAL < TEXT < BLOB).
+    auto type_rank = [](const Value& v) -> int {
+        if (std::holds_alternative<std::monostate>(v)) return 0;
+        if (std::holds_alternative<std::int64_t>(v)) return 1;
+        if (std::holds_alternative<double>(v)) return 1;
+        if (std::holds_alternative<std::string>(v)) return 2;
+        return 3;  // blob
+    };
+    int ra = type_rank(a), rb = type_rank(b);
+    return (ra < rb) ? -1 : (ra > rb) ? 1 : 0;
 }
 
-/// Check if a changeset could affect a subscription with the given
-/// table dependencies and predicates.
-/// Iterates the changeset, checking each operation against predicates.
-bool changeset_could_affect(
+/// Evaluate a PredicateCheck against a column value.
+bool check_matches(const PredicateCheck& check, const Value& col_val) {
+    switch (check.op) {
+        case CheckOp::Eq:
+            return col_val == check.value;
+        case CheckOp::Ne:
+            return col_val != check.value;
+        case CheckOp::Lt:
+            return compare_values(col_val, check.value) < 0;
+        case CheckOp::Le:
+            return compare_values(col_val, check.value) <= 0;
+        case CheckOp::Gt:
+            return compare_values(col_val, check.value) > 0;
+        case CheckOp::Ge:
+            return compare_values(col_val, check.value) >= 0;
+        case CheckOp::IsNull:
+            return std::holds_alternative<std::monostate>(col_val);
+        case CheckOp::IsNotNull:
+            return !std::holds_alternative<std::monostate>(col_val);
+        case CheckOp::InList:
+            for (const auto& v : check.values) {
+                if (col_val == v) return true;
+            }
+            return false;
+    }
+    return true;  // unknown op → conservative
+}
+
+/// Per-column check entry in the predicate index.
+struct ColumnCheck {
+    SubscriptionId sub_id;
+    PredicateCheck check;
+};
+
+/// Key for the predicate index: (table, column_index).
+struct TableColumnKey {
+    std::string table;
+    int         column_index;
+    bool operator==(const TableColumnKey& o) const {
+        return table == o.table && column_index == o.column_index;
+    }
+};
+
+struct TableColumnKeyHash {
+    std::size_t operator()(const TableColumnKey& k) const {
+        return std::hash<std::string>{}(k.table) ^
+               (std::hash<int>{}(k.column_index) << 1);
+    }
+};
+
+/// The predicate index: maps (table, column_index) to subscription checks.
+/// Built once from all subscriptions. Evaluated per changeset row.
+using PredicateIndex = std::unordered_map<
+    TableColumnKey, std::vector<ColumnCheck>, TableColumnKeyHash>;
+
+/// Build a PredicateCheck from a ResolvedPredicate.
+PredicateCheck resolved_to_check(const ResolvedPredicate& pred) {
+    return {pred.op, pred.value, pred.values};
+}
+
+/// Evaluate a changeset against the predicate index.
+/// Returns the set of subscription IDs affected by the changeset.
+/// Iterates the changeset once, checking all indexed predicates per row.
+std::set<SubscriptionId> evaluate_changeset(
         const Changeset& data,
-        const std::set<std::string>& tables,
-        const std::vector<ResolvedPredicate>& predicates) {
-    if (data.empty() || tables.empty()) return false;
-    if (predicates.empty()) return true;  // no predicates → table-level only
+        const PredicateIndex& index,
+        const std::unordered_map<std::string, std::set<SubscriptionId>>& table_subs) {
+    std::set<SubscriptionId> affected;
+    if (data.empty()) return affected;
 
     sqlite3_changeset_iter* iter = nullptr;
     int rc = sqlite3changeset_start(&iter,
         static_cast<int>(data.size()),
         const_cast<void*>(static_cast<const void*>(data.data())));
-    if (rc != SQLITE_OK) return true;  // can't parse → conservative
+    if (rc != SQLITE_OK) {
+        // Can't parse changeset — conservatively mark all as affected.
+        for (const auto& [_, subs] : table_subs) {
+            affected.insert(subs.begin(), subs.end());
+        }
+        return affected;
+    }
 
-    bool affected = false;
     while (sqlite3changeset_next(iter) == SQLITE_ROW) {
         const char* tbl = nullptr;
-        int ncol = 0, op = 0;
-        int indirect = 0;
+        int ncol = 0, op = 0, indirect = 0;
         sqlite3changeset_op(iter, &tbl, &ncol, &op, &indirect);
         if (!tbl) continue;
 
         std::string table_name(tbl);
-        if (tables.find(table_name) == tables.end()) continue;
 
-        if (changeset_row_matches(predicates, table_name, iter, op)) {
-            affected = true;
-            break;
+        // Find subscriptions for this table that have NO predicates —
+        // they're always affected by any change to their tables.
+        auto ts_it = table_subs.find(table_name);
+        if (ts_it == table_subs.end()) continue;
+
+        // For each subscription on this table, track whether ANY
+        // predicate on this table matched for this row.
+        // Subscriptions with no predicates for this table are
+        // immediately affected.
+        // Use a map: sub_id → has_predicate_for_table.
+        // We mark affected if: no predicates, or any predicate matches.
+
+        // Collect all column checks for this table.
+        std::unordered_map<SubscriptionId, bool> sub_matched;
+        std::set<SubscriptionId> sub_has_check;
+
+        for (int col = 0; col < ncol; ++col) {
+            TableColumnKey key{table_name, col};
+            auto idx_it = index.find(key);
+            if (idx_it == index.end()) continue;
+
+            // Extract old and new values for this column.
+            Value old_val = std::monostate{};
+            Value new_val = std::monostate{};
+            if (op == SQLITE_UPDATE || op == SQLITE_DELETE) {
+                sqlite3_value* v = nullptr;
+                if (sqlite3changeset_old(iter, col, &v) == SQLITE_OK && v) {
+                    old_val = sqlite3_value_to_value(v);
+                }
+            }
+            if (op == SQLITE_INSERT || op == SQLITE_UPDATE) {
+                sqlite3_value* v = nullptr;
+                if (sqlite3changeset_new(iter, col, &v) == SQLITE_OK && v) {
+                    new_val = sqlite3_value_to_value(v);
+                }
+            }
+
+            // Check each subscription's predicate on this column.
+            for (const auto& cc : idx_it->second) {
+                sub_has_check.insert(cc.sub_id);
+                if (affected.count(cc.sub_id)) continue;  // already affected
+
+                bool old_match = (op == SQLITE_UPDATE || op == SQLITE_DELETE)
+                    && check_matches(cc.check, old_val);
+                bool new_match = (op == SQLITE_INSERT || op == SQLITE_UPDATE)
+                    && check_matches(cc.check, new_val);
+
+                if (old_match || new_match) {
+                    sub_matched[cc.sub_id] = true;
+                }
+            }
+        }
+
+        // Subscriptions on this table with no checks → always affected.
+        for (auto sub_id : ts_it->second) {
+            if (affected.count(sub_id)) continue;
+            if (sub_has_check.count(sub_id) == 0) {
+                affected.insert(sub_id);
+            } else if (sub_matched.count(sub_id)) {
+                affected.insert(sub_id);
+            }
         }
     }
+
     sqlite3changeset_finalize(iter);
     return affected;
 }
@@ -3040,9 +3269,23 @@ struct QueryWatch::Impl {
     std::map<SubscriptionId, Subscription> subscriptions;
     // Reverse index: table name → subscription IDs that depend on it.
     std::unordered_map<std::string, std::set<SubscriptionId>> table_subs;
+    // Predicate index: (table, column) → subscription checks.
+    detail::PredicateIndex pred_index;
     // Subscriptions registered since last notify — need initial evaluation.
     std::set<SubscriptionId> pending_new;
     SubscriptionId next_sub_id = 1;
+
+    /// Rebuild the predicate index from all subscriptions.
+    void rebuild_pred_index() {
+        pred_index.clear();
+        for (const auto& [id, sub] : subscriptions) {
+            for (const auto& pred : sub.predicates) {
+                if (pred.column_index < 0) continue;
+                detail::TableColumnKey key{pred.table, pred.column_index};
+                pred_index[key].push_back({id, detail::resolved_to_check(pred)});
+            }
+        }
+    }
 
     /// Analyze a subscription query using the RA transform.
     /// Returns table dependencies and extracts predicates.
@@ -3109,14 +3352,24 @@ struct QueryWatch::Impl {
     std::vector<QueryResult> evaluate_invalidated(
             const std::set<std::string>& affected,
             const Changeset* changeset = nullptr) {
-        // Collect unique subscription IDs via reverse index.
+        // Determine which subscriptions to evaluate.
         std::set<SubscriptionId> ids;
-        for (const auto& table : affected) {
-            auto it = table_subs.find(table);
-            if (it != table_subs.end()) {
-                ids.insert(it->second.begin(), it->second.end());
+
+        if (changeset && !changeset->empty() && !pred_index.empty()) {
+            // Batch evaluation: iterate changeset once, check all
+            // subscription predicates via the index.
+            ids = detail::evaluate_changeset(
+                *changeset, pred_index, table_subs);
+        } else {
+            // No changeset or no predicates — table-level invalidation.
+            for (const auto& table : affected) {
+                auto it = table_subs.find(table);
+                if (it != table_subs.end()) {
+                    ids.insert(it->second.begin(), it->second.end());
+                }
             }
         }
+
         // Also include any newly registered subscriptions that haven't
         // been evaluated yet (their initial result delivery).
         ids.insert(pending_new.begin(), pending_new.end());
@@ -3127,17 +3380,6 @@ struct QueryWatch::Impl {
             auto it = subscriptions.find(id);
             if (it == subscriptions.end()) continue;
             auto& sub = it->second;
-
-            // Predicate-aware filtering: if we have a changeset and the
-            // subscription has extracted predicates, check whether any
-            // changed row actually matches the predicates before
-            // re-evaluating the (potentially expensive) query.
-            if (changeset && !sub.predicates.empty()) {
-                if (!detail::changeset_could_affect(
-                        *changeset, sub.tables, sub.predicates)) {
-                    continue;  // changeset doesn't affect this subscription
-                }
-            }
 
             auto [result, hash] = evaluate_query(sub);
             if (hash != sub.result_hash) {
@@ -3185,6 +3427,7 @@ SubscriptionId QueryWatch::subscribe(const std::string& sql) {
                                 std::move(predicates), std::move(stmt),
                                 std::move(columns), 0};
     impl_->pending_new.insert(id);
+    impl_->rebuild_pred_index();
     return id;
 }
 
@@ -3203,6 +3446,7 @@ void QueryWatch::unsubscribe(SubscriptionId id) {
         }
         impl_->pending_new.erase(id);
         impl_->subscriptions.erase(it);
+        impl_->rebuild_pred_index();
     }
 }
 
