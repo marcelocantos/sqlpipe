@@ -127,21 +127,25 @@ ordered reliable delivery.
 
 **Convergence loop** (preferred — stateless, works over datagrams):
 
-```
-Replica                              Master
-   |                                    |
-   |-- BucketHashesMsg -------------->|  converge() — no prior hello needed
-   |                                    |  compare bucket hashes
-   |<-- NeedBucketsMsg ---------------|  (skipped if all match)
-   |                                    |
-   |-- RowHashesMsg ----------------->|  row-level hashes for mismatched buckets
-   |                                    |
-   |<-- DiffReadyMsg -----------------|  patchset + per-table deletes
-   |-- AckMsg ----------------------->|
-   |                                    |
-   |         [LIVE STREAMING]           |
-   |<-- ChangesetMsg -----------------|  (master.flush())
-   |-- AckMsg ----------------------->|
+```mermaid
+sequenceDiagram
+    participant R as Replica
+    participant M as Master
+
+    Note over R: converge() — no prior hello needed
+    R->>M: BucketHashesMsg
+    Note over M: compare bucket hashes
+    M->>R: NeedBucketsMsg (skipped if all match)
+    R->>M: RowHashesMsg
+    Note over M: compute diff
+    M->>R: DiffReadyMsg (patchset + deletes)
+    R->>M: AckMsg
+
+    rect rgb(240, 248, 255)
+        Note over R,M: Live streaming
+        M->>R: ChangesetMsg (master.flush())
+        R->>M: AckMsg
+    end
 ```
 
 Every message in the convergence loop is regenerable. If any message is
@@ -150,19 +154,22 @@ processes `BucketHashesMsg` directly without requiring a prior `HelloMsg`.
 
 **Legacy handshake** (ordered reliable channel):
 
-```
-Replica                              Master
-   |                                    |
-   |-- HelloMsg --------------------->|
-   |<-- HelloMsg ---------------------|  schema mismatch → ErrorMsg
-   |                                    |
-   |-- BucketHashesMsg -------------->|
-   |<-- NeedBucketsMsg ---------------|
-   |-- RowHashesMsg ----------------->|
-   |<-- DiffReadyMsg -----------------|
-   |-- AckMsg ----------------------->|
-   |                                    |
-   |         [LIVE STREAMING]           |
+```mermaid
+sequenceDiagram
+    participant R as Replica
+    participant M as Master
+
+    R->>M: HelloMsg
+    M->>R: HelloMsg (or ErrorMsg on schema mismatch)
+    R->>M: BucketHashesMsg
+    M->>R: NeedBucketsMsg
+    R->>M: RowHashesMsg
+    M->>R: DiffReadyMsg
+    R->>M: AckMsg
+
+    rect rgb(240, 248, 255)
+        Note over R,M: Live streaming
+    end
 ```
 
 ## API
