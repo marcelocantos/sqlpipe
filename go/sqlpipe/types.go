@@ -66,14 +66,6 @@ const (
 	DiffApplyingPatchset                   // Applying patchset + deletes (replica).
 )
 
-// Delivery indicates the transport delivery mode for a message.
-type Delivery uint8
-
-const (
-	DeliveryReliable   Delivery = 0 // Must arrive (changesets, errors, acks, hellos, patchsets).
-	DeliveryBestEffort Delivery = 1 // Regenerable by convergence (bucket/row hashes, need-buckets).
-)
-
 // SenderRole identifies direction in peer-to-peer messages.
 type SenderRole uint8
 
@@ -165,7 +157,7 @@ type ApproveOwnershipCallback func(requestedTables map[string]bool) bool
 // FlushCallback is called when the Master auto-flushes after a write
 // transaction committed via Master.Exec. It receives the changeset messages
 // ready to send to replicas.
-type FlushCallback func(messages []OutMessage)
+type FlushCallback func(messages []Message)
 
 // Protocol constants.
 const (

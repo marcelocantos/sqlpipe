@@ -59,11 +59,11 @@ func goFlushTrampoline(handle C.uintptr_t, data *C.uint8_t, dataLen C.size_t) {
 	h := cgo.Handle(handle)
 	fn := h.Value().(FlushCallback)
 	buf := C.GoBytes(unsafe.Pointer(data), C.int(dataLen))
-	outMsgs, err := decodeMessagesFromBytes(buf)
+	msgs, err := decodeMessagesFromBytes(buf)
 	if err != nil {
 		return // Best-effort: silently drop on decode error.
 	}
-	fn(outMsgs)
+	fn(msgs)
 }
 
 //export goApproveOwnershipTrampoline

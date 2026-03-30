@@ -67,9 +67,9 @@ func TestMasterFlushAfterInsert(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
-	cs, ok := msgs[0].Msg.(ChangesetMsg)
+	cs, ok := msgs[0].(ChangesetMsg)
 	if !ok {
-		t.Fatalf("expected ChangesetMsg, got %T", msgs[0].Msg)
+		t.Fatalf("expected ChangesetMsg, got %T", msgs[0])
 	}
 	if cs.Seq != 1 {
 		t.Errorf("seq = %d, want 1", cs.Seq)
@@ -108,7 +108,7 @@ func TestMasterMultipleFlushes(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
-	cs := msgs[0].Msg.(ChangesetMsg)
+	cs := msgs[0].(ChangesetMsg)
 	if cs.Seq != 2 {
 		t.Errorf("seq = %d, want 2", cs.Seq)
 	}
@@ -137,9 +137,9 @@ func TestMasterHandleHello(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
-	reply, ok := msgs[0].Msg.(HelloMsg)
+	reply, ok := msgs[0].(HelloMsg)
 	if !ok {
-		t.Fatalf("expected HelloMsg, got %T", msgs[0].Msg)
+		t.Fatalf("expected HelloMsg, got %T", msgs[0])
 	}
 	if reply.SchemaVersion != sv {
 		t.Errorf("reply schema_version = %d, want %d", reply.SchemaVersion, sv)
@@ -168,9 +168,9 @@ func TestMasterSchemaMismatch(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
-	errMsg, ok := msgs[0].Msg.(ErrorMsg)
+	errMsg, ok := msgs[0].(ErrorMsg)
 	if !ok {
-		t.Fatalf("expected ErrorMsg, got %T", msgs[0].Msg)
+		t.Fatalf("expected ErrorMsg, got %T", msgs[0])
 	}
 	if errMsg.Code != ErrSchemaMismatch {
 		t.Errorf("error code = %d, want %d", errMsg.Code, ErrSchemaMismatch)
@@ -199,8 +199,8 @@ func TestMasterProtocolVersionMismatch(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
-	if _, ok := msgs[0].Msg.(ErrorMsg); !ok {
-		t.Fatalf("expected ErrorMsg, got %T", msgs[0].Msg)
+	if _, ok := msgs[0].(ErrorMsg); !ok {
+		t.Fatalf("expected ErrorMsg, got %T", msgs[0])
 	}
 }
 
@@ -247,7 +247,7 @@ func TestLiveStreamingEndToEnd(t *testing.T) {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
 
-	hr, err := r.HandleMessage(msgs[0].Msg)
+	hr, err := r.HandleMessage(msgs[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func TestSubscriptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hr, err := r.HandleMessage(msgs[0].Msg)
+	hr, err := r.HandleMessage(msgs[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestSubscriptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hr, err = r.HandleMessage(msgs[0].Msg)
+	hr, err = r.HandleMessage(msgs[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,8 +426,8 @@ func TestSchemaMismatchCallback(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
-	if _, ok := msgs[0].Msg.(ErrorMsg); !ok {
-		t.Fatalf("expected ErrorMsg, got %T", msgs[0].Msg)
+	if _, ok := msgs[0].(ErrorMsg); !ok {
+		t.Fatalf("expected ErrorMsg, got %T", msgs[0])
 	}
 }
 
@@ -490,7 +490,7 @@ func TestPeerBidirectional(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, om := range sMsgs {
-		if _, err := client.HandleMessage(om.Msg); err != nil {
+		if _, err := client.HandleMessage(om); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -515,7 +515,7 @@ func TestPeerBidirectional(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, om := range cMsgs {
-		if _, err := server.HandleMessage(om.Msg); err != nil {
+		if _, err := server.HandleMessage(om); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -568,9 +568,9 @@ func TestMasterExecWithFlushCallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var flushedMsgs []OutMessage
+	var flushedMsgs []Message
 	m, err := NewMaster(db, MasterConfig{
-		OnFlush: func(msgs []OutMessage) {
+		OnFlush: func(msgs []Message) {
 			flushedMsgs = append(flushedMsgs, msgs...)
 		},
 	})
@@ -586,9 +586,9 @@ func TestMasterExecWithFlushCallback(t *testing.T) {
 	if len(flushedMsgs) != 1 {
 		t.Fatalf("expected 1 flushed message, got %d", len(flushedMsgs))
 	}
-	cs, ok := flushedMsgs[0].Msg.(ChangesetMsg)
+	cs, ok := flushedMsgs[0].(ChangesetMsg)
 	if !ok {
-		t.Fatalf("expected ChangesetMsg, got %T", flushedMsgs[0].Msg)
+		t.Fatalf("expected ChangesetMsg, got %T", flushedMsgs[0])
 	}
 	if cs.Seq != 1 {
 		t.Errorf("seq = %d, want 1", cs.Seq)
@@ -645,7 +645,7 @@ func TestPeerSubscribe(t *testing.T) {
 
 	var gotSubs []QueryResult
 	for _, om := range sMsgs {
-		hr, err := client.HandleMessage(om.Msg)
+		hr, err := client.HandleMessage(om)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -676,7 +676,7 @@ func TestPeerSubscribe(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, om := range sMsgs {
-		hr, err := client.HandleMessage(om.Msg)
+		hr, err := client.HandleMessage(om)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,19 +1,12 @@
 // Copyright 2026 Marcelo Cantos
 // SPDX-License-Identifier: Apache-2.0
 
-// Package transport provides a dual-channel transport adapter for sqlpipe
-// replication over network connections that support both reliable streams
-// and unreliable datagrams (e.g., QUIC via tern).
+// Package transport provides a transport adapter for sqlpipe replication
+// over network connections that support both reliable streams and
+// unreliable datagrams (e.g., QUIC via tern).
 //
-// The adapter routes outgoing messages based on their Delivery hint:
-// Reliable messages go to the stream channel, BestEffort messages go
-// to the datagram channel. Incoming messages from both channels are
-// merged and delivered to the sqlpipe message handler.
-//
-// During the handshake phase (before both sides reach Live), all messages
-// are sent on the reliable stream regardless of delivery hint, because
-// the handshake protocol requires ordered, sequential message exchange.
-// Once live, BestEffort messages use the datagram channel.
+// Outgoing messages are sent on the reliable stream. Incoming messages
+// from both channels are merged and delivered to the sqlpipe message handler.
 //
 // Usage with tern:
 //
@@ -46,12 +39,10 @@ type Transport interface {
 	RecvDatagram(ctx context.Context) ([]byte, error)
 }
 
-// Link connects a sqlpipe instance to a Transport, routing messages
-// by delivery hint and merging incoming messages from both channels.
+// Link connects a sqlpipe instance to a Transport, sending messages
+// on the reliable stream and merging incoming messages from both channels.
 type Link struct {
-	t    Transport
-	mu   sync.Mutex
-	live bool // true once handshake completes — enables datagram routing
+	t Transport
 }
 
 // NewLink creates a Link over the given Transport.
@@ -59,36 +50,15 @@ func NewLink(t Transport) *Link {
 	return &Link{t: t}
 }
 
-// setLive transitions to live mode, enabling datagram routing.
-func (l *Link) setLive() {
-	l.mu.Lock()
-	l.live = true
-	l.mu.Unlock()
-}
-
-// isLive returns whether the link is in live mode.
-func (l *Link) isLive() bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.live
-}
-
-// send routes an OutMessage to the appropriate channel.
-// During handshake (not live), all messages use the reliable stream.
-func (l *Link) send(ctx context.Context, om sqlpipe.OutMessage) error {
-	wire := sqlpipe.Serialize(om.Msg)
-	if l.isLive() && om.Delivery == sqlpipe.DeliveryBestEffort {
-		return l.t.SendDatagram(wire)
-	}
+// send writes a Message to the reliable stream.
+func (l *Link) send(ctx context.Context, msg sqlpipe.Message) error {
+	wire := sqlpipe.Serialize(msg)
 	return l.t.Send(ctx, wire)
 }
 
-// sendPeer routes a PeerOutMessage to the appropriate channel.
-func (l *Link) sendPeer(ctx context.Context, pom sqlpipe.PeerOutMessage) error {
-	wire := sqlpipe.SerializePeer(pom.Msg)
-	if l.isLive() && pom.Delivery == sqlpipe.DeliveryBestEffort {
-		return l.t.SendDatagram(wire)
-	}
+// sendPeer writes a PeerMessage to the reliable stream.
+func (l *Link) sendPeer(ctx context.Context, msg sqlpipe.PeerMessage) error {
+	wire := sqlpipe.SerializePeer(msg)
 	return l.t.Send(ctx, wire)
 }
 
@@ -221,15 +191,11 @@ func (l *Link) RunReplica(ctx context.Context, r *sqlpipe.Replica, handler Repli
 			fail(err)
 			return
 		}
-		for _, om := range hr.Messages {
-			if err := l.send(ctx, om); err != nil {
+		for _, msg := range hr.Messages {
+			if err := l.send(ctx, msg); err != nil {
 				fail(err)
 				return
 			}
-		}
-		// Transition to live when replica reaches Live state.
-		if r.State() == sqlpipe.ReplicaLive {
-			l.setLive()
 		}
 		if handler != nil && (len(hr.Changes) > 0 || len(hr.Subscriptions) > 0) {
 			if err := handler(hr); err != nil {
@@ -312,14 +278,11 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 			fail(err)
 			return
 		}
-		for _, pom := range hr.Messages {
-			if err := l.sendPeer(ctx, pom); err != nil {
+		for _, pm := range hr.Messages {
+			if err := l.sendPeer(ctx, pm); err != nil {
 				fail(err)
 				return
 			}
-		}
-		if p.State() == sqlpipe.PeerLive {
-			l.setLive()
 		}
 		if handler != nil && (len(hr.Changes) > 0 || len(hr.Subscriptions) > 0) {
 			if err := handler(hr); err != nil {
