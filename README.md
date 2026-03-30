@@ -7,47 +7,47 @@ layer. A **Master** tracks changes and produces compact binary changesets; a
 **Replica** applies them, emitting per-row change events and query subscription
 updates. A **Peer** wraps both behind a symmetric API for bidirectional
 replication with table-level ownership. A **Relay** enables chain replication
-(source -> relay -> sink).
+(source → relay → sink).
 
 The library is transport-agnostic: it defines a message-in / message-out API.
 You decide how messages travel between peers (TCP, WebSocket, QUIC, serial,
 shared memory, datagrams, etc.). The convergence loop makes every message
-regenerable, so the protocol works over pure datagrams -- any message can be
+regenerable, so the protocol works over pure datagrams — any message can be
 lost and recovered by the next convergence round.
 
 ## Features
 
-- **Convergence loop** -- `Replica::converge()` provides stateless,
+- **Convergence loop** — `Replica::converge()` provides stateless,
   loss-tolerant sync. The replica computes bucket hashes and sends them
   directly; the master responds with the delta. Works entirely over
   datagrams. No handshake required. Call it periodically or on reconnect.
-- **Bidirectional replication** via the Peer API -- each side owns a disjoint
+- **Bidirectional replication** via the Peer API — each side owns a disjoint
   set of tables, with server-authoritative ownership negotiation
-- **Chain replication** via the Relay class -- source -> relay -> sink
+- **Chain replication** via the Relay class — source → relay → sink
   topologies for fan-out or geographic distribution
 - **Incremental replication** via SQLite's session extension (compact binary
   changesets)
-- **Efficient diff sync** on reconnect -- bucketed row hashes identify what
+- **Efficient diff sync** on reconnect — bucketed row hashes identify what
   differs, then only the delta is transferred
-- **Changeset queue** -- master retains recent changesets
+- **Changeset queue** — master retains recent changesets
   (`changeset_queue_size`, default 64) for fast reconnect replay without
   full diff sync
-- **Predicate-aware query subscriptions** -- register SQL queries on the
+- **Predicate-aware query subscriptions** — register SQL queries on the
   replica; receive updated result sets only when incoming changes match
   extracted predicates. Queries are parsed via liteparser into relational
   algebra; predicates are propagated through equijoins and evaluated by a
   bytecode VM. Supports equality, inequality, range, IS NULL, IN, NOT IN,
   BETWEEN, and OR-of-equalities.
-- **Prediction API** -- `begin_prediction`/`commit_prediction`/`rollback_prediction`
+- **Prediction API** — `begin_prediction`/`commit_prediction`/`rollback_prediction`
   for optimistic local updates with automatic rollback on server response
-- **Auto-flush** -- `MasterConfig::on_flush` callback fires on commit, so
+- **Auto-flush** — `MasterConfig::on_flush` callback fires on commit, so
   callers never need to call `flush()` explicitly
 - **Per-row change events** (insert/update/delete) on the receiving side
 - **Conflict callbacks** for custom resolution logic
-- **LZ4 changeset compression** -- automatic, with uncompressed fallback
+- **LZ4 changeset compression** — automatic, with uncompressed fallback
 - **Schema fingerprinting** via structural hashing (sqlift) to detect mismatches
 - **Single header + source** (`sqlpipe.h` / `sqlpipe.cpp`) for easy integration
-- **Formally verified** -- the convergence protocol is modelled in
+- **Formally verified** — the convergence protocol is modelled in
   [TLA+](formal/Convergence.tla) and checked with TLC
 
 ## Language bindings
@@ -125,7 +125,7 @@ Two sync paths are available. The convergence loop is preferred for most use
 cases; the legacy handshake is available for environments that require
 ordered reliable delivery.
 
-**Convergence loop** (preferred -- stateless, works over datagrams):
+**Convergence loop** (preferred — stateless, works over datagrams):
 
 ```
 Replica                              Master
@@ -145,7 +145,7 @@ Replica                              Master
 ```
 
 Every message in the convergence loop is regenerable. If any message is
-lost, call `converge()` again -- the loop is idempotent. The master
+lost, call `converge()` again — the loop is idempotent. The master
 processes `BucketHashesMsg` directly without requiring a prior `HelloMsg`.
 
 **Legacy handshake** (ordered reliable channel):
@@ -154,7 +154,7 @@ processes `BucketHashesMsg` directly without requiring a prior `HelloMsg`.
 Replica                              Master
    |                                    |
    |-- HelloMsg --------------------->|
-   |<-- HelloMsg ---------------------|  schema mismatch -> ErrorMsg
+   |<-- HelloMsg ---------------------|  schema mismatch → ErrorMsg
    |                                    |
    |-- BucketHashesMsg -------------->|
    |<-- NeedBucketsMsg ---------------|
@@ -303,7 +303,7 @@ replica.unsubscribe(id);
 
 Predicates are extracted from WHERE clauses and propagated through equijoins.
 A bytecode VM evaluates predicates against changeset rows, so subscriptions
-whose predicates don't match are skipped entirely -- no SQL re-evaluation
+whose predicates don't match are skipped entirely — no SQL re-evaluation
 needed.
 
 ### Prediction API
@@ -324,7 +324,7 @@ replica.commit_prediction();
 ### Reconnection
 
 **Convergence loop** (preferred): Call `converge()` at any time to sync
-without a handshake. Works from any state -- Init, Live, or after `reset()`.
+without a handshake. Works from any state — Init, Live, or after `reset()`.
 
 ```cpp
 replica.reset();
@@ -417,25 +417,25 @@ handle must not be used concurrently during sqlpipe operations.
 
 ## Message size limits
 
-- **`kMaxMessageSize`** (64 MB) -- maximum serialized message size
-- **`kMaxArrayCount`** (10 M) -- maximum elements in any array field
+- **`kMaxMessageSize`** (64 MB) — maximum serialized message size
+- **`kMaxArrayCount`** (10 M) — maximum elements in any array field
 
 Messages exceeding these limits cause `deserialize()` to throw `ProtocolError`.
 
 ## Related projects
 
-- **[sqldeep](https://github.com/marcelocantos/sqldeep)** -- JSON5-like SQL syntax transpiler for SQLite JSON functions
-- **[sqlift](https://github.com/marcelocantos/sqlift)** -- Declarative SQLite schema migrations via structural diffing
+- **[sqldeep](https://github.com/marcelocantos/sqldeep)** — JSON5-like SQL syntax transpiler for SQLite JSON functions
+- **[sqlift](https://github.com/marcelocantos/sqlift)** — Declarative SQLite schema migrations via structural diffing
 
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE) for details.
 
 Third-party dependencies:
-- **SQLite** -- public domain
-- **LZ4** -- BSD 2-Clause
-- **spdlog** -- MIT
-- **nlohmann/json** -- MIT
-- **liteparser** -- MIT
-- **sqlift** -- Apache 2.0
-- **doctest** -- MIT (test only)
+- **SQLite** — public domain
+- **LZ4** — BSD 2-Clause
+- **spdlog** — MIT
+- **nlohmann/json** — MIT
+- **liteparser** — MIT
+- **sqlift** — Apache 2.0
+- **doctest** — MIT (test only)
