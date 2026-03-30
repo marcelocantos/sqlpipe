@@ -4,36 +4,68 @@ Streaming replication protocol for SQLite.
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-sqlpipe is a C++ library that keeps two SQLite databases in sync over any
-transport layer. A **Master** component tracks changes and produces compact
-binary changesets; a **Replica** component applies them, emitting per-row change
-events to client code as they arrive. A **Peer** component wraps both behind a
-symmetric API for bidirectional replication with table-level ownership.
+sqlpipe is a C++ library that keeps SQLite databases in sync over any transport
+layer. A **Master** tracks changes and produces compact binary changesets; a
+**Replica** applies them, emitting per-row change events and query subscription
+updates. A **Peer** wraps both behind a symmetric API for bidirectional
+replication with table-level ownership. A **Relay** enables chain replication
+(source -> relay -> sink).
 
 The library is transport-agnostic: it defines a message-in / message-out API.
-You decide how messages travel between peers (TCP, WebSocket, serial, shared
-memory, etc.).
+You decide how messages travel between peers (TCP, WebSocket, QUIC, serial,
+shared memory, etc.). Every outgoing message carries a `Delivery` hint
+(`Reliable` or `BestEffort`) so transports can route appropriately -- e.g.
+QUIC streams for reliable messages, QUIC datagrams for best-effort.
 
 ## Features
 
-- **Bidirectional replication** via the Peer API — each side owns a disjoint
+- **Convergence loop** -- `Replica::converge()` provides stateless,
+  loss-tolerant sync. The replica computes bucket hashes and sends them
+  directly; the master responds with the delta. Works entirely over
+  datagrams. No handshake required. Call it periodically or on reconnect.
+- **Bidirectional replication** via the Peer API -- each side owns a disjoint
   set of tables, with server-authoritative ownership negotiation
+- **Chain replication** via the Relay class -- source -> relay -> sink
+  topologies for fan-out or geographic distribution
 - **Incremental replication** via SQLite's session extension (compact binary
   changesets)
-- **Efficient diff sync** on reconnect — bucketed row hashes identify what
+- **Efficient diff sync** on reconnect -- bucketed row hashes identify what
   differs, then only the delta is transferred
-- **Query subscriptions** — register SQL queries on the replica; receive updated
-  result sets automatically when incoming changes affect relevant tables
+- **Changeset queue** -- master retains recent changesets
+  (`changeset_queue_size`, default 64) for fast reconnect replay without
+  full diff sync
+- **Predicate-aware query subscriptions** -- register SQL queries on the
+  replica; receive updated result sets only when incoming changes match
+  extracted predicates. Queries are parsed via liteparser into relational
+  algebra; predicates are propagated through equijoins and evaluated by a
+  bytecode VM. Supports equality, inequality, range, IS NULL, IN, NOT IN,
+  BETWEEN, and OR-of-equalities.
+- **Prediction API** -- `begin_prediction`/`commit_prediction`/`rollback_prediction`
+  for optimistic local updates with automatic rollback on server response
+- **Auto-flush** -- `MasterConfig::on_flush` callback fires on commit, so
+  callers never need to call `flush()` explicitly
 - **Per-row change events** (insert/update/delete) on the receiving side
 - **Conflict callbacks** for custom resolution logic
-- **LZ4 changeset compression** — changeset blobs are automatically compressed
-  with LZ4 for reduced bandwidth (transparent, with uncompressed fallback)
-- **Schema fingerprinting** to detect schema mismatches
+- **LZ4 changeset compression** -- automatic, with uncompressed fallback
+- **Schema fingerprinting** via structural hashing (sqlift) to detect mismatches
+- **Delivery hints** -- every `OutMessage`/`PeerOutMessage` carries `Reliable`
+  or `BestEffort`, enabling smart transport routing
 - **Single header + source** (`sqlpipe.h` / `sqlpipe.cpp`) for easy integration
+- **Formally verified** -- the convergence protocol is modelled in
+  [TLA+](formal/Convergence.tla) and checked with TLC
+
+## Language bindings
+
+| Language | Location | Install |
+|---|---|---|
+| C++ | `dist/sqlpipe.h` + `dist/sqlpipe.cpp` | Copy two files |
+| Go | `go/sqlpipe/` | `go get github.com/marcelocantos/sqlpipe/go/sqlpipe` |
+| Swift | `swift/` | SPM package with `CSqlpipe` and `Sqlpipe` targets |
+| TypeScript/Wasm | `web/` | `npm install` (builds SQLite + sqlpipe to Wasm) |
 
 ## Requirements
 
-- C++20 compiler
+- C++23 compiler
 - SQLite 3 compiled with `-DSQLITE_ENABLE_SESSION
   -DSQLITE_ENABLE_PREUPDATE_HOOK`
 
@@ -60,58 +92,83 @@ Master master(master_db);
 Replica replica(replica_db);
 
 // Handshake (exchange messages until replica reaches Live state).
-// See examples/loopback.cpp for the full multi-step handshake.
+sync_handshake(master, replica);  // convenience for in-process use
 
 // Make changes on the master, then flush.
 sqlite3_exec(master_db, "INSERT INTO t VALUES (1, 'hello')", 0, 0, 0);
-auto msgs = master.flush();
-for (auto& m : msgs) {
-    auto result = replica.handle_message(m);
-    // result.messages — AckMsg to send back to master
-    // result.changes  — per-row ChangeEvents (table, op, old/new values)
+auto out_msgs = master.flush();  // returns vector<OutMessage>
+for (auto& om : out_msgs) {
+    auto result = replica.handle_message(om.msg);
+    // result.messages    — vector<OutMessage> to send back
+    // result.changes     — per-row ChangeEvents
+    // result.subscriptions — updated query results
 }
 // replica_db now has the row.
 ```
 
 See [`examples/loopback.cpp`](examples/loopback.cpp) for a complete working
-example including the handshake and change event handling.
+example including handshake and change event handling.
 
 ## Building
 
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-mk test     # build and run tests (74 test cases)
+mk test     # build and run tests (134 test cases)
 mk example  # build and run the loopback demo
+mk wasm     # build Wasm module (requires emscripten)
 ```
 
 If you use an agentic coding tool (Claude Code, Cursor, Copilot, etc.), include
-[`dist/sqlpipe-agents-guide.md`](dist/sqlpipe-agents-guide.md) in your project context for a condensed
-API reference.
+[`dist/sqlpipe-agents-guide.md`](dist/sqlpipe-agents-guide.md) in your project
+context for a condensed API reference.
 
 ## Protocol overview
 
-**Diff sync** (reconnect — discovers and transfers only what differs):
+Two sync paths are available. The convergence loop is preferred for most use
+cases; the legacy handshake is available for environments that require
+ordered reliable delivery.
+
+**Convergence loop** (preferred -- stateless, works over datagrams):
 
 ```
 Replica                              Master
    |                                    |
-   |-- HelloMsg(sv) ------------------>|
-   |<-- HelloMsg(sv) -----------------|  schema mismatch → ErrorMsg
-   |                                    |
-   |-- BucketHashesMsg -------------->|  per-table bucketed row hashes
+   |-- BucketHashesMsg [BE] --------->|  converge() — no prior hello needed
    |                                    |  compare bucket hashes
-   |<-- NeedBucketsMsg (ranges) ------|  (empty if all match)
+   |<-- NeedBucketsMsg [BE] ----------|  (skipped if all match)
    |                                    |
-   |-- RowHashesMsg ----------------->|  row-level hashes for mismatched buckets
-   |                                    |  compute diff: insert/update/delete
-   |<-- DiffReadyMsg(seq, patchset,  |
-   |      deletes per table) ---------|
-   |-- AckMsg ----------------------->|
+   |-- RowHashesMsg [BE] ------------>|  row-level hashes for mismatched buckets
+   |                                    |
+   |<-- DiffReadyMsg [R] -------------|  patchset + per-table deletes
+   |-- AckMsg [R] ------------------->|
    |                                    |
    |         [LIVE STREAMING]           |
-   |<-- ChangesetMsg -----------------|  (master.flush())
-   |-- AckMsg ----------------------->|
+   |<-- ChangesetMsg [R] -------------|  (master.flush())
+   |-- AckMsg [R] ------------------->|
+
+[BE] = BestEffort delivery    [R] = Reliable delivery
+```
+
+If any best-effort message is lost, call `converge()` again -- the loop
+is idempotent. The master processes `BucketHashesMsg` directly without
+requiring a prior `HelloMsg`.
+
+**Legacy handshake** (ordered reliable channel):
+
+```
+Replica                              Master
+   |                                    |
+   |-- HelloMsg [R] ----------------->|
+   |<-- HelloMsg [R] -----------------|  schema mismatch -> ErrorMsg
+   |                                    |
+   |-- BucketHashesMsg [R] ---------->|
+   |<-- NeedBucketsMsg [R] -----------|
+   |-- RowHashesMsg [R] ------------->|
+   |<-- DiffReadyMsg [R] -------------|
+   |-- AckMsg [R] ------------------->|
+   |                                    |
+   |         [LIVE STREAMING]           |
 ```
 
 ## API
@@ -120,17 +177,21 @@ Replica                              Master
 
 ```cpp
 struct MasterConfig {
-    std::optional<std::set<std::string>> table_filter;
-    std::int64_t bucket_size = 1024;  // rows per diff bucket
+    std::optional<std::set<std::string>> table_filter;  // nullopt = all tables
+    std::int64_t bucket_size = 1024;
     ProgressCallback on_progress = nullptr;
     SchemaMismatchCallback on_schema_mismatch = nullptr;
+    FlushCallback on_flush = nullptr;        // auto-flush on commit
+    std::size_t changeset_queue_size = 64;   // 0 = disable queue replay
+    LogCallback on_log = nullptr;
 };
 
 class Master {
 public:
     explicit Master(sqlite3* db, MasterConfig config = {});
-    std::vector<Message> flush();
-    std::vector<Message> handle_message(const Message& msg);
+    void exec(const std::string& sql);                     // auto-flushes if on_flush set
+    std::vector<OutMessage> flush();                       // manual flush
+    std::vector<OutMessage> handle_message(const Message& msg);
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 };
@@ -140,28 +201,33 @@ public:
 
 ```cpp
 struct ReplicaConfig {
-    ConflictCallback on_conflict = nullptr;  // default: Abort
+    ConflictCallback on_conflict = nullptr;
     std::optional<std::set<std::string>> table_filter;
     std::int64_t bucket_size = 1024;
     ProgressCallback on_progress = nullptr;
     SchemaMismatchCallback on_schema_mismatch = nullptr;
+    LogCallback on_log = nullptr;
 };
 
 struct HandleResult {
-    std::vector<Message>      messages;       // protocol responses to send back
-    std::vector<ChangeEvent>  changes;        // row-level changes applied this call
-    std::vector<QueryResult>  subscriptions;  // invalidated subscription results
+    std::vector<OutMessage>   messages;       // tagged protocol responses
+    std::vector<ChangeEvent>  changes;        // row-level changes applied
+    std::vector<QueryResult>  subscriptions;  // invalidated query results
 };
 
 class Replica {
 public:
     explicit Replica(sqlite3* db, ReplicaConfig config = {});
-    Message hello() const;
+    OutMessage hello() const;
+    std::vector<OutMessage> converge();                    // stateless sync
     HandleResult handle_message(const Message& msg);
     HandleResult handle_messages(std::span<const Message> msgs);  // batched
-    QueryResult subscribe(const std::string& sql);  // register a query
-    void unsubscribe(SubscriptionId id);             // remove a subscription
-    void reset();                                    // return to Init; preserves subscriptions
+    SubscriptionId subscribe(const std::string& sql);
+    void unsubscribe(SubscriptionId id);
+    void begin_prediction();       // optimistic local update
+    void commit_prediction();      // finalise prediction
+    void rollback_prediction();    // cancel prediction
+    void reset();                  // back to Init; preserves subscriptions
     Seq current_seq() const;
     SchemaVersion schema_version() const;
     State state() const;  // Init, Handshake, DiffBuckets, DiffRows, Live, Error
@@ -171,82 +237,143 @@ public:
 ### Peer (bidirectional)
 
 ```cpp
+enum class PeerRole : std::uint8_t { Client, Server };
+
 struct PeerConfig {
-    std::set<std::string> owned_tables;       // tables this side masters
-    ApproveOwnershipCallback approve_ownership; // non-null = server side
+    PeerRole role = PeerRole::Client;
+    std::set<std::string> owned_tables;
+    std::optional<std::set<std::string>> table_filter;
+    ApproveOwnershipCallback approve_ownership = nullptr;  // server only
     ConflictCallback on_conflict = nullptr;
     ProgressCallback on_progress = nullptr;
     SchemaMismatchCallback on_schema_mismatch = nullptr;
+    LogCallback on_log = nullptr;
 };
 
 struct PeerHandleResult {
-    std::vector<PeerMessage>  messages;  // responses to send back
-    std::vector<ChangeEvent>  changes;   // row-level changes applied
+    std::vector<PeerOutMessage> messages;
+    std::vector<ChangeEvent>    changes;
+    std::vector<QueryResult>    subscriptions;
 };
 
 class Peer {
 public:
     explicit Peer(sqlite3* db, PeerConfig config = {});
-    std::vector<PeerMessage> start();   // client initiates handshake
-    std::vector<PeerMessage> flush();   // after writing owned tables
+    std::vector<PeerOutMessage> start();   // client initiates
+    std::vector<PeerOutMessage> flush();
     PeerHandleResult handle_message(const PeerMessage& msg);
+    SubscriptionId subscribe(const std::string& sql);
+    void unsubscribe(SubscriptionId id);
+    void reset();
     State state() const;  // Init, Negotiating, Diffing, Live, Error
     const std::set<std::string>& owned_tables() const;
     const std::set<std::string>& remote_tables() const;
-    void reset();  // return to Init for reconnection; preserves table ownership
 };
 ```
 
-Each peer internally wraps a Master (for its owned tables) and a Replica (for
-the remote peer's tables). The client calls `start()` to request ownership; the
-server validates via `approve_ownership` (or auto-approves if null). The server
-owns the complement of whatever the client claims.
+### Relay (chain replication)
 
 ```cpp
-// Client (e.g. mobile app) owns "drafts", server owns the rest.
-PeerConfig client_cfg;
-client_cfg.owned_tables = {"drafts"};
-Peer client(client_db, client_cfg);
-
-PeerConfig server_cfg;
-server_cfg.approve_ownership = [](const std::set<std::string>& t) {
-    return t == std::set<std::string>{"drafts"};
+class Relay {
+public:
+    explicit Relay(sqlite3* db, RelayConfig config = {});
+    std::size_t add_sink(SinkCallback cb);             // register downstream
+    void remove_sink(std::size_t id);
+    OutMessage hello();                                // send to upstream
+    std::vector<OutMessage> handle_upstream(const Message& msg);
+    std::vector<OutMessage> handle_downstream(const Message& msg);
+    SubscriptionId subscribe(const std::string& sql);
+    void unsubscribe(SubscriptionId id);
+    void reset();
 };
-Peer server(server_db, server_cfg);
-
-auto msgs = client.start();
-// Exchange msgs between client and server until both reach Live.
-// Then: client.flush() after writes to "drafts",
-//       server.flush() after writes to other tables.
 ```
+
+### OutMessage / PeerOutMessage
+
+All methods that produce messages return tagged wrappers:
+
+```cpp
+struct OutMessage {
+    Message  msg;       // the protocol message
+    Delivery delivery;  // Reliable or BestEffort
+};
+
+struct PeerOutMessage {
+    PeerMessage msg;
+    Delivery    delivery;
+};
+
+enum class Delivery : std::uint8_t { Reliable, BestEffort };
+```
+
+`BucketHashesMsg`, `NeedBucketsMsg`, and `RowHashesMsg` are tagged
+`BestEffort`; all other messages are `Reliable`.
 
 ### Query subscriptions
 
-Register SQL queries on the replica to receive updated results whenever incoming
-changes affect a table the query reads from:
+Register SQL queries on the replica to receive updated results when incoming
+changes match the query's predicates:
 
 ```cpp
-// Subscribe to a query — returns the current result immediately.
-auto qr = replica.subscribe("SELECT id, val FROM t1 ORDER BY id");
-// qr.id       — subscription handle
-// qr.columns  — {"id", "val"}
-// qr.rows     — current result set (vector of vector<Value>)
+auto id = replica.subscribe("SELECT id, val FROM t1 WHERE val > 10 ORDER BY id");
 
-// After applying a changeset that touches t1:
-auto result = replica.handle_message(changeset_msg);
+// After applying a changeset:
+auto result = replica.handle_message(changeset_msg.msg);
 for (const auto& sub : result.subscriptions) {
-    // sub.id   — which subscription was invalidated
-    // sub.rows — the full updated result set
+    // sub.id      — which subscription fired
+    // sub.columns — column names
+    // sub.rows    — the full updated result set
 }
 
-// Stop receiving updates.
-replica.unsubscribe(qr.id);
+replica.unsubscribe(id);
 ```
 
-Table dependencies are discovered automatically via SQLite's authorizer API.
-Queries involving JOINs across multiple tables will fire when any of those
-tables change. Invalidation is table-level: any row change to a relevant table
-triggers re-evaluation of the full query.
+Predicates are extracted from WHERE clauses and propagated through equijoins.
+A bytecode VM evaluates predicates against changeset rows, so subscriptions
+whose predicates don't match are skipped entirely -- no SQL re-evaluation
+needed.
+
+### Prediction API
+
+Optimistic local updates with automatic rollback:
+
+```cpp
+replica.begin_prediction();
+// Write optimistically to the local database.
+sqlite3_exec(replica_db, "INSERT INTO items VALUES (99, 'pending')", 0, 0, 0);
+// Subscriptions now reflect the predicted state.
+replica.commit_prediction();
+// Send the corresponding action to the server.
+// When the server's changeset arrives via handle_message(), the prediction
+// savepoint is automatically rolled back and the server's state applied.
+```
+
+### Reconnection
+
+**Convergence loop** (preferred): Call `converge()` at any time to sync
+without a handshake. Works from any state -- Init, Live, or after `reset()`.
+
+```cpp
+replica.reset();
+auto msgs = replica.converge();  // BucketHashesMsg with BestEffort delivery
+// Send msgs to master, process responses normally.
+// If a message is lost, just call converge() again.
+```
+
+**Legacy handshake**: For ordered reliable channels.
+
+```cpp
+replica.reset();
+auto hello = replica.hello();
+// ... exchange messages until Live ...
+```
+
+**Peer reconnection**:
+
+```cpp
+peer.reset();              // preserves table ownership
+auto msgs = peer.start();  // re-initiate handshake
+```
 
 ## Error handling
 
@@ -262,149 +389,81 @@ try {
 }
 ```
 
-Error codes: `SqliteError`, `ProtocolError`, `SchemaMismatch`, `InvalidState`,
-`OwnershipRejected`, `WithoutRowidTable`. See `sqlpipe.h` for details.
-
-The replica also returns `ErrorMsg` messages when it receives unexpected
-protocol messages — these should be forwarded to the master over the transport.
+| ErrorCode | Meaning | Recommended action |
+|---|---|---|
+| `SqliteError` | An underlying SQLite call failed | Check the message; may indicate corruption or constraint violation |
+| `ProtocolError` | Malformed or unexpected message | Disconnect and reconnect |
+| `SchemaMismatch` | Master and replica schemas differ | Install `on_schema_mismatch`, or migrate offline and reconnect |
+| `InvalidState` | Operation not valid in current state | Bug in calling code |
+| `OwnershipRejected` | Peer ownership request rejected | Server's `approve_ownership` returned false |
+| `WithoutRowidTable` | Table uses `WITHOUT ROWID` | Use regular rowid tables |
 
 ## Schema migration
 
-By default, a schema mismatch between master and replica is a hard error. You
-can install a callback to run migrations instead:
+Install a callback to run migrations on schema mismatch instead of erroring:
 
 ```cpp
-MasterConfig mc;
-mc.on_schema_mismatch = [&](SchemaVersion remote, SchemaVersion local,
-                            const std::string& /*remote_schema_sql*/) {
-    // ALTER the master's DB to match the replica, then return true to retry.
-    // remote_schema_sql is empty on the master side (replica only sends fingerprint).
-    sqlite3_exec(master_db, "ALTER TABLE t ADD COLUMN new_col TEXT", 0, 0, 0);
-    return true;  // recompute fingerprint and retry
-};
-Master master(master_db, mc);
-
 ReplicaConfig rc;
 rc.on_schema_mismatch = [&](SchemaVersion remote, SchemaVersion local,
                             const std::string& remote_schema_sql) {
-    // remote_schema_sql contains the master's CREATE TABLE statements.
-    // Use it to determine what ALTER TABLE commands to run.
+    // remote_schema_sql has the master's CREATE TABLE statements.
     sqlite3_exec(replica_db, "ALTER TABLE t ADD COLUMN new_col TEXT", 0, 0, 0);
-    return true;  // reset to Init — call hello() again to re-handshake
+    return true;  // reset to Init; re-handshake
 };
-Replica replica(replica_db, rc);
 ```
 
-The same callback is available on `PeerConfig` and is forwarded to both the
-internal Master and Replica.
-
-## Batched message handling
-
-When processing a burst of messages, use `handle_messages()` to defer
-subscription re-evaluation until all messages are applied:
-
-```cpp
-std::vector<Message> burst = /* received from network */;
-auto result = replica.handle_messages(burst);
-// Subscriptions are evaluated once, not per-message.
-```
-
-## Thread safety
-
-`Master`, `Replica`, and `Peer` are **not thread-safe**. Each instance must be
-accessed from a single thread at a time. If you need multi-threaded access,
-provide your own synchronisation (e.g. a mutex around all calls to the
-instance). The `sqlite3*` handle must not be used concurrently by other threads
-during sqlpipe operations.
-
-## WAL mode
-
-SQLite WAL mode is recommended but not required. WAL allows concurrent readers
-while the replica applies changes, which is useful if your application reads the
-database on a separate thread. Enable it before creating any sqlpipe objects:
-
-```cpp
-sqlite3_exec(db, "PRAGMA journal_mode=WAL", 0, 0, 0);
-```
+The same callback is available on `MasterConfig` and `PeerConfig`.
 
 ## Transport wiring
 
-sqlpipe is transport-agnostic. The wire format is already length-prefixed, so
-integrating with any byte-stream transport (TCP, WebSocket, serial, etc.) is
-straightforward:
+sqlpipe is transport-agnostic. The wire format is length-prefixed:
 
-**Sending:**
 ```cpp
-auto buf = sqlpipe::serialize(msg);      // or serialize(peer_msg)
-send(socket, buf.data(), buf.size());    // your transport
-```
+// Sending:
+auto buf = sqlpipe::serialize(om.msg);   // or serialize(pom.msg)
+// Use om.delivery to choose channel (e.g. QUIC stream vs datagram).
+send(socket, buf.data(), buf.size());
 
-**Receiving:**
-```cpp
-// 1. Read the 4-byte little-endian length prefix.
+// Receiving:
 uint8_t hdr[4];
 recv(socket, hdr, 4);
 uint32_t len = hdr[0] | (hdr[1]<<8) | (hdr[2]<<16) | (hdr[3]<<24);
-
-// 2. Read the full message (length prefix + payload).
 std::vector<uint8_t> buf(4 + len);
 memcpy(buf.data(), hdr, 4);
 recv(socket, buf.data() + 4, len);
-
-// 3. Deserialize.
 auto msg = sqlpipe::deserialize(buf);    // or deserialize_peer(buf)
 ```
 
-## Reconnection
+The Go wrapper provides a `Transport` interface in
+`go/sqlpipe/transport` for pluggable transport implementations.
 
-Both `Replica` and `Peer` support reconnection without recreating the object:
+## Thread safety
 
-```cpp
-// Replica reconnection:
-replica.reset();           // back to Init; subscriptions are preserved
-auto hello = replica.hello();
-// ... re-run the handshake exchange ...
-// Diff sync will discover and transfer only what changed.
-
-// Peer reconnection:
-peer.reset();              // back to Init; table ownership is preserved
-auto msgs = peer.start();  // re-initiate handshake
-// ... exchange messages until Live ...
-```
-
-## Error recovery
-
-| ErrorCode | Meaning | Recommended action |
-|---|---|---|
-| `SqliteError` | An underlying SQLite call failed | Check the message for details; may indicate corruption or a constraint violation |
-| `ProtocolError` | Malformed or unexpected message | Disconnect and reconnect; the peer may be buggy or malicious |
-| `SchemaMismatch` | Master and replica schemas differ | Install an `on_schema_mismatch` callback, or migrate offline and reconnect |
-| `InvalidState` | Operation not valid in the current state | Bug in the calling code; check the state machine |
-| `OwnershipRejected` | Peer ownership request was rejected | The server's `approve_ownership` callback returned false |
-| `WithoutRowidTable` | Table uses `WITHOUT ROWID` | Not supported; use regular rowid tables |
+`Master`, `Replica`, `Peer`, and `Relay` are **not thread-safe**. Each
+instance must be accessed from a single thread at a time. The `sqlite3*`
+handle must not be used concurrently during sqlpipe operations.
 
 ## Message size limits
 
-Incoming messages are validated against built-in limits to resist malicious
-peers:
+- **`kMaxMessageSize`** (64 MB) -- maximum serialized message size
+- **`kMaxArrayCount`** (10 M) -- maximum elements in any array field
 
-- **`kMaxMessageSize`** (64 MB) — maximum serialized message size
-- **`kMaxArrayCount`** (10 M) — maximum number of elements in any array field
-
-Messages exceeding these limits cause `deserialize()` to throw
-`ProtocolError`. The limits are defined as `inline constexpr` in `sqlpipe.h`.
+Messages exceeding these limits cause `deserialize()` to throw `ProtocolError`.
 
 ## Related projects
 
-- **[sqldeep](https://github.com/marcelocantos/sqldeep)** — JSON5-like SQL syntax transpiler. Write nested JSON queries naturally; sqldeep rewrites them into SQLite JSON functions.
-- **[sqlift](https://github.com/marcelocantos/sqlift)** — Declarative SQLite schema migrations. Describe your desired schema; sqlift diffs and applies the changes.
+- **[sqldeep](https://github.com/marcelocantos/sqldeep)** -- JSON5-like SQL syntax transpiler for SQLite JSON functions
+- **[sqlift](https://github.com/marcelocantos/sqlift)** -- Declarative SQLite schema migrations via structural diffing
 
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE) for details.
 
 Third-party dependencies:
-- **SQLite** - public domain
-- **LZ4** - BSD 2-Clause
-- **spdlog** - MIT
-- **doctest** - MIT
+- **SQLite** -- public domain
+- **LZ4** -- BSD 2-Clause
+- **spdlog** -- MIT
+- **nlohmann/json** -- MIT
+- **liteparser** -- MIT
+- **sqlift** -- Apache 2.0
+- **doctest** -- MIT (test only)
