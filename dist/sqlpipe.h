@@ -85,20 +85,6 @@ inline constexpr std::size_t kMaxMessageSize = 64 * 1024 * 1024;
 /// Maximum number of elements in a deserialized array (10 M).
 inline constexpr std::uint32_t kMaxArrayCount = 10'000'000;
 
-// ── Delivery hint ──────────────────────────────────────────────────
-
-// ── Delivery hint ──────────────────────────────────────────────────
-
-/// Transport delivery hint for outgoing messages.
-/// Reliable messages should be sent via an ordered, guaranteed channel
-/// (e.g. QUIC stream). BestEffort messages may be sent via an
-/// unreliable channel (e.g. QUIC datagram); if lost, the convergence
-/// loop will regenerate them.
-enum class Delivery : std::uint8_t {
-    Reliable,    ///< Must arrive (changesets, errors, acks, hellos, patchsets).
-    BestEffort,  ///< Regenerable by convergence (bucket/row hashes, need-buckets).
-};
-
 /// Opaque handle for a query subscription.
 using SubscriptionId = std::uint64_t;
 
@@ -361,45 +347,6 @@ using Message = std::variant<
     DiffReadyMsg
 >;
 
-// ── OutMessage ──────────────────────────────────────────────────────
-
-/// A message paired with a transport delivery hint.
-struct OutMessage {
-    Message  msg;
-    Delivery delivery;
-};
-
-/// Determine the delivery mode for a message based on its type.
-/// BucketHashesMsg, NeedBucketsMsg, RowHashesMsg → BestEffort;
-/// everything else → Reliable.
-inline Delivery delivery_for(const Message& msg) {
-    return std::visit([](const auto& m) -> Delivery {
-        using T = std::decay_t<decltype(m)>;
-        if constexpr (std::is_same_v<T, BucketHashesMsg> ||
-                      std::is_same_v<T, NeedBucketsMsg> ||
-                      std::is_same_v<T, RowHashesMsg>) {
-            return Delivery::BestEffort;
-        }
-        return Delivery::Reliable;
-    }, msg);
-}
-
-/// Wrap a Message with its default delivery hint.
-inline OutMessage tagged(Message msg) {
-    auto d = delivery_for(msg);
-    return {std::move(msg), d};
-}
-
-/// Wrap a vector of Messages with their default delivery hints.
-inline std::vector<OutMessage> tagged(std::vector<Message> msgs) {
-    std::vector<OutMessage> result;
-    result.reserve(msgs.size());
-    for (auto& m : msgs) {
-        result.push_back(tagged(std::move(m)));
-    }
-    return result;
-}
-
 // ── Wire format tags ────────────────────────────────────────────────
 
 enum class MessageTag : std::uint8_t {
@@ -426,7 +373,7 @@ Message deserialize(std::span<const std::uint8_t> buf);
 /// Master's database. Receives the tagged changeset messages ready to send.
 /// When set, the Master hooks into SQLite's commit notification so that
 /// callers never need to call flush() explicitly.
-using FlushCallback = std::function<void(const std::vector<OutMessage>&)>;
+using FlushCallback = std::function<void(const std::vector<Message>&)>;
 
 } // namespace sqlpipe
 
@@ -491,10 +438,10 @@ public:
     /// Call after committing a write transaction. Extracts the changeset,
     /// assigns a sequence number, and returns the tagged messages to send
     /// to connected replicas. Returns empty if nothing changed.
-    std::vector<OutMessage> flush();
+    std::vector<Message> flush();
 
     /// Process an incoming message from a replica.
-    std::vector<OutMessage> handle_message(const Message& msg);
+    std::vector<Message> handle_message(const Message& msg);
 
     Seq current_seq() const;
     SchemaVersion schema_version() const;
@@ -540,7 +487,7 @@ struct ReplicaConfig {
 
 /// Return type for Replica::handle_message.
 struct HandleResult {
-    std::vector<OutMessage>   messages;       ///< Tagged protocol responses to send back.
+    std::vector<Message>      messages;       ///< Protocol responses to send back.
     std::vector<ChangeEvent>  changes;        ///< Row-level changes applied this call.
     std::vector<QueryResult>  subscriptions;  ///< Invalidated subscription results.
 };
@@ -560,7 +507,7 @@ public:
     Replica& operator=(Replica&&) noexcept;
 
     /// Generate the initial HelloMsg to send to the master.
-    OutMessage hello() const;
+    Message hello() const;
 
     /// Initiate a convergence round. Computes and returns bucket hashes
     /// for the current local state. The master compares these against its
@@ -574,7 +521,7 @@ public:
     /// - Periodic convergence checks (are we still in sync?)
     /// - Reconnection without full handshake
     /// - Loss-tolerant sync over unreliable channels
-    std::vector<OutMessage> converge();
+    std::vector<Message> converge();
 
     /// Process an incoming message from the master.
     HandleResult handle_message(const Message& msg);
@@ -696,31 +643,9 @@ struct PeerMessage {
     Message    payload;
 };
 
-/// A peer message paired with a transport delivery hint.
-struct PeerOutMessage {
-    PeerMessage msg;
-    Delivery    delivery;
-};
-
-/// Wrap a PeerMessage with its default delivery hint.
-inline PeerOutMessage tagged(PeerMessage msg) {
-    auto d = delivery_for(msg.payload);
-    return {std::move(msg), d};
-}
-
-/// Wrap a vector of PeerMessages with their default delivery hints.
-inline std::vector<PeerOutMessage> tagged(std::vector<PeerMessage> msgs) {
-    std::vector<PeerOutMessage> result;
-    result.reserve(msgs.size());
-    for (auto& m : msgs) {
-        result.push_back(tagged(std::move(m)));
-    }
-    return result;
-}
-
 /// Return type for Peer::handle_message.
 struct PeerHandleResult {
-    std::vector<PeerOutMessage> messages;       ///< Tagged protocol responses.
+    std::vector<PeerMessage>    messages;       ///< Protocol responses.
     std::vector<ChangeEvent>    changes;        ///< Row-level changes applied.
     std::vector<QueryResult>    subscriptions;  ///< Invalidated subscription results.
 };
@@ -743,11 +668,11 @@ public:
 
     /// Initiate the handshake (client only).
     /// Returns tagged PeerMessages to send to the remote peer.
-    std::vector<PeerOutMessage> start();
+    std::vector<PeerMessage> start();
 
     /// Flush local changes on owned tables.
-    /// Returns tagged PeerMessages to send to the remote peer.
-    std::vector<PeerOutMessage> flush();
+    /// Returns PeerMessages to send to the remote peer.
+    std::vector<PeerMessage> flush();
 
     /// Process an incoming PeerMessage from the remote peer.
     PeerHandleResult handle_message(const PeerMessage& msg);
@@ -795,7 +720,7 @@ PeerMessage deserialize_peer(std::span<const std::uint8_t> buf);
 // ── relay.h ─────────────────────────────────────────────────────
 
 /// Callback to deliver a tagged message to a downstream sink.
-using SinkCallback = std::function<void(const OutMessage&)>;
+using SinkCallback = std::function<void(const Message&)>;
 
 /// Configuration for a Relay node.
 struct RelayConfig {
@@ -838,17 +763,17 @@ public:
     void remove_sink(std::size_t id);
 
     /// Generate the HelloMsg to send to the upstream master.
-    OutMessage hello();
+    Message hello();
 
     /// Handle an incoming message from the upstream master.
     /// Applies the changeset locally, flushes to the internal Master,
     /// and broadcasts to all registered sinks.
-    /// Returns tagged response messages to send back to the upstream master.
-    std::vector<OutMessage> handle_upstream(const Message& msg);
+    /// Returns response messages to send back to the upstream master.
+    std::vector<Message> handle_upstream(const Message& msg);
 
     /// Handle an incoming message from a downstream sink (handshake).
-    /// Returns tagged response messages to send back to that sink.
-    std::vector<OutMessage> handle_downstream(const Message& msg);
+    /// Returns response messages to send back to that sink.
+    std::vector<Message> handle_downstream(const Message& msg);
 
     /// Subscribe to a query (on the replica side).
     SubscriptionId subscribe(const std::string& sql);
