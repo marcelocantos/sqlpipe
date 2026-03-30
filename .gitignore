@@ -13,3 +13,6 @@ compile_commands.json
 node_modules/
 web/dist/
 swift/.build/
+formal/tla2tools.jar
+formal/*_TTrace_*
+formal/states/
