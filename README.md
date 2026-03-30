@@ -2,8 +2,6 @@
 
 Streaming replication protocol for SQLite.
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-
 sqlpipe is a C++ library that keeps SQLite databases in sync over any transport
 layer. A **Master** tracks changes and produces compact binary changesets; a
 **Replica** applies them, emitting per-row change events and query subscription
@@ -13,9 +11,9 @@ replication with table-level ownership. A **Relay** enables chain replication
 
 The library is transport-agnostic: it defines a message-in / message-out API.
 You decide how messages travel between peers (TCP, WebSocket, QUIC, serial,
-shared memory, etc.). Every outgoing message carries a `Delivery` hint
-(`Reliable` or `BestEffort`) so transports can route appropriately -- e.g.
-QUIC streams for reliable messages, QUIC datagrams for best-effort.
+shared memory, datagrams, etc.). The convergence loop makes every message
+regenerable, so the protocol works over pure datagrams -- any message can be
+lost and recovered by the next convergence round.
 
 ## Features
 
@@ -48,8 +46,6 @@ QUIC streams for reliable messages, QUIC datagrams for best-effort.
 - **Conflict callbacks** for custom resolution logic
 - **LZ4 changeset compression** -- automatic, with uncompressed fallback
 - **Schema fingerprinting** via structural hashing (sqlift) to detect mismatches
-- **Delivery hints** -- every `OutMessage`/`PeerOutMessage` carries `Reliable`
-  or `BestEffort`, enabling smart transport routing
 - **Single header + source** (`sqlpipe.h` / `sqlpipe.cpp`) for easy integration
 - **Formally verified** -- the convergence protocol is modelled in
   [TLA+](formal/Convergence.tla) and checked with TLC
@@ -96,10 +92,10 @@ sync_handshake(master, replica);  // convenience for in-process use
 
 // Make changes on the master, then flush.
 sqlite3_exec(master_db, "INSERT INTO t VALUES (1, 'hello')", 0, 0, 0);
-auto out_msgs = master.flush();  // returns vector<OutMessage>
-for (auto& om : out_msgs) {
-    auto result = replica.handle_message(om.msg);
-    // result.messages    — vector<OutMessage> to send back
+auto msgs = master.flush();  // returns vector<Message>
+for (auto& msg : msgs) {
+    auto result = replica.handle_message(msg);
+    // result.messages    — vector<Message> to send back
     // result.changes     — per-row ChangeEvents
     // result.subscriptions — updated query results
 }
@@ -134,39 +130,37 @@ ordered reliable delivery.
 ```
 Replica                              Master
    |                                    |
-   |-- BucketHashesMsg [BE] --------->|  converge() — no prior hello needed
+   |-- BucketHashesMsg -------------->|  converge() — no prior hello needed
    |                                    |  compare bucket hashes
-   |<-- NeedBucketsMsg [BE] ----------|  (skipped if all match)
+   |<-- NeedBucketsMsg ---------------|  (skipped if all match)
    |                                    |
-   |-- RowHashesMsg [BE] ------------>|  row-level hashes for mismatched buckets
+   |-- RowHashesMsg ----------------->|  row-level hashes for mismatched buckets
    |                                    |
-   |<-- DiffReadyMsg [R] -------------|  patchset + per-table deletes
-   |-- AckMsg [R] ------------------->|
+   |<-- DiffReadyMsg -----------------|  patchset + per-table deletes
+   |-- AckMsg ----------------------->|
    |                                    |
    |         [LIVE STREAMING]           |
-   |<-- ChangesetMsg [R] -------------|  (master.flush())
-   |-- AckMsg [R] ------------------->|
-
-[BE] = BestEffort delivery    [R] = Reliable delivery
+   |<-- ChangesetMsg -----------------|  (master.flush())
+   |-- AckMsg ----------------------->|
 ```
 
-If any best-effort message is lost, call `converge()` again -- the loop
-is idempotent. The master processes `BucketHashesMsg` directly without
-requiring a prior `HelloMsg`.
+Every message in the convergence loop is regenerable. If any message is
+lost, call `converge()` again -- the loop is idempotent. The master
+processes `BucketHashesMsg` directly without requiring a prior `HelloMsg`.
 
 **Legacy handshake** (ordered reliable channel):
 
 ```
 Replica                              Master
    |                                    |
-   |-- HelloMsg [R] ----------------->|
-   |<-- HelloMsg [R] -----------------|  schema mismatch -> ErrorMsg
+   |-- HelloMsg --------------------->|
+   |<-- HelloMsg ---------------------|  schema mismatch -> ErrorMsg
    |                                    |
-   |-- BucketHashesMsg [R] ---------->|
-   |<-- NeedBucketsMsg [R] -----------|
-   |-- RowHashesMsg [R] ------------->|
-   |<-- DiffReadyMsg [R] -------------|
-   |-- AckMsg [R] ------------------->|
+   |-- BucketHashesMsg -------------->|
+   |<-- NeedBucketsMsg ---------------|
+   |-- RowHashesMsg ----------------->|
+   |<-- DiffReadyMsg -----------------|
+   |-- AckMsg ----------------------->|
    |                                    |
    |         [LIVE STREAMING]           |
 ```
@@ -181,7 +175,7 @@ struct MasterConfig {
     std::int64_t bucket_size = 1024;
     ProgressCallback on_progress = nullptr;
     SchemaMismatchCallback on_schema_mismatch = nullptr;
-    FlushCallback on_flush = nullptr;        // auto-flush on commit
+    FlushCallback on_flush = nullptr;        // auto-flush on commit (takes std::vector<Message>)
     std::size_t changeset_queue_size = 64;   // 0 = disable queue replay
     LogCallback on_log = nullptr;
 };
@@ -190,8 +184,8 @@ class Master {
 public:
     explicit Master(sqlite3* db, MasterConfig config = {});
     void exec(const std::string& sql);                     // auto-flushes if on_flush set
-    std::vector<OutMessage> flush();                       // manual flush
-    std::vector<OutMessage> handle_message(const Message& msg);
+    std::vector<Message> flush();                          // manual flush
+    std::vector<Message> handle_message(const Message& msg);
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 };
@@ -210,7 +204,7 @@ struct ReplicaConfig {
 };
 
 struct HandleResult {
-    std::vector<OutMessage>   messages;       // tagged protocol responses
+    std::vector<Message>      messages;       // protocol responses
     std::vector<ChangeEvent>  changes;        // row-level changes applied
     std::vector<QueryResult>  subscriptions;  // invalidated query results
 };
@@ -218,8 +212,8 @@ struct HandleResult {
 class Replica {
 public:
     explicit Replica(sqlite3* db, ReplicaConfig config = {});
-    OutMessage hello() const;
-    std::vector<OutMessage> converge();                    // stateless sync
+    Message hello() const;
+    std::vector<Message> converge();                       // stateless sync
     HandleResult handle_message(const Message& msg);
     HandleResult handle_messages(std::span<const Message> msgs);  // batched
     SubscriptionId subscribe(const std::string& sql);
@@ -251,16 +245,16 @@ struct PeerConfig {
 };
 
 struct PeerHandleResult {
-    std::vector<PeerOutMessage> messages;
-    std::vector<ChangeEvent>    changes;
-    std::vector<QueryResult>    subscriptions;
+    std::vector<PeerMessage>  messages;
+    std::vector<ChangeEvent>  changes;
+    std::vector<QueryResult>  subscriptions;
 };
 
 class Peer {
 public:
     explicit Peer(sqlite3* db, PeerConfig config = {});
-    std::vector<PeerOutMessage> start();   // client initiates
-    std::vector<PeerOutMessage> flush();
+    std::vector<PeerMessage> start();      // client initiates
+    std::vector<PeerMessage> flush();
     PeerHandleResult handle_message(const PeerMessage& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
@@ -277,37 +271,16 @@ public:
 class Relay {
 public:
     explicit Relay(sqlite3* db, RelayConfig config = {});
-    std::size_t add_sink(SinkCallback cb);             // register downstream
+    std::size_t add_sink(SinkCallback cb);             // register downstream (takes const Message&)
     void remove_sink(std::size_t id);
-    OutMessage hello();                                // send to upstream
-    std::vector<OutMessage> handle_upstream(const Message& msg);
-    std::vector<OutMessage> handle_downstream(const Message& msg);
+    Message hello();                                   // send to upstream
+    std::vector<Message> handle_upstream(const Message& msg);
+    std::vector<Message> handle_downstream(const Message& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
     void reset();
 };
 ```
-
-### OutMessage / PeerOutMessage
-
-All methods that produce messages return tagged wrappers:
-
-```cpp
-struct OutMessage {
-    Message  msg;       // the protocol message
-    Delivery delivery;  // Reliable or BestEffort
-};
-
-struct PeerOutMessage {
-    PeerMessage msg;
-    Delivery    delivery;
-};
-
-enum class Delivery : std::uint8_t { Reliable, BestEffort };
-```
-
-`BucketHashesMsg`, `NeedBucketsMsg`, and `RowHashesMsg` are tagged
-`BestEffort`; all other messages are `Reliable`.
 
 ### Query subscriptions
 
@@ -318,7 +291,7 @@ changes match the query's predicates:
 auto id = replica.subscribe("SELECT id, val FROM t1 WHERE val > 10 ORDER BY id");
 
 // After applying a changeset:
-auto result = replica.handle_message(changeset_msg.msg);
+auto result = replica.handle_message(changeset_msg);
 for (const auto& sub : result.subscriptions) {
     // sub.id      — which subscription fired
     // sub.columns — column names
@@ -355,7 +328,7 @@ without a handshake. Works from any state -- Init, Live, or after `reset()`.
 
 ```cpp
 replica.reset();
-auto msgs = replica.converge();  // BucketHashesMsg with BestEffort delivery
+auto msgs = replica.converge();  // returns BucketHashesMsg
 // Send msgs to master, process responses normally.
 // If a message is lost, just call converge() again.
 ```
@@ -382,7 +355,7 @@ human-readable message:
 
 ```cpp
 try {
-    auto msgs = master.flush();
+    auto msgs = master.flush();  // std::vector<Message>
 } catch (const sqlpipe::Error& e) {
     // e.code()  — ErrorCode enum
     // e.what()  — descriptive string
@@ -420,8 +393,7 @@ sqlpipe is transport-agnostic. The wire format is length-prefixed:
 
 ```cpp
 // Sending:
-auto buf = sqlpipe::serialize(om.msg);   // or serialize(pom.msg)
-// Use om.delivery to choose channel (e.g. QUIC stream vs datagram).
+auto buf = sqlpipe::serialize(msg);   // or serialize(peer_msg)
 send(socket, buf.data(), buf.size());
 
 // Receiving:
