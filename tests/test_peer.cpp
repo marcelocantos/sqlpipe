@@ -45,11 +45,11 @@ struct DB {
     }
 };
 
-// Deliver all PeerOutMessages from one peer to another, returning aggregated result.
-PeerHandleResult deliver(const std::vector<PeerOutMessage>& msgs, Peer& handler) {
+// Deliver all PeerMessages from one peer to another, returning aggregated result.
+PeerHandleResult deliver(const std::vector<PeerMessage>& msgs, Peer& handler) {
     PeerHandleResult result;
     for (const auto& m : msgs) {
-        auto resp = handler.handle_message(m.msg);
+        auto resp = handler.handle_message(m);
         result.messages.insert(result.messages.end(),
                                resp.messages.begin(), resp.messages.end());
         result.changes.insert(result.changes.end(),
@@ -59,7 +59,7 @@ PeerHandleResult deliver(const std::vector<PeerOutMessage>& msgs, Peer& handler)
 }
 
 // Exchange messages between two peers until no more messages are produced.
-void exchange(Peer& a, Peer& b, const std::vector<PeerOutMessage>& initial) {
+void exchange(Peer& a, Peer& b, const std::vector<PeerMessage>& initial) {
     auto msgs = initial;
     while (!msgs.empty()) {
         // Deliver to b, collect responses.
@@ -86,8 +86,8 @@ TEST_CASE("peer: client start produces hello with owned_tables") {
 
     auto msgs = client.start();
     REQUIRE(msgs.size() == 1);
-    CHECK(msgs[0].msg.sender_role == SenderRole::AsReplica);
-    auto& hello = std::get<HelloMsg>(msgs[0].msg.payload);
+    CHECK(msgs[0].sender_role == SenderRole::AsReplica);
+    auto& hello = std::get<HelloMsg>(msgs[0].payload);
     CHECK(hello.owned_tables == std::set<std::string>{"t1"});
     CHECK(client.state() == Peer::State::Negotiating);
 }
@@ -155,7 +155,7 @@ TEST_CASE("peer: ownership rejection") {
 
     CHECK(server.state() == Peer::State::Error);
     REQUIRE(!resp.messages.empty());
-    auto* err = std::get_if<ErrorMsg>(&resp.messages[0].msg.payload);
+    auto* err = std::get_if<ErrorMsg>(&resp.messages[0].payload);
     REQUIRE(err != nullptr);
     CHECK(err->code == ErrorCode::OwnershipRejected);
 }
@@ -557,7 +557,7 @@ TEST_CASE("peer: server rejects client ownership outside table_filter") {
 
     CHECK(server.state() == Peer::State::Error);
     REQUIRE(!resp.messages.empty());
-    auto* err = std::get_if<ErrorMsg>(&resp.messages[0].msg.payload);
+    auto* err = std::get_if<ErrorMsg>(&resp.messages[0].payload);
     REQUIRE(err != nullptr);
     CHECK(err->code == ErrorCode::OwnershipRejected);
 }
@@ -607,7 +607,7 @@ TEST_CASE("peer: subscribe receives updates through handle_message") {
     // Client handles the changeset — subscription should fire.
     PeerHandleResult result;
     for (auto& m : msgs) {
-        auto r = client.handle_message(m.msg);
+        auto r = client.handle_message(m);
         result.messages.insert(result.messages.end(),
             r.messages.begin(), r.messages.end());
         result.changes.insert(result.changes.end(),
@@ -627,7 +627,7 @@ TEST_CASE("peer: subscribe receives updates through handle_message") {
     msgs = server.flush();
     PeerHandleResult result2;
     for (auto& m : msgs) {
-        auto r = client.handle_message(m.msg);
+        auto r = client.handle_message(m);
         result2.subscriptions.insert(result2.subscriptions.end(),
             r.subscriptions.begin(), r.subscriptions.end());
     }

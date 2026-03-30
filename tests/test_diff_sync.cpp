@@ -48,34 +48,34 @@ struct DB {
 // Full handshake including diff exchange.
 void handshake(Master& master, Replica& replica) {
     auto hello = replica.hello();
-    auto resp = master.handle_message(hello.msg);
+    auto resp = master.handle_message(hello);
     HandleResult r;
     for (const auto& m : resp) {
-        auto result = replica.handle_message(m.msg);
+        auto result = replica.handle_message(m);
         r.messages.insert(r.messages.end(),
                           result.messages.begin(), result.messages.end());
     }
     for (const auto& m : r.messages) {
-        auto result = master.handle_message(m.msg);
+        auto result = master.handle_message(m);
         HandleResult r2;
         for (const auto& m2 : result) {
-            auto result2 = replica.handle_message(m2.msg);
+            auto result2 = replica.handle_message(m2);
             r2.messages.insert(r2.messages.end(),
                                result2.messages.begin(), result2.messages.end());
         }
         for (const auto& m3 : r2.messages) {
-            auto result3 = master.handle_message(m3.msg);
+            auto result3 = master.handle_message(m3);
             for (const auto& m4 : result3) {
-                replica.handle_message(m4.msg);
+                replica.handle_message(m4);
             }
         }
     }
 }
 
-HandleResult deliver(const std::vector<OutMessage>& msgs, Replica& handler) {
+HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
     HandleResult result;
     for (const auto& m : msgs) {
-        auto resp = handler.handle_message(m.msg);
+        auto resp = handler.handle_message(m);
         result.messages.insert(result.messages.end(),
                                resp.messages.begin(), resp.messages.end());
         result.changes.insert(result.changes.end(),
@@ -96,12 +96,12 @@ TEST_CASE("diff sync: schema mismatch produces ErrorMsg") {
     Replica replica(replica_db.db);
 
     auto hello = replica.hello();
-    auto master_resp = master.handle_message(hello.msg);
+    auto master_resp = master.handle_message(hello);
 
     // Master should detect schema mismatch and send ErrorMsg.
     REQUIRE(master_resp.size() == 1);
-    CHECK(std::holds_alternative<ErrorMsg>(master_resp[0].msg));
-    auto& err = std::get<ErrorMsg>(master_resp[0].msg);
+    CHECK(std::holds_alternative<ErrorMsg>(master_resp[0]));
+    auto& err = std::get<ErrorMsg>(master_resp[0]);
     CHECK(err.code == ErrorCode::SchemaMismatch);
     CHECK(err.remote_schema_version == master.schema_version());
     CHECK(!err.remote_schema_sql.empty());
@@ -235,10 +235,10 @@ TEST_CASE("diff sync: auto-migrate empty replica to master schema") {
     Replica replica(replica_db.db);  // no schema, no tables
 
     // First handshake attempt: schema mismatch → auto-migration → reset.
-    auto pending = master.handle_message(replica.hello().msg);
+    auto pending = master.handle_message(replica.hello());
     REQUIRE(pending.size() == 1);  // ErrorMsg with schema SQL
 
-    auto result = replica.handle_message(pending[0].msg);
+    auto result = replica.handle_message(pending[0]);
     // Auto-migration should have resolved the mismatch and reset to Init.
     CHECK(replica.state() == Replica::State::Init);
 
@@ -273,10 +273,10 @@ TEST_CASE("diff sync: auto-migrate adds new column") {
     replica.reset();
     Master master2(master_db.db);  // new master with evolved schema
 
-    auto pending = master2.handle_message(replica.hello().msg);
+    auto pending = master2.handle_message(replica.hello());
     REQUIRE(pending.size() == 1);  // ErrorMsg
 
-    auto result = replica.handle_message(pending[0].msg);
+    auto result = replica.handle_message(pending[0]);
     CHECK(replica.state() == Replica::State::Init);  // auto-migrated
 
     sync_handshake(master2, replica);
@@ -295,7 +295,7 @@ TEST_CASE("diff sync: fast reconnect when seq matches (no diff messages)") {
     sync_handshake(master, replica);
     master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
     auto msgs = master.flush();
-    for (auto& m : msgs) replica.handle_message(m.msg);
+    for (auto& m : msgs) replica.handle_message(m);
     CHECK(replica.current_seq() == 1);
 
     // Simulate reconnect with no changes — seqs match.
@@ -304,21 +304,21 @@ TEST_CASE("diff sync: fast reconnect when seq matches (no diff messages)") {
 
     // Track what messages are exchanged.
     auto hello = replica2.hello();
-    auto resp = master2.handle_message(hello.msg);
+    auto resp = master2.handle_message(hello);
 
     // Master should respond with a single HelloMsg (fast path).
     REQUIRE(resp.size() == 1);
-    CHECK(std::holds_alternative<HelloMsg>(resp[0].msg));
-    auto& hm = std::get<HelloMsg>(resp[0].msg);
+    CHECK(std::holds_alternative<HelloMsg>(resp[0]));
+    auto& hm = std::get<HelloMsg>(resp[0]);
     CHECK(hm.last_seq == 1);  // confirms fast path
 
     // Replica receives the HelloMsg and goes straight to Live.
-    auto result = replica2.handle_message(resp[0].msg);
+    auto result = replica2.handle_message(resp[0]);
     CHECK(replica2.state() == Replica::State::Live);
 
     // No BucketHashesMsg — just an AckMsg back.
     REQUIRE(result.messages.size() == 1);
-    CHECK(std::holds_alternative<AckMsg>(result.messages[0].msg));
+    CHECK(std::holds_alternative<AckMsg>(result.messages[0]));
 
     // Data is still there.
     CHECK(replica_db.count("t1") == 1);
@@ -335,7 +335,7 @@ TEST_CASE("diff sync: no fast reconnect when seq differs") {
     sync_handshake(master, replica);
     master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
     auto msgs = master.flush();
-    for (auto& m : msgs) replica.handle_message(m.msg);
+    for (auto& m : msgs) replica.handle_message(m);
 
     // Master adds more data (seq=2), replica stays at seq=1.
     {
@@ -371,23 +371,22 @@ TEST_CASE("convergence: replica-initiated sync without hello") {
     // Instead of hello → handshake, use converge() directly.
     auto bucket_msgs = replica.converge();
     REQUIRE(!bucket_msgs.empty());
-    CHECK(std::holds_alternative<BucketHashesMsg>(bucket_msgs[0].msg));
-    CHECK(bucket_msgs[0].delivery == Delivery::BestEffort);
+    CHECK(std::holds_alternative<BucketHashesMsg>(bucket_msgs[0]));
 
     // Feed bucket hashes to master — no prior HelloMsg needed.
-    auto master_resp = master.handle_message(bucket_msgs[0].msg);
+    auto master_resp = master.handle_message(bucket_msgs[0]);
     REQUIRE(!master_resp.empty());
 
     // Master responds with NeedBuckets (+ maybe DiffReady).
     // Feed all responses to replica.
     for (const auto& om : master_resp) {
-        auto hr = replica.handle_message(om.msg);
+        auto hr = replica.handle_message(om);
         // Feed replica responses back to master.
         for (const auto& rom : hr.messages) {
-            auto mr = master.handle_message(rom.msg);
+            auto mr = master.handle_message(rom);
             // Continue relay if needed.
             for (const auto& m : mr) {
-                replica.handle_message(m.msg);
+                replica.handle_message(m);
             }
         }
     }
@@ -410,7 +409,7 @@ TEST_CASE("convergence: re-convergence check while live") {
     // Insert and deliver one row.
     master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
     auto msgs = master.flush();
-    for (const auto& om : msgs) replica.handle_message(om.msg);
+    for (const auto& om : msgs) replica.handle_message(om);
     CHECK(replica_db.count("t1") == 1);
 
     // Run a convergence check while already Live.
@@ -418,19 +417,19 @@ TEST_CASE("convergence: re-convergence check while live") {
     auto bucket_msgs = replica.converge();
     REQUIRE(!bucket_msgs.empty());
 
-    auto master_resp = master.handle_message(bucket_msgs[0].msg);
+    auto master_resp = master.handle_message(bucket_msgs[0]);
     // All buckets should match — master responds with empty NeedBuckets + DiffReady.
     REQUIRE(master_resp.size() == 2);
-    CHECK(std::holds_alternative<NeedBucketsMsg>(master_resp[0].msg));
-    CHECK(std::get<NeedBucketsMsg>(master_resp[0].msg).ranges.empty());
-    CHECK(std::holds_alternative<DiffReadyMsg>(master_resp[1].msg));
-    auto& dr = std::get<DiffReadyMsg>(master_resp[1].msg);
+    CHECK(std::holds_alternative<NeedBucketsMsg>(master_resp[0]));
+    CHECK(std::get<NeedBucketsMsg>(master_resp[0]).ranges.empty());
+    CHECK(std::holds_alternative<DiffReadyMsg>(master_resp[1]));
+    auto& dr = std::get<DiffReadyMsg>(master_resp[1]);
     CHECK(dr.patchset.empty());
     CHECK(dr.deletes.empty());
 
     // Feed back to replica — should stay Live and data unchanged.
     for (const auto& om : master_resp) {
-        replica.handle_message(om.msg);
+        replica.handle_message(om);
     }
     CHECK(replica.state() == Replica::State::Live);
     CHECK(replica_db.count("t1") == 1);
@@ -453,7 +452,7 @@ TEST_CASE("convergence: queue replay via converge()") {
     // Deliver first changeset normally.
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
     auto msgs = master.flush();
-    for (const auto& om : msgs) replica.handle_message(om.msg);
+    for (const auto& om : msgs) replica.handle_message(om);
     CHECK(replica.current_seq() == 1);
 
     // Master writes more, but we "lose" the delivery.
@@ -467,20 +466,20 @@ TEST_CASE("convergence: queue replay via converge()") {
     // Replica converges — seq=1 is in the queue, so master replays
     // changesets 2 and 3 from the queue instead of doing full diff.
     auto bucket_msgs = replica.converge();
-    auto master_resp = master.handle_message(bucket_msgs[0].msg);
+    auto master_resp = master.handle_message(bucket_msgs[0]);
 
     // Should get: NeedBuckets(empty) + DiffReady(empty) + Changeset(2) + Changeset(3).
     REQUIRE(master_resp.size() == 4);
-    CHECK(std::holds_alternative<NeedBucketsMsg>(master_resp[0].msg));
-    CHECK(std::holds_alternative<DiffReadyMsg>(master_resp[1].msg));
-    CHECK(std::holds_alternative<ChangesetMsg>(master_resp[2].msg));
-    CHECK(std::get<ChangesetMsg>(master_resp[2].msg).seq == 2);
-    CHECK(std::holds_alternative<ChangesetMsg>(master_resp[3].msg));
-    CHECK(std::get<ChangesetMsg>(master_resp[3].msg).seq == 3);
+    CHECK(std::holds_alternative<NeedBucketsMsg>(master_resp[0]));
+    CHECK(std::holds_alternative<DiffReadyMsg>(master_resp[1]));
+    CHECK(std::holds_alternative<ChangesetMsg>(master_resp[2]));
+    CHECK(std::get<ChangesetMsg>(master_resp[2]).seq == 2);
+    CHECK(std::holds_alternative<ChangesetMsg>(master_resp[3]));
+    CHECK(std::get<ChangesetMsg>(master_resp[3]).seq == 3);
 
     // Feed to replica.
     for (const auto& om : master_resp) {
-        replica.handle_message(om.msg);
+        replica.handle_message(om);
     }
     CHECK(replica.state() == Replica::State::Live);
     CHECK(replica.current_seq() == 3);
@@ -507,15 +506,15 @@ TEST_CASE("convergence: repeated converge() calls are safe") {
     CHECK(replica.state() == Replica::State::DiffBuckets);
 
     // Only the last round's BucketHashes matters — process it.
-    auto master_resp = master.handle_message(msgs3[0].msg);
+    auto master_resp = master.handle_message(msgs3[0]);
 
     // Feed responses back. The relay loop should converge.
     for (const auto& om : master_resp) {
-        auto hr = replica.handle_message(om.msg);
+        auto hr = replica.handle_message(om);
         for (const auto& rom : hr.messages) {
-            auto mr = master.handle_message(rom.msg);
+            auto mr = master.handle_message(rom);
             for (const auto& m : mr) {
-                replica.handle_message(m.msg);
+                replica.handle_message(m);
             }
         }
     }
@@ -528,7 +527,7 @@ TEST_CASE("convergence: repeated converge() calls are safe") {
     // responds (queue replay or fresh diff). Either way it's safe —
     // the replica is already converged, so applying the response
     // is a no-op or idempotent.
-    auto stale_resp = master.handle_message(msgs1[0].msg);
+    auto stale_resp = master.handle_message(msgs1[0]);
     CHECK(!stale_resp.empty());  // master responds (not a silent drop)
 }
 
@@ -552,15 +551,15 @@ TEST_CASE("convergence: re-convergence discovers missed changes") {
 
     // Replica initiates convergence — discovers the gap.
     auto bucket_msgs = replica.converge();
-    auto master_resp = master.handle_message(bucket_msgs[0].msg);
+    auto master_resp = master.handle_message(bucket_msgs[0]);
 
     // Relay the diff exchange.
     for (const auto& om : master_resp) {
-        auto hr = replica.handle_message(om.msg);
+        auto hr = replica.handle_message(om);
         for (const auto& rom : hr.messages) {
-            auto mr = master.handle_message(rom.msg);
+            auto mr = master.handle_message(rom);
             for (const auto& m : mr) {
-                replica.handle_message(m.msg);
+                replica.handle_message(m);
             }
         }
     }
@@ -587,7 +586,7 @@ TEST_CASE("convergence: live changeset during convergence round") {
     // Deliver one row normally.
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
     auto msgs = master.flush();
-    for (const auto& om : msgs) replica.handle_message(om.msg);
+    for (const auto& om : msgs) replica.handle_message(om);
     CHECK(replica.current_seq() == 1);
 
     // Master writes row 2 but we "lose" the changeset.
@@ -601,14 +600,14 @@ TEST_CASE("convergence: live changeset during convergence round") {
 
     // Meanwhile, replica starts a convergence round (stale — missing row 2).
     auto probe = replica.converge();
-    auto master_resp = master.handle_message(probe[0].msg);
+    auto master_resp = master.handle_message(probe[0]);
 
     // Master's response: queue replay for seq 2 and 3 (if queue covers),
     // or a diff patchset. Either way, feed it all to the replica.
     for (const auto& om : master_resp) {
-        auto hr = replica.handle_message(om.msg);
+        auto hr = replica.handle_message(om);
         for (const auto& rom : hr.messages) {
-            master.handle_message(rom.msg);
+            master.handle_message(rom);
         }
     }
 
@@ -619,7 +618,7 @@ TEST_CASE("convergence: live changeset during convergence round") {
         // The replica handles seq gaps by throwing, so catch and ignore
         // if the seq was already applied.
         try {
-            replica.handle_message(om.msg);
+            replica.handle_message(om);
         } catch (...) {
             // Expected: seq gap or duplicate.
         }
@@ -644,7 +643,7 @@ TEST_CASE("convergence: master writes during queue replay response") {
 
     // Deliver seq 1.
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
-    for (const auto& om : master.flush()) replica.handle_message(om.msg);
+    for (const auto& om : master.flush()) replica.handle_message(om);
 
     // Master writes 2 and 3, not delivered.
     master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
@@ -654,17 +653,17 @@ TEST_CASE("convergence: master writes during queue replay response") {
 
     // Replica converges — gets queue replay for 2 and 3.
     auto probe = replica.converge();
-    auto replay = master.handle_message(probe[0].msg);
+    auto replay = master.handle_message(probe[0]);
 
     // Master writes 4 AFTER producing the replay response.
     master_db.exec("INSERT INTO t1 VALUES (4, 'd')");
     auto new_flush = master.flush();
 
     // Deliver the replay, then the new changeset.
-    for (const auto& om : replay) replica.handle_message(om.msg);
+    for (const auto& om : replay) replica.handle_message(om);
     CHECK(replica.current_seq() == 3);
 
-    for (const auto& om : new_flush) replica.handle_message(om.msg);
+    for (const auto& om : new_flush) replica.handle_message(om);
     CHECK(replica.current_seq() == 4);
     CHECK(replica_db.count("t1") == 4);
 }
@@ -685,7 +684,7 @@ TEST_CASE("convergence: stale DiffReady after queue replay") {
 
     // Deliver seq 1.
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
-    for (const auto& om : master.flush()) replica.handle_message(om.msg);
+    for (const auto& om : master.flush()) replica.handle_message(om);
 
     // Master writes 2, not delivered.
     master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
@@ -694,14 +693,14 @@ TEST_CASE("convergence: stale DiffReady after queue replay") {
     // Round 1: converge via full diff. Capture the master's response
     // but DON'T deliver to replica.
     auto probe1 = replica.converge();
-    auto diff_resp = master.handle_message(probe1[0].msg);
+    auto diff_resp = master.handle_message(probe1[0]);
 
     // Round 2: converge again. This time, master does queue replay.
     auto probe2 = replica.converge();
-    auto replay_resp = master.handle_message(probe2[0].msg);
+    auto replay_resp = master.handle_message(probe2[0]);
 
     // Deliver round 2 (queue replay) first.
-    for (const auto& om : replay_resp) replica.handle_message(om.msg);
+    for (const auto& om : replay_resp) replica.handle_message(om);
     CHECK(replica.state() == Replica::State::Live);
     CHECK(replica_db.count("t1") == 2);
 
@@ -712,7 +711,7 @@ TEST_CASE("convergence: stale DiffReady after queue replay") {
     // replica's data should remain correct.
     for (const auto& om : diff_resp) {
         try {
-            replica.handle_message(om.msg);
+            replica.handle_message(om);
         } catch (const Error&) {
             // Stale patchset on already-converged data — benign.
         }
@@ -731,12 +730,12 @@ TEST_CASE("convergence: schema mismatch via converge()") {
 
     // converge() sends BucketHashes with schema_version.
     auto probe = replica.converge();
-    auto resp = master.handle_message(probe[0].msg);
+    auto resp = master.handle_message(probe[0]);
 
     // Master should detect schema mismatch and return ErrorMsg.
     REQUIRE(!resp.empty());
-    CHECK(std::holds_alternative<ErrorMsg>(resp[0].msg));
-    auto& err = std::get<ErrorMsg>(resp[0].msg);
+    CHECK(std::holds_alternative<ErrorMsg>(resp[0]));
+    auto& err = std::get<ErrorMsg>(resp[0]);
     CHECK(err.code == ErrorCode::SchemaMismatch);
     CHECK(!err.remote_schema_sql.empty());
 }

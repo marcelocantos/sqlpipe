@@ -49,37 +49,37 @@ struct DB {
 void handshake(Master& master, Replica& replica) {
     // replica → HelloMsg → master
     auto hello = replica.hello();
-    auto resp = master.handle_message(hello.msg);
+    auto resp = master.handle_message(hello);
     // master → HelloMsg → replica → BucketHashesMsg
     HandleResult r;
     for (const auto& m : resp) {
-        auto result = replica.handle_message(m.msg);
+        auto result = replica.handle_message(m);
         r.messages.insert(r.messages.end(),
                           result.messages.begin(), result.messages.end());
     }
     // replica → BucketHashesMsg → master → NeedBucketsMsg (possibly + DiffReadyMsg)
     for (const auto& m : r.messages) {
-        auto result = master.handle_message(m.msg);
+        auto result = master.handle_message(m);
         HandleResult r2;
         for (const auto& m2 : result) {
-            auto result2 = replica.handle_message(m2.msg);
+            auto result2 = replica.handle_message(m2);
             r2.messages.insert(r2.messages.end(),
                                result2.messages.begin(), result2.messages.end());
         }
         // If NeedBucketsMsg had ranges, replica sends RowHashesMsg → master → DiffReadyMsg.
         for (const auto& m3 : r2.messages) {
-            auto result3 = master.handle_message(m3.msg);
+            auto result3 = master.handle_message(m3);
             for (const auto& m4 : result3) {
-                replica.handle_message(m4.msg);
+                replica.handle_message(m4);
             }
         }
     }
 }
 
-HandleResult deliver(const std::vector<OutMessage>& msgs, Replica& handler) {
+HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
     HandleResult result;
     for (const auto& m : msgs) {
-        auto resp = handler.handle_message(m.msg);
+        auto resp = handler.handle_message(m);
         result.messages.insert(result.messages.end(),
                                resp.messages.begin(), resp.messages.end());
         result.changes.insert(result.changes.end(),
@@ -113,8 +113,8 @@ TEST_CASE("integration: fresh start, live streaming") {
     // Deliver to replica.
     auto result = deliver(changeset_msgs, replica);
     REQUIRE(result.messages.size() == 1);
-    CHECK(std::holds_alternative<AckMsg>(result.messages[0].msg));
-    CHECK(std::get<AckMsg>(result.messages[0].msg).seq == 1);
+    CHECK(std::holds_alternative<AckMsg>(result.messages[0]));
+    CHECK(std::get<AckMsg>(result.messages[0]).seq == 1);
 
     // Verify replica has the data.
     CHECK(replica_db.count("t1") == 1);
@@ -489,11 +489,11 @@ TEST_CASE("integration: master schema migration hook returns false") {
     Replica replica(replica_db.db);
 
     auto hello = replica.hello();
-    auto resp = master.handle_message(hello.msg);
+    auto resp = master.handle_message(hello);
 
     REQUIRE(resp.size() == 1);
-    CHECK(std::holds_alternative<ErrorMsg>(resp[0].msg));
-    CHECK(std::get<ErrorMsg>(resp[0].msg).code == ErrorCode::SchemaMismatch);
+    CHECK(std::holds_alternative<ErrorMsg>(resp[0]));
+    CHECK(std::get<ErrorMsg>(resp[0]).code == ErrorCode::SchemaMismatch);
 }
 
 TEST_CASE("integration: replica schema migration hook resolves mismatch") {
@@ -520,11 +520,11 @@ TEST_CASE("integration: replica schema migration hook resolves mismatch") {
 
     // First handshake attempt: master sends ErrorMsg, replica callback fires.
     auto hello = replica.hello();
-    auto master_resp = master.handle_message(hello.msg);
+    auto master_resp = master.handle_message(hello);
     REQUIRE(master_resp.size() == 1);
-    CHECK(std::holds_alternative<ErrorMsg>(master_resp[0].msg));
+    CHECK(std::holds_alternative<ErrorMsg>(master_resp[0]));
 
-    auto result = replica.handle_message(master_resp[0].msg);
+    auto result = replica.handle_message(master_resp[0]);
     CHECK(callback_called);
     // Replica callback must receive the master's real fingerprint and schema.
     CHECK(received_remote_sv == master.schema_version());
@@ -558,9 +558,9 @@ TEST_CASE("integration: batched handle_messages defers subscriptions") {
 
     // Batch them all — extract underlying Messages for handle_messages().
     std::vector<Message> batch;
-    for (auto& om : m1) batch.push_back(om.msg);
-    for (auto& om : m2) batch.push_back(om.msg);
-    for (auto& om : m3) batch.push_back(om.msg);
+    for (auto& om : m1) batch.push_back(om);
+    for (auto& om : m2) batch.push_back(om);
+    for (auto& om : m3) batch.push_back(om);
 
     auto result = replica.handle_messages(batch);
 
@@ -693,7 +693,7 @@ TEST_CASE("integration: subscriptions fire after diff sync with no changes") {
     CHECK(replica.state() == Replica::State::Live);
 
     auto msgs = master.flush();
-    for (auto& m : msgs) replica.handle_message(m.msg);
+    for (auto& m : msgs) replica.handle_message(m);
 
     // Verify data is on both sides.
     CHECK(replica_db.count("t1") == 1);
@@ -716,7 +716,7 @@ TEST_CASE("integration: subscriptions fire after diff sync with no changes") {
     master_db.exec("INSERT INTO t1 VALUES (2, 'world')");
     auto msgs2 = master2.flush();
     REQUIRE(!msgs2.empty());
-    auto result = replica2.handle_message(msgs2[0].msg);
+    auto result = replica2.handle_message(msgs2[0]);
     REQUIRE(!result.subscriptions.empty());
     CHECK(result.subscriptions[0].id == sub_id);
     CHECK(std::get<int64_t>(result.subscriptions[0].rows[0][0]) == 2);
@@ -743,7 +743,7 @@ TEST_CASE("prediction: confirmed by server (data matches)") {
     // Server makes the same change and sends it.
     master_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
     auto msgs = master.flush();
-    auto result = replica.handle_message(msgs[0].msg);
+    auto result = replica.handle_message(msgs[0]);
 
     // Prediction was rolled back, server data applied.
     // Result should be the same (1 row).
@@ -772,7 +772,7 @@ TEST_CASE("prediction: rejected by server (different data)") {
     // Server sends a different row instead (rejection scenario).
     master_db.exec("INSERT INTO t1 VALUES (2, 'server')");
     auto msgs = master.flush();
-    auto result = replica.handle_message(msgs[0].msg);
+    auto result = replica.handle_message(msgs[0]);
 
     // Prediction rolled back: row 1 gone, row 2 from server.
     CHECK(replica_db.count("t1") == 1);
@@ -856,9 +856,9 @@ TEST_CASE("fan-out: 3 replicas all receive same data") {
     REQUIRE(!msgs.empty());
 
     for (auto& msg : msgs) {
-        r1.handle_message(msg.msg);
-        r2.handle_message(msg.msg);
-        r3.handle_message(msg.msg);
+        r1.handle_message(msg);
+        r2.handle_message(msg);
+        r3.handle_message(msg);
     }
 
     CHECK(r1_db.count("t1") == 2);
@@ -883,13 +883,13 @@ TEST_CASE("fan-out: late joiner diff syncs to catch up") {
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
     master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
     auto msgs = master.flush();
-    for (auto& m : msgs) r1.handle_message(m.msg);
+    for (auto& m : msgs) r1.handle_message(m);
     CHECK(r1_db.count("t1") == 2);
 
     // More data.
     master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
     msgs = master.flush();
-    for (auto& m : msgs) r1.handle_message(m.msg);
+    for (auto& m : msgs) r1.handle_message(m);
     CHECK(r1_db.count("t1") == 3);
 
     // Late joiner r2 — should diff sync and get all 3 rows.
@@ -902,8 +902,8 @@ TEST_CASE("fan-out: late joiner diff syncs to catch up") {
     master_db.exec("INSERT INTO t1 VALUES (4, 'd')");
     msgs = master.flush();
     for (auto& m : msgs) {
-        r1.handle_message(m.msg);
-        r2.handle_message(m.msg);
+        r1.handle_message(m);
+        r2.handle_message(m);
     }
     CHECK(r1_db.count("t1") == 4);
     CHECK(r2_db.count("t1") == 4);
@@ -924,13 +924,13 @@ TEST_CASE("fan-out: replica disconnect and reconnect while others stream") {
     // Both get initial data.
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
     auto msgs = master.flush();
-    for (auto& m : msgs) { r1.handle_message(m.msg); r2.handle_message(m.msg); }
+    for (auto& m : msgs) { r1.handle_message(m); r2.handle_message(m); }
 
     // r2 "disconnects" — r1 keeps streaming.
     master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
     master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
     msgs = master.flush();
-    for (auto& m : msgs) r1.handle_message(m.msg);
+    for (auto& m : msgs) r1.handle_message(m);
     // r2 missed these.
 
     CHECK(r1_db.count("t1") == 3);
@@ -958,32 +958,32 @@ TEST_CASE("fan-out: flush during another replica's handshake") {
     // Insert data and flush to r1 (r1 is live).
     master_db.exec("INSERT INTO t1 VALUES (1, 'before')");
     auto msgs = master.flush();
-    for (auto& m : msgs) r1.handle_message(m.msg);
+    for (auto& m : msgs) r1.handle_message(m);
 
     // r2 starts handshake — sends hello, master responds with hello.
     Replica r2(r2_db.db);
     auto hello = r2.hello();
-    auto hello_resp = master.handle_message(hello.msg);
+    auto hello_resp = master.handle_message(hello);
 
     // Meanwhile, master gets more data and flushes to r1.
     master_db.exec("INSERT INTO t1 VALUES (2, 'during')");
     auto live_msgs = master.flush();
-    for (auto& m : live_msgs) r1.handle_message(m.msg);
+    for (auto& m : live_msgs) r1.handle_message(m);
     CHECK(r1_db.count("t1") == 2);
 
     // Feed the hello response to r2, which sends bucket hashes.
     // Then drive the rest of the handshake to completion.
-    std::vector<OutMessage> pending;
+    std::vector<Message> pending;
     for (auto& m : hello_resp) {
-        auto hr = r2.handle_message(m.msg);
+        auto hr = r2.handle_message(m);
         pending.insert(pending.end(), hr.messages.begin(), hr.messages.end());
     }
     while (!pending.empty()) {
-        std::vector<OutMessage> next;
+        std::vector<Message> next;
         for (auto& m : pending) {
-            auto mr = master.handle_message(m.msg);
+            auto mr = master.handle_message(m);
             for (auto& m2 : mr) {
-                auto hr = r2.handle_message(m2.msg);
+                auto hr = r2.handle_message(m2);
                 next.insert(next.end(), hr.messages.begin(), hr.messages.end());
             }
         }
@@ -1008,12 +1008,12 @@ TEST_CASE("fan-out: replicas at different seqs receive correct data") {
     // Flush 1 — both receive.
     master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
     auto msgs = master.flush();
-    for (auto& m : msgs) { r1.handle_message(m.msg); r2.handle_message(m.msg); }
+    for (auto& m : msgs) { r1.handle_message(m); r2.handle_message(m); }
 
     // Flush 2 — only r1 receives.
     master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
     msgs = master.flush();
-    for (auto& m : msgs) r1.handle_message(m.msg);
+    for (auto& m : msgs) r1.handle_message(m);
 
     CHECK(r1.current_seq() == 2);
     CHECK(r2.current_seq() == 1);
@@ -1022,12 +1022,12 @@ TEST_CASE("fan-out: replicas at different seqs receive correct data") {
     // Should reject with a seq gap error.
     master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
     msgs = master.flush();
-    for (auto& m : msgs) r1.handle_message(m.msg);
+    for (auto& m : msgs) r1.handle_message(m);
     CHECK(r1.current_seq() == 3);
     CHECK(r1_db.count("t1") == 3);
 
     // r2 rejects the out-of-order changeset.
-    CHECK_THROWS_AS(r2.handle_message(msgs[0].msg), Error);
+    CHECK_THROWS_AS(r2.handle_message(msgs[0]), Error);
     CHECK(r2.current_seq() == 1);    // unchanged
     CHECK(r2_db.count("t1") == 1);   // unchanged
 
@@ -1053,8 +1053,8 @@ TEST_CASE("chain: source → relay → sink using Relay class") {
     Replica sink(sink_db.db);
 
     // Register sink — relay broadcasts to it automatically.
-    std::vector<OutMessage> sink_inbox;
-    relay.add_sink([&](const OutMessage& m) { sink_inbox.push_back(m); });
+    std::vector<Message> sink_inbox;
+    relay.add_sink([&](const Message& m) { sink_inbox.push_back(m); });
 
     // Handshake: source ↔ relay (upstream)
     sync_handshake(source, relay);
@@ -1062,18 +1062,18 @@ TEST_CASE("chain: source → relay → sink using Relay class") {
     // Handshake: relay ↔ sink (downstream)
     {
         auto h = sink.hello();
-        auto resp = relay.handle_downstream(h.msg);
-        std::vector<OutMessage> pending;
+        auto resp = relay.handle_downstream(h);
+        std::vector<Message> pending;
         for (auto& m : resp) {
-            auto hr = sink.handle_message(m.msg);
+            auto hr = sink.handle_message(m);
             pending.insert(pending.end(), hr.messages.begin(), hr.messages.end());
         }
         while (!pending.empty()) {
-            std::vector<OutMessage> next;
+            std::vector<Message> next;
             for (auto& m : pending) {
-                auto mr = relay.handle_downstream(m.msg);
+                auto mr = relay.handle_downstream(m);
                 for (auto& m2 : mr) {
-                    auto hr = sink.handle_message(m2.msg);
+                    auto hr = sink.handle_message(m2);
                     next.insert(next.end(), hr.messages.begin(), hr.messages.end());
                 }
             }
@@ -1086,11 +1086,11 @@ TEST_CASE("chain: source → relay → sink using Relay class") {
     src_db.exec("INSERT INTO t1 VALUES (1, 'hello')");
     src_db.exec("INSERT INTO t1 VALUES (2, 'world')");
     auto msgs = source.flush();
-    for (auto& m : msgs) relay.handle_upstream(m.msg);
+    for (auto& m : msgs) relay.handle_upstream(m);
 
     // Sink should have received broadcast.
     REQUIRE(!sink_inbox.empty());
-    for (auto& m : sink_inbox) sink.handle_message(m.msg);
+    for (auto& m : sink_inbox) sink.handle_message(m);
     sink_inbox.clear();
 
     CHECK(src_db.count("t1") == 2);
@@ -1100,8 +1100,8 @@ TEST_CASE("chain: source → relay → sink using Relay class") {
     // Second round.
     src_db.exec("INSERT INTO t1 VALUES (3, 'chain')");
     msgs = source.flush();
-    for (auto& m : msgs) relay.handle_upstream(m.msg);
-    for (auto& m : sink_inbox) sink.handle_message(m.msg);
+    for (auto& m : msgs) relay.handle_upstream(m);
+    for (auto& m : sink_inbox) sink.handle_message(m);
 
     CHECK(src_db.count("t1") == 3);
     CHECK(relay_db.count("t1") == 3);
@@ -1124,27 +1124,27 @@ TEST_CASE("chain: late sink joins mid-chain via Relay") {
     src_db.exec("INSERT INTO t1 VALUES (1, 'a')");
     src_db.exec("INSERT INTO t1 VALUES (2, 'b')");
     auto msgs = source.flush();
-    for (auto& m : msgs) relay.handle_upstream(m.msg);
+    for (auto& m : msgs) relay.handle_upstream(m);
     CHECK(relay_db.count("t1") == 2);
 
     // Sink joins late — register and handshake.
-    std::vector<OutMessage> sink_inbox;
-    relay.add_sink([&](const OutMessage& m) { sink_inbox.push_back(m); });
+    std::vector<Message> sink_inbox;
+    relay.add_sink([&](const Message& m) { sink_inbox.push_back(m); });
 
     Replica sink(sink_db.db);
     auto hello = sink.hello();
-    auto resp = relay.handle_downstream(hello.msg);
-    std::vector<OutMessage> pending;
+    auto resp = relay.handle_downstream(hello);
+    std::vector<Message> pending;
     for (auto& m : resp) {
-        auto hr = sink.handle_message(m.msg);
+        auto hr = sink.handle_message(m);
         pending.insert(pending.end(), hr.messages.begin(), hr.messages.end());
     }
     while (!pending.empty()) {
-        std::vector<OutMessage> next;
+        std::vector<Message> next;
         for (auto& m : pending) {
-            auto mr = relay.handle_downstream(m.msg);
+            auto mr = relay.handle_downstream(m);
             for (auto& m2 : mr) {
-                auto hr = sink.handle_message(m2.msg);
+                auto hr = sink.handle_message(m2);
                 next.insert(next.end(), hr.messages.begin(), hr.messages.end());
             }
         }
@@ -1156,8 +1156,8 @@ TEST_CASE("chain: late sink joins mid-chain via Relay") {
     // Subsequent streaming works end-to-end.
     src_db.exec("INSERT INTO t1 VALUES (3, 'c')");
     msgs = source.flush();
-    for (auto& m : msgs) relay.handle_upstream(m.msg);
-    for (auto& m : sink_inbox) sink.handle_message(m.msg);
+    for (auto& m : msgs) relay.handle_upstream(m);
+    for (auto& m : sink_inbox) sink.handle_message(m);
     CHECK(sink_db.count("t1") == 3);
 }
 
@@ -1170,9 +1170,9 @@ TEST_CASE("chain: relay broadcasts to multiple sinks") {
     Master source(src_db.db);
     Relay relay(relay_db.db);
 
-    std::vector<OutMessage> s1_inbox, s2_inbox;
-    relay.add_sink([&](const OutMessage& m) { s1_inbox.push_back(m); });
-    relay.add_sink([&](const OutMessage& m) { s2_inbox.push_back(m); });
+    std::vector<Message> s1_inbox, s2_inbox;
+    relay.add_sink([&](const Message& m) { s1_inbox.push_back(m); });
+    relay.add_sink([&](const Message& m) { s2_inbox.push_back(m); });
 
     sync_handshake(source, relay);
 
@@ -1180,18 +1180,18 @@ TEST_CASE("chain: relay broadcasts to multiple sinks") {
     // Handshake sinks via downstream.
     auto drive_sink_handshake = [&](Replica& sink) {
         auto h = sink.hello();
-        auto resp = relay.handle_downstream(h.msg);
-        std::vector<OutMessage> pending;
+        auto resp = relay.handle_downstream(h);
+        std::vector<Message> pending;
         for (auto& m : resp) {
-            auto hr = sink.handle_message(m.msg);
+            auto hr = sink.handle_message(m);
             pending.insert(pending.end(), hr.messages.begin(), hr.messages.end());
         }
         while (!pending.empty()) {
-            std::vector<OutMessage> next;
+            std::vector<Message> next;
             for (auto& m : pending) {
-                auto mr = relay.handle_downstream(m.msg);
+                auto mr = relay.handle_downstream(m);
                 for (auto& m2 : mr) {
-                    auto hr = sink.handle_message(m2.msg);
+                    auto hr = sink.handle_message(m2);
                     next.insert(next.end(), hr.messages.begin(), hr.messages.end());
                 }
             }
@@ -1206,12 +1206,12 @@ TEST_CASE("chain: relay broadcasts to multiple sinks") {
     // Insert and flush through chain.
     src_db.exec("INSERT INTO t1 VALUES (1, 'broadcast')");
     auto msgs = source.flush();
-    for (auto& m : msgs) relay.handle_upstream(m.msg);
+    for (auto& m : msgs) relay.handle_upstream(m);
 
     // Both sinks should have received.
     CHECK(s1_inbox.size() == s2_inbox.size());
-    for (auto& m : s1_inbox) s1.handle_message(m.msg);
-    for (auto& m : s2_inbox) s2.handle_message(m.msg);
+    for (auto& m : s1_inbox) s1.handle_message(m);
+    for (auto& m : s2_inbox) s2.handle_message(m);
 
     CHECK(s1_db.count("t1") == 1);
     CHECK(s2_db.count("t1") == 1);

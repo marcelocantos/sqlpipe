@@ -37,7 +37,7 @@ TEST_CASE("replica: hello produces HelloMsg") {
     DB d;
     Replica r(d.db);
     auto out = r.hello();
-    auto& h = std::get<HelloMsg>(out.msg);
+    auto& h = std::get<HelloMsg>(out);
     CHECK(h.protocol_version == kProtocolVersion);
     CHECK(r.state() == Replica::State::Handshake);
 }
@@ -53,7 +53,7 @@ TEST_CASE("replica: transitions through diff states to live") {
     CHECK(r.state() == Replica::State::DiffBuckets);
     // Replica sends BucketHashesMsg.
     REQUIRE(!result.messages.empty());
-    CHECK(std::holds_alternative<BucketHashesMsg>(result.messages[0].msg));
+    CHECK(std::holds_alternative<BucketHashesMsg>(result.messages[0]));
 
     // Master says no buckets needed (empty NeedBucketsMsg).
     result = r.handle_message(NeedBucketsMsg{});
@@ -64,7 +64,7 @@ TEST_CASE("replica: transitions through diff states to live") {
     CHECK(r.state() == Replica::State::Live);
     // Should produce an AckMsg.
     REQUIRE(!result.messages.empty());
-    CHECK(std::holds_alternative<AckMsg>(result.messages[0].msg));
+    CHECK(std::holds_alternative<AckMsg>(result.messages[0]));
 }
 
 TEST_CASE("replica: subscribe returns subscription id") {
