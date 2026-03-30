@@ -97,3 +97,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: (pending)
 - **Outcome**: Released v0.16.0. Convergence loop (stateless diff sync without handshake), transport adapter (Go), TLA+ formal verification, BucketHashesMsg with protocol/schema/seq fields, Go wrapper Replica.Converge(), end-to-end tern relay test, liteparser compiled in Go build.
+
+## 2026-03-30 — /release v0.17.0
+
+- **Commit**: (pending)
+- **Outcome**: Released v0.17.0. Removed Delivery/OutMessage/PeerOutMessage — all methods return Message/PeerMessage directly. Protocol is fully datagram-safe via convergence loop; delivery hints were redundant. README updated, licence badge removed.
