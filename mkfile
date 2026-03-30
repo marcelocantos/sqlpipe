@@ -103,4 +103,5 @@ build/examples/{name}.o: examples/{name}.cpp
     $cxx $cxxflags $incflags -c $input -o $target
 
 build/liteparser/{name}.o: $liteparser/src/{name}.c
-    $cc -w -O2 -c $input -o $target
+    $cc -w -O2 -I$liteparser/src -c $input -o $target
+

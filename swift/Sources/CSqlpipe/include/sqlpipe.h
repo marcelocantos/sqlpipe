@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#define SQLPIPE_VERSION       "0.15.0"
+#define SQLPIPE_VERSION       "0.16.0"
 #define SQLPIPE_VERSION_MAJOR 0
-#define SQLPIPE_VERSION_MINOR 15
+#define SQLPIPE_VERSION_MINOR 16
 #define SQLPIPE_VERSION_PATCH 0
 
 #include <cstdint>
@@ -197,6 +197,12 @@ public:
     /// Returns results only for subscriptions whose output actually changed.
     std::vector<QueryResult> notify(const std::set<std::string>& affected_tables);
 
+    /// Re-evaluate subscriptions with predicate-aware filtering.
+    /// Subscriptions with extractable predicates skip re-evaluation when
+    /// the changeset doesn't contain matching rows.
+    std::vector<QueryResult> notify(const std::set<std::string>& affected_tables,
+                                    const Changeset& changeset_data);
+
     /// Returns true if there are no active subscriptions.
     bool empty() const;
 
@@ -292,6 +298,9 @@ struct BucketHashEntry {
 /// Contains per-table bucket hashes for the diff protocol.
 struct BucketHashesMsg {
     std::vector<BucketHashEntry> buckets;
+    Seq                last_seq = -1;           ///< Sender's last applied seq (-1 = unknown).
+    std::uint32_t      protocol_version = 0;    ///< Sender's protocol version (0 = legacy).
+    SchemaVersion      schema_version = 0;      ///< Sender's schema fingerprint (0 = legacy).
 };
 
 /// One bucket range the master needs row-level detail for.
@@ -552,6 +561,20 @@ public:
 
     /// Generate the initial HelloMsg to send to the master.
     OutMessage hello() const;
+
+    /// Initiate a convergence round. Computes and returns bucket hashes
+    /// for the current local state. The master compares these against its
+    /// own state and responds with NeedBuckets/DiffReady.
+    ///
+    /// Can be called in any state — Init, Live, or after reset().
+    /// Unlike hello(), does not require a handshake sequence. The master
+    /// processes the BucketHashes directly without a prior HelloMsg.
+    ///
+    /// Use this for:
+    /// - Periodic convergence checks (are we still in sync?)
+    /// - Reconnection without full handshake
+    /// - Loss-tolerant sync over unreliable channels
+    std::vector<OutMessage> converge();
 
     /// Process an incoming message from the master.
     HandleResult handle_message(const Message& msg);

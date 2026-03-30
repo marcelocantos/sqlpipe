@@ -236,6 +236,18 @@ func deserializeError(r *reader) (ErrorMsg, error) {
 }
 
 func deserializeBucketHashes(r *reader) (BucketHashesMsg, error) {
+	lastSeq, err := r.readI64()
+	if err != nil {
+		return BucketHashesMsg{}, err
+	}
+	protoVer, err := r.readU32()
+	if err != nil {
+		return BucketHashesMsg{}, err
+	}
+	schemaVer, err := r.readI32()
+	if err != nil {
+		return BucketHashesMsg{}, err
+	}
 	count, err := r.readU32()
 	if err != nil {
 		return BucketHashesMsg{}, err
@@ -269,7 +281,12 @@ func deserializeBucketHashes(r *reader) (BucketHashesMsg, error) {
 			Table: table, BucketLo: lo, BucketHi: hi, Hash: hash, RowCount: rc,
 		}
 	}
-	return BucketHashesMsg{Buckets: buckets}, nil
+	return BucketHashesMsg{
+		Buckets:         buckets,
+		LastSeq:         Seq(lastSeq),
+		ProtocolVersion: protoVer,
+		SchemaVersion:   SchemaVersion(schemaVer),
+	}, nil
 }
 
 func deserializeNeedBuckets(r *reader) (NeedBucketsMsg, error) {

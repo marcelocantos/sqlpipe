@@ -92,3 +92,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `5e25bd8`
 - **Outcome**: Released v0.15.0. Transport delivery hints (OutMessage/PeerOutMessage), changeset queue for fast reconnect replay, predicate-aware subscription invalidation via relational algebra and bytecode VM, liteparser integration, column relevance tracking, SQL three-valued NULL semantics. STABILITY.md updated, NOTICES updated for liteparser.
+
+## 2026-03-30 — /release v0.16.0
+
+- **Commit**: (pending)
+- **Outcome**: Released v0.16.0. Convergence loop (stateless diff sync without handshake), transport adapter (Go), TLA+ formal verification, BucketHashesMsg with protocol/schema/seq fields, Go wrapper Replica.Converge(), end-to-end tern relay test, liteparser compiled in Go build.

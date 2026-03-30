@@ -535,16 +535,7 @@ sqlpipe_error sqlpipe_replica_unsubscribe(sqlpipe_replica* r, uint64_t id) {
 sqlpipe_error sqlpipe_replica_converge(sqlpipe_replica* r, sqlpipe_buf* out) {
     try {
         auto msgs = r->impl.converge();
-        // Encode the same way as Hello: single message + delivery byte.
-        // converge() always returns exactly one BucketHashesMsg.
-        if (msgs.empty()) {
-            *out = {nullptr, 0};
-        } else {
-            auto wire = sqlpipe::serialize(msgs[0].msg);
-            Buf b(wire.begin(), wire.end());
-            put_u8(b, static_cast<uint8_t>(msgs[0].delivery));
-            *out = to_buf(std::move(b));
-        }
+        *out = to_buf(encode_messages(msgs));
         return ok();
     } catch (const sqlpipe::Error& e) { return make_error(e); }
       catch (const std::exception& e) { return make_error(1, e.what()); }

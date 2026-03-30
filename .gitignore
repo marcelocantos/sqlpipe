@@ -16,3 +16,4 @@ swift/.build/
 formal/tla2tools.jar
 formal/*_TTrace_*
 formal/states/
+states/

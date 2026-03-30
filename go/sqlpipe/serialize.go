@@ -39,6 +39,9 @@ func Serialize(msg Message) []byte {
 
 	case BucketHashesMsg:
 		buf = append(buf, byte(TagBucketHashes))
+		buf = putI64(buf, int64(m.LastSeq))
+		buf = putU32(buf, m.ProtocolVersion)
+		buf = putI32(buf, int32(m.SchemaVersion))
 		buf = putU32(buf, uint32(len(m.Buckets)))
 		for _, b := range m.Buckets {
 			buf = putString(buf, b.Table)

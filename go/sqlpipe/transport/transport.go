@@ -191,12 +191,12 @@ func (l *Link) RunMaster(ctx context.Context, m *sqlpipe.Master, flushCh <-chan 
 // handler is called for each HandleResult that contains changes or
 // subscription updates. Cancel ctx to stop the link.
 func (l *Link) RunReplica(ctx context.Context, r *sqlpipe.Replica, handler ReplicaHandler) error {
-	// Send hello to initiate handshake.
-	hello, err := r.Hello()
+	// Initiate convergence (replaces the hello handshake).
+	probe, err := r.Converge()
 	if err != nil {
 		return err
 	}
-	if err := l.send(ctx, hello); err != nil {
+	if err := l.send(ctx, probe); err != nil {
 		return err
 	}
 

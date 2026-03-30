@@ -4,8 +4,8 @@
 package sqlpipe
 
 /*
-#cgo CXXFLAGS: -std=c++23 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE -I${SRCDIR}/internal/c
-#cgo CFLAGS: -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE -I${SRCDIR}/internal/c
+#cgo CXXFLAGS: -std=c++23 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE -I${SRCDIR}/internal/c -I${SRCDIR}/internal/c/liteparser
+#cgo CFLAGS: -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE -I${SRCDIR}/internal/c -I${SRCDIR}/internal/c/liteparser
 
 #include <stdlib.h>
 #include "internal/c/sqlite3.h"
@@ -969,6 +969,30 @@ func (r *Replica) Hello() (OutMessage, error) {
 	}
 	// The wire format is [serialized msg][u8 delivery].
 	// The serialized msg has a 4-byte LE length prefix.
+	mlen := binary.LittleEndian.Uint32(data[:4])
+	total := 4 + int(mlen)
+	msg, err := Deserialize(data[:total])
+	if err != nil {
+		return OutMessage{}, err
+	}
+	delivery := Delivery(data[total])
+	return OutMessage{Msg: msg, Delivery: delivery}, nil
+}
+
+// Converge initiates a convergence round. Computes bucket hashes for
+// the current local state and returns the message to send to the
+// master. Can be called in any state — replaces the hello() handshake
+// for loss-tolerant, stateless sync.
+func (r *Replica) Converge() (OutMessage, error) {
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_replica_converge(r.ptr, &buf)); err != nil {
+		return OutMessage{}, err
+	}
+	defer C.sqlpipe_free_buf(buf)
+	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
+	if len(data) < 5 {
+		return OutMessage{}, fmt.Errorf("converge response too short: %d bytes", len(data))
+	}
 	mlen := binary.LittleEndian.Uint32(data[:4])
 	total := 4 + int(mlen)
 	msg, err := Deserialize(data[:total])

@@ -68,7 +68,10 @@ type BucketHashEntry struct {
 
 // BucketHashesMsg is sent by replica with per-table bucket hashes.
 type BucketHashesMsg struct {
-	Buckets []BucketHashEntry
+	Buckets         []BucketHashEntry
+	LastSeq         Seq           // Sender's last applied seq (-1 = unknown).
+	ProtocolVersion uint32        // Sender's protocol version (0 = legacy).
+	SchemaVersion   SchemaVersion // Sender's schema fingerprint (0 = legacy).
 }
 
 func (BucketHashesMsg) messageTag() MessageTag { return TagBucketHashes }

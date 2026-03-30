@@ -175,6 +175,9 @@ sqlpipe_error sqlpipe_replica_subscribe(
 
 sqlpipe_error sqlpipe_replica_unsubscribe(sqlpipe_replica* r, uint64_t id);
 
+sqlpipe_error sqlpipe_replica_converge(
+    sqlpipe_replica* r, sqlpipe_buf* out);
+
 void sqlpipe_replica_reset(sqlpipe_replica* r);
 uint8_t sqlpipe_replica_state(sqlpipe_replica* r);
 int64_t sqlpipe_replica_current_seq(sqlpipe_replica* r);
