@@ -487,6 +487,51 @@ TEST_CASE("convergence: queue replay via converge()") {
     CHECK(replica_db.count("t1") == 3);
 }
 
+TEST_CASE("convergence: repeated converge() calls are safe") {
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    Master master(master_db.db);
+    master.flush();
+
+    Replica replica(replica_db.db);
+
+    // Call converge() multiple times before any response arrives.
+    // Each call should be safe — just recomputes and resends.
+    auto msgs1 = replica.converge();
+    auto msgs2 = replica.converge();  // overwrites DiffBuckets state
+    auto msgs3 = replica.converge();  // again
+
+    CHECK(replica.state() == Replica::State::DiffBuckets);
+
+    // Only the last round's BucketHashes matters — process it.
+    auto master_resp = master.handle_message(msgs3[0].msg);
+
+    // Feed responses back. The relay loop should converge.
+    for (const auto& om : master_resp) {
+        auto hr = replica.handle_message(om.msg);
+        for (const auto& rom : hr.messages) {
+            auto mr = master.handle_message(rom.msg);
+            for (const auto& m : mr) {
+                replica.handle_message(m.msg);
+            }
+        }
+    }
+
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 1);
+
+    // Now deliver the old round's BucketHashes (msgs1) — stale.
+    // The master sees last_seq=0 (stale), detects it's behind, and
+    // responds (queue replay or fresh diff). Either way it's safe —
+    // the replica is already converged, so applying the response
+    // is a no-op or idempotent.
+    auto stale_resp = master.handle_message(msgs1[0].msg);
+    CHECK(!stale_resp.empty());  // master responds (not a silent drop)
+}
+
 TEST_CASE("convergence: re-convergence discovers missed changes") {
     DB master_db, replica_db;
     master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");

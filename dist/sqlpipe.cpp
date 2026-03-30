@@ -1563,6 +1563,11 @@ struct Master::Impl {
         // Accept BucketHashes in any state — enables convergence loop
         // where the replica can initiate diff sync at any time, including
         // re-convergence checks while already Live.
+        //
+        // Clear any pending state from a previous round. If the replica
+        // calls converge() while a previous round is in flight, this
+        // ensures the master starts fresh rather than mixing rounds.
+        pending_ranges.clear();
 
         // Protocol version check (if provided).
         if (msg.protocol_version != 0 &&
