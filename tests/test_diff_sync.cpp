@@ -569,3 +569,174 @@ TEST_CASE("convergence: re-convergence discovers missed changes") {
     CHECK(replica.state() == Replica::State::Live);
     CHECK(replica_db.count("t1") == 2);
 }
+
+// ── Edge cases from TLA+ model ─────────────────────────────────────
+
+TEST_CASE("convergence: live changeset during convergence round") {
+    // Convergence round overlapping with live changeset delivery.
+    // The master sends a changeset via flush() while also processing
+    // a convergence probe. The replica should get both.
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Deliver one row normally.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    auto msgs = master.flush();
+    for (const auto& om : msgs) replica.handle_message(om.msg);
+    CHECK(replica.current_seq() == 1);
+
+    // Master writes row 2 but we "lose" the changeset.
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    auto lost = master.flush();
+    // Don't deliver.
+
+    // Master writes row 3 and flushes (this one we keep).
+    master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
+    auto kept = master.flush();
+
+    // Meanwhile, replica starts a convergence round (stale — missing row 2).
+    auto probe = replica.converge();
+    auto master_resp = master.handle_message(probe[0].msg);
+
+    // Master's response: queue replay for seq 2 and 3 (if queue covers),
+    // or a diff patchset. Either way, feed it all to the replica.
+    for (const auto& om : master_resp) {
+        auto hr = replica.handle_message(om.msg);
+        for (const auto& rom : hr.messages) {
+            master.handle_message(rom.msg);
+        }
+    }
+
+    // Also deliver the kept changeset (seq 3) — may be duplicate if
+    // queue replay already delivered it. Should be safe (seq check).
+    for (const auto& om : kept) {
+        // Seq may not match if queue replay already advanced past it.
+        // The replica handles seq gaps by throwing, so catch and ignore
+        // if the seq was already applied.
+        try {
+            replica.handle_message(om.msg);
+        } catch (...) {
+            // Expected: seq gap or duplicate.
+        }
+    }
+
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 3);
+}
+
+TEST_CASE("convergence: master writes during queue replay response") {
+    // Master writes a new row after producing queue replay messages
+    // but before the replica processes them.
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    MasterConfig cfg;
+    cfg.changeset_queue_size = 16;
+    Master master(master_db.db, cfg);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Deliver seq 1.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    for (const auto& om : master.flush()) replica.handle_message(om.msg);
+
+    // Master writes 2 and 3, not delivered.
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    master.flush();
+    master_db.exec("INSERT INTO t1 VALUES (3, 'c')");
+    master.flush();
+
+    // Replica converges — gets queue replay for 2 and 3.
+    auto probe = replica.converge();
+    auto replay = master.handle_message(probe[0].msg);
+
+    // Master writes 4 AFTER producing the replay response.
+    master_db.exec("INSERT INTO t1 VALUES (4, 'd')");
+    auto new_flush = master.flush();
+
+    // Deliver the replay, then the new changeset.
+    for (const auto& om : replay) replica.handle_message(om.msg);
+    CHECK(replica.current_seq() == 3);
+
+    for (const auto& om : new_flush) replica.handle_message(om.msg);
+    CHECK(replica.current_seq() == 4);
+    CHECK(replica_db.count("t1") == 4);
+}
+
+TEST_CASE("convergence: stale DiffReady after queue replay") {
+    // Replica converges twice. First round produces a DiffReady via full
+    // diff. Second round uses queue replay. The stale DiffReady from
+    // round 1 arrives after queue replay has already converged.
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+
+    MasterConfig cfg;
+    cfg.changeset_queue_size = 16;
+    Master master(master_db.db, cfg);
+    Replica replica(replica_db.db);
+    sync_handshake(master, replica);
+
+    // Deliver seq 1.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'a')");
+    for (const auto& om : master.flush()) replica.handle_message(om.msg);
+
+    // Master writes 2, not delivered.
+    master_db.exec("INSERT INTO t1 VALUES (2, 'b')");
+    master.flush();
+
+    // Round 1: converge via full diff. Capture the master's response
+    // but DON'T deliver to replica.
+    auto probe1 = replica.converge();
+    auto diff_resp = master.handle_message(probe1[0].msg);
+
+    // Round 2: converge again. This time, master does queue replay.
+    auto probe2 = replica.converge();
+    auto replay_resp = master.handle_message(probe2[0].msg);
+
+    // Deliver round 2 (queue replay) first.
+    for (const auto& om : replay_resp) replica.handle_message(om.msg);
+    CHECK(replica.state() == Replica::State::Live);
+    CHECK(replica_db.count("t1") == 2);
+
+    // Now deliver round 1's stale diff response. Replica is already
+    // Live and has all the data. Messages from the stale round are
+    // processed — some may be no-ops, others may trigger benign errors
+    // (e.g., patchset applying already-present rows). Either way, the
+    // replica's data should remain correct.
+    for (const auto& om : diff_resp) {
+        try {
+            replica.handle_message(om.msg);
+        } catch (const Error&) {
+            // Stale patchset on already-converged data — benign.
+        }
+    }
+    CHECK(replica_db.count("t1") == 2);
+}
+
+TEST_CASE("convergence: schema mismatch via converge()") {
+    // Schema mismatch detected through converge() rather than hello().
+    DB master_db, replica_db;
+    master_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
+    replica_db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT, extra INT)");
+
+    Master master(master_db.db);
+    Replica replica(replica_db.db);
+
+    // converge() sends BucketHashes with schema_version.
+    auto probe = replica.converge();
+    auto resp = master.handle_message(probe[0].msg);
+
+    // Master should detect schema mismatch and return ErrorMsg.
+    REQUIRE(!resp.empty());
+    CHECK(std::holds_alternative<ErrorMsg>(resp[0].msg));
+    auto& err = std::get<ErrorMsg>(resp[0].msg);
+    CHECK(err.code == ErrorCode::SchemaMismatch);
+    CHECK(!err.remote_schema_sql.empty());
+}
