@@ -602,7 +602,10 @@ struct PeerConfig {
     /// Peer role — determines handshake behaviour.
     PeerRole role = PeerRole::Client;
 
-    /// Tables this peer wants to own (client-side: sent in hello).
+    /// Glob patterns for tables this peer wants to own (client-side).
+    /// Patterns are matched against tracked tables using SQLite GLOB
+    /// semantics (* = any sequence, ? = any char, [...] = character class).
+    /// Use "*" to own all user tables. Resolved at start() time.
     /// Ignored on the server side (computed as complement of client's).
     std::set<std::string> owned_tables;
 

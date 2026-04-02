@@ -562,17 +562,116 @@ TEST_CASE("peer: server rejects client ownership outside table_filter") {
     CHECK(err->code == ErrorCode::OwnershipRejected);
 }
 
-TEST_CASE("peer: client owned_tables must be subset of table_filter") {
+TEST_CASE("peer: owned_tables patterns respect table_filter") {
     DB d;
     d.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);"
            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)");
 
-    PeerConfig cfg;
-    cfg.owned_tables = {"t1", "t2"};
-    cfg.table_filter = std::set<std::string>{"t1"};  // t2 not in filter
-    Peer peer(d.db, cfg);
+    SUBCASE("pattern resolves within filter") {
+        PeerConfig cfg;
+        cfg.owned_tables = {"t*"};
+        cfg.table_filter = std::set<std::string>{"t1"};
+        Peer peer(d.db, cfg);
+        auto msgs = peer.start();
+        CHECK(peer.owned_tables() == std::set<std::string>{"t1"});
+    }
 
-    CHECK_THROWS_AS(peer.start(), Error);
+    SUBCASE("pattern matches nothing → error") {
+        PeerConfig cfg;
+        cfg.owned_tables = {"nonexistent"};
+        Peer peer(d.db, cfg);
+        CHECK_THROWS_AS(peer.start(), Error);
+    }
+}
+
+TEST_CASE("peer: owned_tables glob patterns") {
+    DB client_db, server_db;
+    const char* schema =
+        "CREATE TABLE drafts (id INTEGER PRIMARY KEY, val TEXT);"
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, val TEXT);"
+        "CREATE TABLE settings (id INTEGER PRIMARY KEY, val TEXT)";
+    client_db.exec(schema);
+    server_db.exec(schema);
+
+    SUBCASE("wildcard * owns all tables") {
+        PeerConfig client_cfg;
+        client_cfg.owned_tables = {"*"};
+        Peer client(client_db.db, client_cfg);
+
+        PeerConfig server_cfg;
+        server_cfg.role = PeerRole::Server;
+        server_cfg.approve_ownership =
+            [](const std::set<std::string>&) { return true; };
+        Peer server(server_db.db, server_cfg);
+
+        sync_handshake(client, server);
+        CHECK(client.owned_tables() ==
+            std::set<std::string>{"docs", "drafts", "settings"});
+        CHECK(server.owned_tables().empty());
+    }
+
+    SUBCASE("prefix glob d*") {
+        PeerConfig client_cfg;
+        client_cfg.owned_tables = {"d*"};
+        Peer client(client_db.db, client_cfg);
+
+        PeerConfig server_cfg;
+        server_cfg.role = PeerRole::Server;
+        server_cfg.approve_ownership =
+            [](const std::set<std::string>&) { return true; };
+        Peer server(server_db.db, server_cfg);
+
+        sync_handshake(client, server);
+        CHECK(client.owned_tables() ==
+            std::set<std::string>{"docs", "drafts"});
+        CHECK(server.owned_tables() ==
+            std::set<std::string>{"settings"});
+    }
+
+    SUBCASE("? single-char glob") {
+        PeerConfig client_cfg;
+        client_cfg.owned_tables = {"doc?"};
+        Peer client(client_db.db, client_cfg);
+
+        PeerConfig server_cfg;
+        server_cfg.role = PeerRole::Server;
+        server_cfg.approve_ownership =
+            [](const std::set<std::string>&) { return true; };
+        Peer server(server_db.db, server_cfg);
+
+        sync_handshake(client, server);
+        CHECK(client.owned_tables() == std::set<std::string>{"docs"});
+    }
+
+    SUBCASE("multiple patterns combine") {
+        PeerConfig client_cfg;
+        client_cfg.owned_tables = {"draft*", "settings"};
+        Peer client(client_db.db, client_cfg);
+
+        PeerConfig server_cfg;
+        server_cfg.role = PeerRole::Server;
+        server_cfg.approve_ownership =
+            [](const std::set<std::string>&) { return true; };
+        Peer server(server_db.db, server_cfg);
+
+        sync_handshake(client, server);
+        CHECK(client.owned_tables() ==
+            std::set<std::string>{"drafts", "settings"});
+        CHECK(server.owned_tables() == std::set<std::string>{"docs"});
+    }
+
+    SUBCASE("* excludes sqlpipe internal tables") {
+        // Create _sqlpipe_meta to verify * doesn't match it.
+        client_db.exec(
+            "CREATE TABLE IF NOT EXISTS _sqlpipe_meta ("
+            "  key TEXT PRIMARY KEY, value TEXT)");
+        PeerConfig cfg;
+        cfg.owned_tables = {"*"};
+        Peer peer(client_db.db, cfg);
+        auto msgs = peer.start();
+        CHECK(peer.owned_tables() ==
+            std::set<std::string>{"docs", "drafts", "settings"});
+    }
 }
 
 TEST_CASE("peer: subscribe receives updates through handle_message") {
