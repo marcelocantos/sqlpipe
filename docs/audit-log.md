@@ -102,3 +102,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: (pending)
 - **Outcome**: Released v0.17.0. Removed Delivery/OutMessage/PeerOutMessage — all methods return Message/PeerMessage directly. Protocol is fully datagram-safe via convergence loop; delivery hints were redundant. README updated, licence badge removed.
+
+## 2026-04-02 — /release v0.18.0
+
+- **Commit**: `0c7552d`
+- **Outcome**: Released v0.18.0. Glob patterns for PeerConfig::owned_tables (use `"*"` to own all user tables). STABILITY.md updated to current surface — all items now Stable. README Mermaid diagrams.

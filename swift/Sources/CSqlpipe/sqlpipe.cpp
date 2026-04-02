@@ -4984,6 +4984,21 @@ struct Peer::Impl {
         return config.role == PeerRole::Server;
     }
 
+    /// Resolve owned_tables glob patterns against tracked tables in the db.
+    std::set<std::string> resolve_owned_patterns() {
+        auto all = detail::get_tracked_tables(db,
+            config.table_filter ? &*config.table_filter : nullptr);
+        std::set<std::string> resolved;
+        for (const auto& pattern : config.owned_tables) {
+            for (const auto& table : all) {
+                if (sqlite3_strglob(pattern.c_str(), table.c_str()) == 0) {
+                    resolved.insert(table);
+                }
+            }
+        }
+        return resolved;
+    }
+
     void create_master() {
         MasterConfig mc;
         mc.table_filter = my_tables;
@@ -5200,20 +5215,12 @@ std::vector<PeerMessage> Peer::start() {
                     "server peer must not call start()");
     }
 
-    // Validate owned_tables ⊆ table_filter when filter is set.
-    if (impl_->config.table_filter) {
-        for (const auto& t : impl_->config.owned_tables) {
-            if (impl_->config.table_filter->find(t) ==
-                    impl_->config.table_filter->end()) {
-                throw Error(ErrorCode::InvalidState,
-                    "owned_tables entry '" + t +
-                    "' is not in table_filter");
-            }
-        }
-    }
-
     impl_->state = State::Negotiating;
-    impl_->my_tables = impl_->config.owned_tables;
+    impl_->my_tables = impl_->resolve_owned_patterns();
+    if (impl_->my_tables.empty()) {
+        throw Error(ErrorCode::InvalidState,
+            "owned_tables patterns matched no tables");
+    }
     impl_->their_tables = impl_->complement_tables(impl_->my_tables);
 
     impl_->create_master();
