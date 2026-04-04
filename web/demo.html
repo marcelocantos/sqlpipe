@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sqlpipe Demo</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #333; }
+        h1 { margin-bottom: 8px; }
+        .subtitle { color: #666; margin-bottom: 24px; }
+        .panel { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+        .panel h2 { font-size: 1.1em; margin-bottom: 12px; }
+        label { display: block; font-size: 0.85em; color: #555; margin-bottom: 4px; }
+        input, textarea { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 0.9em; }
+        textarea { resize: vertical; }
+        .btn-row { display: flex; gap: 8px; margin-top: 8px; }
+        button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9em; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary { background: #2563eb; color: white; }
+        .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+        .btn-danger { background: #dc2626; color: white; }
+        .btn-danger:hover:not(:disabled) { background: #b91c1c; }
+        .btn-secondary { background: #e5e7eb; color: #333; }
+        .btn-secondary:hover:not(:disabled) { background: #d1d5db; }
+        .result-table { width: 100%; border-collapse: collapse; font-size: 0.85em; font-family: monospace; }
+        .result-table th { background: #f3f4f6; text-align: left; padding: 6px 8px; border-bottom: 2px solid #ddd; }
+        .result-table td { padding: 6px 8px; border-bottom: 1px solid #eee; }
+        .result-table tr:hover td { background: #f9fafb; }
+        .log { font-family: monospace; font-size: 0.8em; background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: 4px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; }
+        .log .info { color: #569cd6; }
+        .log .sub { color: #4ec9b0; }
+        .log .err { color: #f44747; }
+        .version { font-size: 0.8em; color: #999; margin-top: 24px; }
+        #status { font-size: 0.85em; padding: 8px; border-radius: 4px; margin-bottom: 16px; }
+        #status.ok { background: #dcfce7; color: #166534; }
+        #status.err { background: #fee2e2; color: #991b1b; }
+        #status.loading { background: #fef3c7; color: #92400e; }
+    </style>
+</head>
+<body>
+    <h1>sqlpipe Demo</h1>
+    <p class="subtitle">Unified database with live query subscriptions</p>
+    <div id="status" class="loading">Loading Wasm module...</div>
+
+    <div class="panel">
+        <h2>Schema</h2>
+        <textarea id="schema" rows="3">CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER DEFAULT 0)</textarea>
+        <div class="btn-row">
+            <button id="initBtn" class="btn-primary" disabled>Open Database</button>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>Execute SQL</h2>
+        <input id="sql" value="INSERT INTO items (name, qty) VALUES ('Widget', 10)">
+        <div class="btn-row">
+            <button id="execBtn" class="btn-primary" disabled>Execute</button>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>Live Subscription</h2>
+        <input id="subSql" value="SELECT * FROM items ORDER BY id">
+        <div class="btn-row">
+            <button id="subBtn" class="btn-primary" disabled>Subscribe</button>
+            <button id="unsubBtn" class="btn-danger" disabled>Unsubscribe</button>
+        </div>
+        <div id="subResult" style="margin-top: 12px;"></div>
+    </div>
+
+    <div class="panel">
+        <h2>Event Log</h2>
+        <div id="log" class="log"></div>
+    </div>
+
+    <div class="version" id="versionInfo"></div>
+
+    <script type="module">
+        import { createSqlpipe } from './dist/index.js';
+
+        const $ = id => document.getElementById(id);
+        const status = (msg, cls) => { $('status').textContent = msg; $('status').className = cls; };
+
+        let sp, db, qw, subId = null;
+
+        function log(msg, cls = 'info') {
+            const el = $('log');
+            const time = new Date().toLocaleTimeString();
+            el.innerHTML += `<span class="${cls}">[${time}]</span> ${msg}\n`;
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function renderTable(result) {
+            if (!result || !result.rows.length) {
+                $('subResult').innerHTML = '<em style="color:#999">No rows</em>';
+                return;
+            }
+            let html = '<table class="result-table"><tr>';
+            for (const col of result.columns) html += `<th>${col}</th>`;
+            html += '</tr>';
+            for (const row of result.rows) {
+                html += '<tr>';
+                for (const val of row) {
+                    const display = val === null ? '<em>NULL</em>' : String(val);
+                    html += `<td>${display}</td>`;
+                }
+                html += '</tr>';
+            }
+            html += '</table>';
+            $('subResult').innerHTML = html;
+        }
+
+        // Get all user table names for notification.
+        function getTableNames() {
+            const r = db.query(
+                "SELECT name FROM sqlite_master WHERE type='table' " +
+                "AND name NOT LIKE '_sqlpipe_%' AND name NOT LIKE 'sqlite_%'");
+            return r.rows.map(row => String(row[0]));
+        }
+
+        async function init() {
+            try {
+                sp = await createSqlpipe();
+                $('versionInfo').textContent = `sqlpipe ${sp.version} · protocol v${sp.protocolVersion}`;
+                status('Wasm loaded. Open a database to start.', 'ok');
+                $('initBtn').disabled = false;
+                log('Wasm module loaded');
+            } catch (e) {
+                status(`Failed to load: ${e.message}`, 'err');
+                log(e.message, 'err');
+            }
+        }
+
+        $('initBtn').addEventListener('click', () => {
+            try {
+                if (db) { if (qw) qw.close(); db.close(); }
+                db = sp.openDatabase(':memory:');
+                qw = sp.createQueryWatch(db);
+
+                // Apply schema via exec.
+                const ddl = $('schema').value.trim();
+                if (ddl) {
+                    db.exec(ddl);
+                    log(`Schema applied`);
+                }
+
+                status('Database ready', 'ok');
+                $('execBtn').disabled = false;
+                $('subBtn').disabled = false;
+                log('Database opened');
+            } catch (e) {
+                status(`Error: ${e.message}`, 'err');
+                log(e.message, 'err');
+            }
+        });
+
+        $('execBtn').addEventListener('click', () => {
+            try {
+                const sql = $('sql').value.trim();
+                db.exec(sql);
+                log(`Executed: ${sql}`);
+
+                // Notify subscriptions.
+                if (subId !== null) {
+                    const tables = getTableNames();
+                    const results = qw.notify(tables);
+                    for (const r of results) {
+                        if (r.id === subId) {
+                            renderTable(r);
+                            log(`Subscription updated (${r.rows.length} rows)`, 'sub');
+                        }
+                    }
+                }
+            } catch (e) {
+                log(e.message, 'err');
+            }
+        });
+
+        $('subBtn').addEventListener('click', () => {
+            try {
+                if (subId !== null) { qw.unsubscribe(subId); }
+                const sql = $('subSql').value.trim();
+                subId = qw.subscribe(sql);
+                log(`Subscribed: ${sql}`, 'sub');
+                $('unsubBtn').disabled = false;
+
+                // Initial result.
+                const tables = getTableNames();
+                const results = qw.notify(tables);
+                for (const r of results) {
+                    if (r.id === subId) {
+                        renderTable(r);
+                        log(`Initial result (${r.rows.length} rows)`, 'sub');
+                    }
+                }
+            } catch (e) {
+                log(e.message, 'err');
+            }
+        });
+
+        $('unsubBtn').addEventListener('click', () => {
+            if (subId !== null) {
+                qw.unsubscribe(subId);
+                subId = null;
+                $('unsubBtn').disabled = true;
+                $('subResult').innerHTML = '';
+                log('Unsubscribed', 'sub');
+            }
+        });
+
+        // Quick-insert shortcuts.
+        $('sql').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') $('execBtn').click();
+        });
+
+        init();
+    </script>
+</body>
+</html>

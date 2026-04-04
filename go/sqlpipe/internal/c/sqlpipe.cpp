@@ -4308,6 +4308,236 @@ QueryResult query(sqlite3* db, const std::string& sql) {
 
 } // namespace sqlpipe
 
+// ── database.cpp ────────────────────────────────────────────────
+
+namespace sqlpipe {
+
+struct Database::Impl {
+    sqlite3*                    db = nullptr;
+    bool                        owns_db = true;
+    QueryWatch                  watch;
+    std::map<SubscriptionId, SubscriptionCallback> callbacks;
+    std::set<std::string>       dirty_tables;
+
+    Impl(sqlite3* db_) : db(db_), watch(db_) {}
+
+    ~Impl() {
+        if (owns_db && db) sqlite3_close(db);
+    }
+
+    void unsubscribe(SubscriptionId id) {
+        watch.unsubscribe(id);
+        callbacks.erase(id);
+    }
+
+    void dispatch(const std::vector<QueryResult>& results) {
+        for (auto& r : results) {
+            auto it = callbacks.find(r.id);
+            if (it != callbacks.end()) {
+                it->second(r);
+            }
+        }
+    }
+
+    static void update_hook(void* ctx, int op, const char* db_name,
+                            const char* table, sqlite3_int64 rowid) {
+        (void)op; (void)db_name; (void)rowid;
+        auto* self = static_cast<Impl*>(ctx);
+        self->dirty_tables.insert(table);
+    }
+};
+
+struct Subscription::Impl {
+    std::weak_ptr<Database::Impl> db_impl;
+    SubscriptionId id = 0;
+};
+
+Subscription::Subscription(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+Subscription::~Subscription() {
+    if (!impl_) return;
+    if (auto db = impl_->db_impl.lock()) {
+        db->unsubscribe(impl_->id);
+    }
+}
+
+Subscription::Subscription(Subscription&&) noexcept = default;
+Subscription& Subscription::operator=(Subscription&&) noexcept = default;
+
+Database::Database(const std::string& path, const std::string& schema_ddl)
+    : impl_(nullptr) {
+    sqlite3* db = nullptr;
+    int rc = sqlite3_open_v2(path.c_str(), &db,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
+    if (rc != SQLITE_OK) {
+        std::string msg = db ? sqlite3_errmsg(db) : "out of memory";
+        if (db) sqlite3_close(db);
+        throw Error(ErrorCode::SqliteError, "failed to open database: " + msg);
+    }
+
+    impl_ = std::make_shared<Impl>(db);
+
+    // Register update hook to track dirty tables.
+    sqlite3_update_hook(db, &Impl::update_hook, impl_.get());
+
+    // Apply schema migration if DDL provided.
+    if (!schema_ddl.empty()) {
+        // Extract current schema from the database.
+        auto* sdb = sqlift_db_wrap(db);
+        int err_type;
+        char* err_msg = nullptr;
+
+        char* current_json = sqlift_extract(sdb, &err_type, &err_msg);
+        if (!current_json) {
+            std::string error = err_msg ? err_msg : "unknown error";
+            sqlift_free(err_msg);
+            sqlift_db_close(sdb);
+            throw Error(ErrorCode::SqliteError,
+                        "failed to extract schema: " + error);
+        }
+
+        // Parse the desired schema.
+        char* desired_json = sqlift_parse(schema_ddl.c_str(),
+                                          &err_type, &err_msg);
+        if (!desired_json) {
+            std::string error = err_msg ? err_msg : "unknown error";
+            sqlift_free(err_msg);
+            sqlift_free(current_json);
+            sqlift_db_close(sdb);
+            throw Error(ErrorCode::SqliteError,
+                        "failed to parse schema DDL: " + error);
+        }
+
+        // Diff and apply.
+        char* plan_json = sqlift_diff(current_json, desired_json,
+                                      &err_type, &err_msg);
+        sqlift_free(current_json);
+        sqlift_free(desired_json);
+
+        if (!plan_json) {
+            std::string error = err_msg ? err_msg : "unknown error";
+            sqlift_free(err_msg);
+            sqlift_db_close(sdb);
+            throw Error(ErrorCode::SqliteError,
+                        "failed to diff schemas: " + error);
+        }
+
+        rc = sqlift_apply(sdb, plan_json, /*allow_destructive=*/0,
+                          &err_type, &err_msg);
+        sqlift_free(plan_json);
+        sqlift_db_close(sdb);
+
+        if (rc != 0) {
+            std::string error = err_msg ? err_msg : "unknown error";
+            sqlift_free(err_msg);
+            throw Error(ErrorCode::SqliteError,
+                        "failed to apply migration: " + error);
+        }
+    }
+
+    detail::ensure_meta_table(db);
+}
+
+Database::~Database() = default;
+Database::Database(Database&&) noexcept = default;
+Database& Database::operator=(Database&&) noexcept = default;
+
+void Database::exec(const std::string& sql) {
+    impl_->dirty_tables.clear();
+    auto stmt = detail::prepare(impl_->db, sql.c_str());
+    detail::step_done(impl_->db, stmt.get());
+
+    if (!impl_->dirty_tables.empty() && !impl_->callbacks.empty()) {
+        auto results = impl_->watch.notify(impl_->dirty_tables);
+        impl_->dispatch(results);
+        impl_->dirty_tables.clear();
+    }
+}
+
+QueryResult Database::query(const std::string& sql) const {
+    return sqlpipe::query(impl_->db, sql);
+}
+
+Subscription Database::subscribe(const std::string& sql,
+                                  SubscriptionCallback cb) {
+    auto id = impl_->watch.subscribe(sql);
+    impl_->callbacks[id] = std::move(cb);
+
+    // Fire immediately with the initial result.
+    auto tables = detail::get_tracked_tables(impl_->db);
+    std::set<std::string> table_set(tables.begin(), tables.end());
+    auto results = impl_->watch.notify(table_set);
+    for (auto& r : results) {
+        if (r.id == id) {
+            impl_->callbacks[id](r);
+            break;
+        }
+    }
+
+    auto sub_impl = std::make_unique<Subscription::Impl>();
+    sub_impl->db_impl = impl_;
+    sub_impl->id = id;
+    return Subscription(std::move(sub_impl));
+}
+
+void Database::notify(const std::set<std::string>& affected_tables) {
+    if (impl_->callbacks.empty()) return;
+    auto results = impl_->watch.notify(affected_tables);
+    impl_->dispatch(results);
+}
+
+void Database::notify() {
+    if (impl_->callbacks.empty()) return;
+    auto tables = detail::get_tracked_tables(impl_->db);
+    std::set<std::string> table_set(tables.begin(), tables.end());
+    notify(table_set);
+}
+
+sqlite3* Database::handle() const {
+    return impl_->db;
+}
+
+std::string Database::migration(const std::string& from_ddl,
+                                const std::string& to_ddl) {
+    int err_type;
+    char* err_msg = nullptr;
+
+    char* from_json = sqlift_parse(from_ddl.c_str(), &err_type, &err_msg);
+    if (!from_json) {
+        std::string error = err_msg ? err_msg : "unknown error";
+        sqlift_free(err_msg);
+        throw Error(ErrorCode::SqliteError,
+                    "failed to parse from_ddl: " + error);
+    }
+
+    char* to_json = sqlift_parse(to_ddl.c_str(), &err_type, &err_msg);
+    if (!to_json) {
+        std::string error = err_msg ? err_msg : "unknown error";
+        sqlift_free(err_msg);
+        sqlift_free(from_json);
+        throw Error(ErrorCode::SqliteError,
+                    "failed to parse to_ddl: " + error);
+    }
+
+    char* plan = sqlift_diff(from_json, to_json, &err_type, &err_msg);
+    sqlift_free(from_json);
+    sqlift_free(to_json);
+
+    if (!plan) {
+        std::string error = err_msg ? err_msg : "unknown error";
+        sqlift_free(err_msg);
+        throw Error(ErrorCode::SqliteError,
+                    "failed to diff schemas: " + error);
+    }
+
+    std::string result(plan);
+    sqlift_free(plan);
+    return result;
+}
+
+} // namespace sqlpipe
+
 // ── replica.cpp ─────────────────────────────────────────────────
 
 namespace sqlpipe {

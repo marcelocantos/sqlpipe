@@ -143,6 +143,91 @@ using SchemaMismatchCallback = std::function<bool(
 /// Throws Error on SQL errors.
 QueryResult query(sqlite3* db, const std::string& sql);
 
+/// Callback for subscription results.
+using SubscriptionCallback = std::function<void(const QueryResult&)>;
+
+} // namespace sqlpipe
+
+// ── database.h ──────────────────────────────────────────────────
+namespace sqlpipe {
+
+class Database;
+
+/// RAII handle for a query subscription. Auto-unsubscribes on destruction.
+class Subscription {
+public:
+    ~Subscription();
+    Subscription(Subscription&&) noexcept;
+    Subscription& operator=(Subscription&&) noexcept;
+    Subscription(const Subscription&) = delete;
+    Subscription& operator=(const Subscription&) = delete;
+
+private:
+    friend class Database;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    Subscription(std::unique_ptr<Impl> impl);
+};
+
+/// Unified database handle with schema migration and query subscriptions.
+///
+/// Opens a SQLite database, optionally applying schema migrations via
+/// sqlift, and provides exec/query/subscribe operations. Subscriptions
+/// fire automatically after exec() when data changes.
+///
+/// Owns the sqlite3* handle. Use handle() to pass it to Master, Replica,
+/// or Peer for replication. After replication operations that modify the
+/// database, call notify() to fire subscriptions.
+class Database {
+public:
+    /// Open or create a database at path. Use ":memory:" for in-memory.
+    /// If schema_ddl is non-empty, applies schema migration using sqlift
+    /// (creates tables if new, alters if existing schema differs).
+    explicit Database(const std::string& path,
+                      const std::string& schema_ddl = {});
+    ~Database();
+
+    Database(Database&&) noexcept;
+    Database& operator=(Database&&) noexcept;
+    Database(const Database&) = delete;
+    Database& operator=(const Database&) = delete;
+
+    /// Execute DDL/DML SQL. Subscriptions fire if data changes.
+    void exec(const std::string& sql);
+
+    /// Execute a query and return the full result set.
+    QueryResult query(const std::string& sql) const;
+
+    /// Subscribe to a query. The callback fires whenever the query's
+    /// result set changes — from local exec(), replication, or any
+    /// other source of writes to the underlying database.
+    /// The callback fires once immediately with the initial result.
+    Subscription subscribe(const std::string& sql, SubscriptionCallback cb);
+
+    /// Fire subscriptions for changes to the given tables. Called
+    /// automatically by exec(); call manually after Master/Replica/Peer
+    /// operations that modify the database.
+    void notify(const std::set<std::string>& affected_tables);
+
+    /// Fire subscriptions by scanning all tracked tables.
+    /// Convenience overload when you don't know which tables changed.
+    void notify();
+
+    /// Access the underlying sqlite3 handle for use with
+    /// Master/Replica/Peer constructors.
+    sqlite3* handle() const;
+
+    /// Generate schema migration SQL from old DDL to new DDL using sqlift.
+    /// Returns empty string if schemas are equivalent.
+    static std::string migration(const std::string& from_ddl,
+                                 const std::string& to_ddl);
+
+private:
+    friend class Subscription;
+    struct Impl;
+    std::shared_ptr<Impl> impl_;
+};
+
 } // namespace sqlpipe
 
 // ── query_watch.h ───────────────────────────────────────────────
@@ -791,6 +876,14 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// ── Schema utilities ────────────────────────────────────────────
+
+/// Generate migration DDL from old_ddl to new_ddl using sqlift.
+/// Returns the SQL statements to transform the schema, or empty string
+/// if schemas are equivalent. Throws Error on parse/diff failures.
+std::string generate_migration(const std::string& old_ddl,
+                               const std::string& new_ddl);
 
 // ── Convenience utilities ───────────────────────────────────────
 
