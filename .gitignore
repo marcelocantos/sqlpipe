@@ -9,6 +9,8 @@ build/
 .DS_Store
 .vscode/
 .idea/
+.vera/
+.playwright-mcp/
 compile_commands.json
 node_modules/
 web/dist/

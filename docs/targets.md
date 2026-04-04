@@ -1,6 +1,6 @@
 # Targets
 
-<!-- last-evaluated: ae18ee5 -->
+<!-- last-evaluated: eff507fdd6922c4df1a1f84f5c870328128023f7 -->
 
 ## Active
 
@@ -193,5 +193,272 @@
 - **Context**: tern provides both reliable streams and unreliable datagrams over QUIC. sqlpipe's `OutMessage` delivery hints (shipped in v0.15.0) map directly to these channels. The convergence loop replaces the linear diff sync handshake with a continuous, loss-tolerant state comparison protocol — bucket hashes over datagrams, with the diff protocol regenerating on loss rather than requiring retransmission.
 - **Status**: identified
 - **Discovered**: 2026-03-30
+
+### 🎯T11 Unified database product combining sqlpipe, sqlift, and sqldeep
+- **Weight**: 1 (value 13 / cost 13)
+- **Estimated-cost**: 13
+- **Acceptance**:
+  - Single library/binary exposes a unified API for database access (CRUD operations, queries), replication (ad hoc masters/replicas, bidirectional peers), schema diffing (via integrated sqlift), and query transpilation (via integrated sqldeep)
+  - Query subscriptions work on both master and replica sides, firing on changes regardless of replication direction
+  - API allows dynamic hookup of replicas/masters/peers without restart or reconfiguration
+  - Integration tests demonstrate end-to-end workflows: create DB, add replicas, run queries with subscriptions, perform schema migrations via sqlift, transpile queries via sqldeep
+  - Backward compatibility maintained for existing sqlpipe usage (no breaking changes to current API)
+- **Context**: Unifying sqlpipe (replication), sqlift (structural schema diffs), and sqldeep (query transpilation) into one product provides users with a complete, easy-to-use database solution. Discovered during strategic planning — current separation forces users to integrate manually, limiting adoption.
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.1 sqlift schema diffing integrated into sqlpipe core
+- **Weight**: 2 (value 8 / cost 5)
+- **Estimated-cost**: 5
+- **Acceptance**: sqlift functions (e.g., structural diff, migration generation) bundled in sqlpipe library; used for enhanced schema fingerprinting and migrations in replication; no external sqlift dependency for users.
+- **Parent**: 🎯T11
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.2 sqldeep query transpilation integrated into sqlpipe core
+- **Weight**: 1 (value 5 / cost 5)
+- **Acceptance**: sqldeep transpile functions available in sqlpipe library; supports converting queries between dialects; bundled without external dependency.
+- **Parent**: 🎯T11
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.3 High-level database access API added
+- **Weight**: 1 (value 13 / cost 13)
+- **Acceptance**: Unified API provides Database class with methods for executing queries, CRUD operations, and result handling; abstracts raw SQLite calls; works with replication underneath.
+- **Parent**: 🎯T11
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.4 Dynamic ad hoc replication hookup
+- **Weight**: 2 (value 13 / cost 8)
+- **Acceptance**: API methods to connect/disconnect replicas/masters/peers at runtime; supports bidirectional peers; maintains replication state during topology changes.
+- **Parent**: 🎯T11
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.5 Unified query subscriptions on both replication ends
+- **Weight**: 3 (value 8 / cost 3)
+- **Acceptance**: Query subscriptions work identically on master and replica sides; changes from either end trigger notifications; integrates with bidirectional peer sync.
+- **Parent**: 🎯T11
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.6 End-to-end integration tests and backward compatibility
+- **Weight**: 1 (value 8 / cost 8)
+- **Acceptance**: Tests cover: DB creation, replication hookup, queries with subscriptions, schema migrations via sqlift, query transpilation via sqldeep; existing sqlpipe API unchanged; all tests pass.
+- **Parent**: 🎯T11
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.1.1 Ensure sqlift submodule is linked in mkfile
+- **Weight**: 1 (value 3 / cost 2)
+- **Estimated-cost**: 2
+- **Acceptance**: `mk test` compiles sqlift code
+- **Parent**: 🎯T11.1
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.1.2 Add sqlift headers to dist/sqlpipe.h includes
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: no compile errors
+- **Parent**: 🎯T11.1
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.1.3 Expose generate_migration API
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: `generate_migration(const std::string& old_sql, const std::string& new_sql)` method callable, returns diff SQL
+- **Parent**: 🎯T11.1
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.1.4 Update compute_schema_fingerprint to use sqlift
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: fingerprint ignores comments/renames
+- **Parent**: 🎯T11.1
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.1.5 Write unit test for migration generation
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: test passes with sample schemas
+- **Parent**: 🎯T11.1
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.2.1 Link sqldeep submodule in mkfile
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: compiles
+- **Parent**: 🎯T11.2
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.2.2 Add sqldeep headers to includes
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: no errors
+- **Parent**: 🎯T11.2
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.2.3 Expose transpile API
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: `transpile(const std::string& query, Dialect from, Dialect to)` transposes queries
+- **Parent**: 🎯T11.2
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.2.4 Write unit test for transpilation
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: test passes with SQL samples
+- **Parent**: 🎯T11.2
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.3.1 Define Database class skeleton in header
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: class compiles, holds sqlite3* handle
+- **Parent**: 🎯T11.3
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.3.2 Implement Database::query
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: executes SELECT, returns ResultSet
+- **Parent**: 🎯T11.3
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.3.3 Implement Database::execute
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: runs INSERT/UPDATE
+- **Parent**: 🎯T11.3
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.3.4 Add ResultSet class
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: iterable rows/columns
+- **Parent**: 🎯T11.3
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.3.5 Implement Database::insert
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: inserts row
+- **Parent**: 🎯T11.3
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.3.6 Implement Database::update
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: updates rows
+- **Parent**: 🎯T11.3
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.3.7 Implement Database::delete_
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: deletes rows
+- **Parent**: 🎯T11.3
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.3.8 Write unit tests for DB methods
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: all CRUD tests pass
+- **Parent**: 🎯T11.3
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.4.1 Extend MasterConfig for runtime replica addition
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: new field for connections
+- **Parent**: 🎯T11.4
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.4.2 Implement Master::add_replica
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: starts replication to new replica
+- **Parent**: 🎯T11.4
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.4.3 Extend PeerConfig for ad hoc connections
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: supports dynamic peers
+- **Parent**: 🎯T11.4
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.4.4 Implement Peer::connect
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: connects and syncs
+- **Parent**: 🎯T11.4
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.4.5 Write integration test for dynamic hookup
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: adds replica/peer at runtime, syncs
+- **Parent**: 🎯T11.4
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.5.1 Verify master subscriptions fire on local changes
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: test passes
+- **Parent**: 🎯T11.5
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.5.2 Verify replica subscriptions fire on received changes
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: test passes
+- **Parent**: 🎯T11.5
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.5.3 Test bidirectional peer subscriptions
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: changes from either end notify both
+- **Parent**: 🎯T11.5
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.6.1 Write end-to-end test for DB creation + replication + subscriptions
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: test runs workflows
+- **Parent**: 🎯T11.6
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.6.2 Write test for schema migrations via sqlift
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: migrates and syncs
+- **Parent**: 🎯T11.6
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.6.3 Write test for query transpilation via sqldeep
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: transposes and executes
+- **Parent**: 🎯T11.6
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.6.4 Compile-check backward compatibility
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: existing code builds unchanged
+- **Parent**: 🎯T11.6
+- **Status**: identified
+- **Discovered**: 2026-04-03
+
+### 🎯T11.6.5 Run full test suite
+- **Weight**: 1 (value 3 / cost 2)
+- **Acceptance**: no regressions
+- **Parent**: 🎯T11.6
+- **Status**: identified
+- **Discovered**: 2026-04-03
 
 ## Achieved
