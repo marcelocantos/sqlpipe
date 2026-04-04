@@ -8,7 +8,7 @@
 
 // Include sqldeep's implementation directly (single-TU build).
 // sqldeep header — path set via -I flag during compilation.
-#include <sqldeep.h>
+#include <sqlpipe.h>
 
 extern "C" {
 

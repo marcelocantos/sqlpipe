@@ -147,3 +147,36 @@ TEST_CASE("database: query returns correct columns") {
     CHECK(std::get<int64_t>(r.rows[0][0]) == 1);
     CHECK(std::get<std::string>(r.rows[0][1]) == "Alice");
 }
+
+TEST_CASE("database: sqldeep transpilation is automatic") {
+    Database db(":memory:",
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)");
+    db.exec("INSERT INTO items VALUES (1, 'Widget', 10)");
+    db.exec("INSERT INTO items VALUES (2, 'Gadget', 25)");
+
+    // sqldeep object syntax: SELECT {col, col} → json_object(...)
+    auto r = db.query("SELECT {id, name, qty} FROM items ORDER BY id");
+    REQUIRE(r.rows.size() == 2);
+    // The result should be a JSON string from json_object().
+    auto& val = std::get<std::string>(r.rows[0][0]);
+    CHECK(val.find("Widget") != std::string::npos);
+}
+
+TEST_CASE("database: sqldeep subscription works") {
+    Database db(":memory:",
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)");
+    int fired = 0;
+    std::string last_json;
+    auto sub = db.subscribe("SELECT {id, name} FROM items ORDER BY id",
+        [&](const QueryResult& r) {
+            fired++;
+            if (!r.rows.empty()) {
+                last_json = std::get<std::string>(r.rows[0][0]);
+            }
+        });
+    CHECK(fired == 1); // initial (empty)
+
+    db.exec("INSERT INTO items VALUES (1, 'Alice')");
+    CHECK(fired == 2);
+    CHECK(last_json.find("Alice") != std::string::npos);
+}

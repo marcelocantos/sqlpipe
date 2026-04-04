@@ -7,6 +7,118 @@
 #define SQLPIPE_VERSION_MINOR 18
 #define SQLPIPE_VERSION_PATCH 0
 
+// ── Bundled: sqldeep (query transpiler) ─────────────────────────
+// Converts sqldeep extended SQL syntax to standard SQL.
+// Integrated into Database::exec/query/subscribe automatically.
+
+#define SQLDEEP_VERSION       "0.8.0"
+#define SQLDEEP_VERSION_MAJOR 0
+#define SQLDEEP_VERSION_MINOR 8
+#define SQLDEEP_VERSION_PATCH 0
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    const char* from_column;
+    const char* to_column;
+} sqldeep_column_pair;
+
+typedef struct {
+    const char* from_table;
+    const char* to_table;
+    const sqldeep_column_pair* columns;
+    int column_count;
+} sqldeep_foreign_key;
+
+typedef enum { SQLDEEP_SQLITE = 0, SQLDEEP_POSTGRES = 1 } sqldeep_backend;
+
+/// Transpile sqldeep syntax to standard SQL (SQLite backend).
+/// Returns malloc'd string (caller frees with sqldeep_free).
+/// On error returns NULL, sets err_msg/err_line/err_col.
+char* sqldeep_transpile(const char* input,
+                        char** err_msg, int* err_line, int* err_col);
+
+/// Transpile with explicit foreign key relationships.
+char* sqldeep_transpile_fk(const char* input,
+                           const sqldeep_foreign_key* fks, int fk_count,
+                           char** err_msg, int* err_line, int* err_col);
+
+/// Transpile for a specific backend (SQLite or Postgres).
+char* sqldeep_transpile_backend(const char* input, sqldeep_backend backend,
+                                char** err_msg, int* err_line, int* err_col);
+
+/// Transpile with FKs for a specific backend.
+char* sqldeep_transpile_fk_backend(const char* input, sqldeep_backend backend,
+                                   const sqldeep_foreign_key* fks, int fk_count,
+                                   char** err_msg, int* err_line, int* err_col);
+
+const char* sqldeep_version(void);
+void sqldeep_free(void* ptr);
+
+#ifdef __cplusplus
+}
+#endif
+
+// ── Bundled: sqlift (schema migration) ──────────────────────────
+// Declarative SQLite schema diffing and migration.
+
+#define SQLIFT_VERSION       "0.12.0"
+#define SQLIFT_VERSION_MAJOR 0
+#define SQLIFT_VERSION_MINOR 12
+#define SQLIFT_VERSION_PATCH 0
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct sqlite3 sqlite3;
+
+enum sqlift_error_type {
+    SQLIFT_OK               = 0,
+    SQLIFT_ERROR            = 1,
+    SQLIFT_PARSE_ERROR      = 2,
+    SQLIFT_EXTRACT_ERROR    = 3,
+    SQLIFT_DIFF_ERROR       = 4,
+    SQLIFT_APPLY_ERROR      = 5,
+    SQLIFT_DRIFT_ERROR      = 6,
+    SQLIFT_DESTRUCTIVE_ERROR = 7,
+    SQLIFT_BREAKING_CHANGE_ERROR = 8,
+    SQLIFT_JSON_ERROR       = 9,
+};
+
+typedef struct sqlift_db sqlift_db;
+
+sqlift_db* sqlift_db_open(const char* path, int flags,
+                          int* err_type, char** err_msg);
+sqlift_db* sqlift_db_wrap(sqlite3* handle);
+void sqlift_db_close(sqlift_db* db);
+int sqlift_db_exec(sqlift_db* db, const char* sql, char** err_msg);
+char* sqlift_parse(const char* ddl, int* err_type, char** err_msg);
+char* sqlift_extract(sqlift_db* db, int* err_type, char** err_msg);
+char* sqlift_diff(const char* current_json, const char* desired_json,
+                  int* err_type, char** err_msg);
+int sqlift_apply(sqlift_db* db, const char* plan_json, int allow_destructive,
+                 int* err_type, char** err_msg);
+int64_t sqlift_migration_version(sqlift_db* db, int* err_type, char** err_msg);
+char* sqlift_detect_redundant_indexes(const char* schema_json,
+                                      int* err_type, char** err_msg);
+char* sqlift_schema_hash(const char* schema_json,
+                         int* err_type, char** err_msg);
+int sqlift_db_query_int64(sqlift_db* db, const char* sql,
+                          int64_t* result, char** err_msg);
+char* sqlift_db_query_text(sqlift_db* db, const char* sql, char** err_msg);
+void sqlift_free(void* ptr);
+
+#ifdef __cplusplus
+}
+#endif
+
+// ── sqlpipe ────────────────────────────────────────────────────
+
 #include <cstdint>
 #include <functional>
 #include <memory>
