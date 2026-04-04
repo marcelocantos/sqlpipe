@@ -1,13 +1,27 @@
 # sqlpipe
 
-Streaming replication protocol for SQLite.
+Unified SQLite library: replication, schema migration, and query transpilation.
 
-sqlpipe is a C++ library that keeps SQLite databases in sync over any transport
-layer. A **Master** tracks changes and produces compact binary changesets; a
-**Replica** applies them, emitting per-row change events and query subscription
-updates. A **Peer** wraps both behind a symmetric API for bidirectional
-replication with table-level ownership. A **Relay** enables chain replication
-(source → relay → sink).
+sqlpipe is a C++ library that combines three capabilities in a single
+two-file distribution (`dist/sqlpipe.h` / `dist/sqlpipe.cpp`):
+
+- **sqlpipe core** — keeps SQLite databases in sync over any transport layer.
+  A **Master** tracks changes and produces compact binary changesets; a
+  **Replica** applies them, emitting per-row change events and query
+  subscription updates. A **Peer** wraps both behind a symmetric API for
+  bidirectional replication with table-level ownership. A **Relay** enables
+  chain replication (source → relay → sink).
+- **sqlift** — declarative schema migration via structural diffing. The
+  `Database` constructor auto-migrates your schema on open; the
+  `generate_migration()` free function produces migration SQL from any two
+  DDL strings.
+- **sqldeep** — JSON5-like SQL transpiler. All SQL passed through `Database`
+  methods is transpiled automatically. Extended syntax like
+  `SELECT {id, name}` (JSON object construction) works out of the box.
+
+The `Database` class is the primary entry point for most users. `Master`,
+`Replica`, and `Peer` are the lower-level building blocks for custom
+replication topologies.
 
 The library is transport-agnostic: it defines a message-in / message-out API.
 You decide how messages travel between peers (TCP, WebSocket, QUIC, serial,
@@ -17,12 +31,27 @@ lost and recovered by the next convergence round.
 
 ## Features
 
+- **Unified Database class** — opens SQLite, auto-migrates the schema via
+  sqlift, provides `exec`/`query`/`subscribe` with automatic change
+  notification. The primary API for most use cases.
+- **RAII Subscription** — `Database::subscribe` returns a `Subscription`
+  object that auto-unsubscribes on destruction.
+- **sqldeep syntax everywhere** — all SQL in `Database` methods is transpiled
+  automatically. Write `SELECT {id, name} FROM items` and get back a JSON
+  object per row with no extra wiring.
+- **Bundled distribution** — `dist/sqlpipe.h` + `dist/sqlpipe.cpp` include
+  sqlpipe core, sqlift, and sqldeep. No separate dependency installation
+  needed beyond SQLite itself.
+- **Schema migration via sqlift** — `Database` constructor auto-migrates on
+  open; `Database::migration(from_ddl, to_ddl)` static method; and the
+  `generate_migration(old_ddl, new_ddl)` free function for offline use.
 - **Convergence loop** — `Replica::converge()` provides stateless,
   loss-tolerant sync. The replica computes bucket hashes and sends them
   directly; the master responds with the delta. Works entirely over
   datagrams. No handshake required. Call it periodically or on reconnect.
 - **Bidirectional replication** via the Peer API — each side owns a disjoint
-  set of tables, with server-authoritative ownership negotiation
+  set of tables (glob patterns supported, e.g. `"*"` owns all tables), with
+  server-authoritative ownership negotiation
 - **Chain replication** via the Relay class — source → relay → sink
   topologies for fan-out or geographic distribution
 - **Incremental replication** via SQLite's session extension (compact binary
@@ -54,7 +83,7 @@ lost and recovered by the next convergence round.
 
 | Language | Location | Install |
 |---|---|---|
-| C++ | `dist/sqlpipe.h` + `dist/sqlpipe.cpp` | Copy two files |
+| C++ | `dist/sqlpipe.h` + `dist/sqlpipe.cpp` | Copy two files (includes sqlpipe + sqlift + sqldeep) |
 | Go | `go/sqlpipe/` | `go get github.com/marcelocantos/sqlpipe/go/sqlpipe` |
 | Swift | `swift/` | SPM package with `CSqlpipe` and `Sqlpipe` targets |
 | TypeScript/Wasm | `web/` | `npm install` (builds SQLite + sqlpipe to Wasm) |
@@ -69,6 +98,57 @@ All tables must have explicit `PRIMARY KEY`s (required by SQLite's session
 extension). `WITHOUT ROWID` tables are not supported.
 
 ## Quick start
+
+### Database API (recommended)
+
+```cpp
+#include <sqlpipe.h>
+using namespace sqlpipe;
+
+// Open database with schema (auto-creates/migrates via sqlift).
+Database db(":memory:", "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)");
+
+// Subscribe — fires immediately with initial result, then on every change.
+// Subscription auto-unsubscribes when it goes out of scope (RAII).
+auto sub = db.subscribe("SELECT {id, name, qty} FROM items ORDER BY id",
+    [](const QueryResult& r) {
+        for (auto& row : r.rows)
+            std::cout << std::get<std::string>(row[0]) << "\n";
+    });
+
+// Insert — subscription fires automatically.
+db.exec("INSERT INTO items VALUES (1, 'Widget', 10)");
+
+// sqldeep syntax works everywhere.
+auto r = db.query("SELECT {id, name} FROM items WHERE qty > 5");
+```
+
+### Replication with Database
+
+`Database` integrates cleanly with `Master` and `Replica` by exposing the
+underlying `sqlite3*` handle. After applying a changeset, call
+`replica_db.notify()` to fire subscriptions.
+
+```cpp
+Database master_db(":memory:", schema);
+Database replica_db(":memory:", schema);
+
+Master master(master_db.handle());
+Replica replica(replica_db.handle());
+sync_handshake(master, replica);
+
+// Subscribe on replica side.
+auto sub = replica_db.subscribe("SELECT count(*) FROM items",
+    [](const QueryResult& r) { /* ... */ });
+
+// Insert on master, flush, apply on replica.
+master_db.exec("INSERT INTO items VALUES (1, 'hello')");
+for (auto& msg : master.flush())
+    replica.handle_message(msg);
+replica_db.notify();  // fires subscriptions registered on replica_db
+```
+
+### Lower-level API (Master/Replica directly)
 
 ```cpp
 #include <sqlpipe.h>
@@ -110,7 +190,7 @@ example including handshake and change event handling.
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-mk test     # build and run tests (134 test cases)
+mk test     # build and run tests (146 test cases)
 mk example  # build and run the loopback demo
 mk wasm     # build Wasm module (requires emscripten)
 ```
@@ -173,6 +253,53 @@ sequenceDiagram
 ```
 
 ## API
+
+### Database
+
+The `Database` class is the recommended starting point. It wraps a `sqlite3*`
+handle, auto-migrates on open, and wires up subscriptions. All SQL is
+transpiled through sqldeep before execution.
+
+```cpp
+class Database {
+public:
+    // Open (or create) a database at path, auto-migrating to schema_ddl.
+    Database(const std::string& path, const std::string& schema_ddl);
+
+    // Execute a statement (sqldeep transpiled). Fires notify() on success.
+    void exec(const std::string& sql);
+
+    // Run a query (sqldeep transpiled). Returns the full result set.
+    QueryResult query(const std::string& sql);
+
+    // Register a callback query (sqldeep transpiled). The callback fires
+    // immediately with the current result, then again after each exec() or
+    // notify() call that touches a table the query reads from.
+    // Returns a Subscription that unsubscribes on destruction.
+    Subscription subscribe(const std::string& sql,
+                           std::function<void(const QueryResult&)> callback);
+
+    // Manually trigger subscription re-evaluation (all tables).
+    void notify();
+
+    // Trigger subscription re-evaluation for a specific set of tables.
+    void notify(const std::set<std::string>& tables);
+
+    // Access the raw sqlite3* handle (e.g. to pass to Master/Replica/Peer).
+    sqlite3* handle() const;
+
+    // Generate migration SQL from one DDL to another (uses sqlift).
+    static std::string migration(const std::string& from_ddl,
+                                 const std::string& to_ddl);
+};
+
+// Free function: generate migration SQL between two DDL strings.
+std::string generate_migration(const std::string& old_ddl,
+                               const std::string& new_ddl);
+```
+
+`Subscription` is a RAII handle: when it is destroyed, the underlying
+subscription is automatically removed.
 
 ### Master
 
@@ -242,7 +369,7 @@ enum class PeerRole : std::uint8_t { Client, Server };
 
 struct PeerConfig {
     PeerRole role = PeerRole::Client;
-    std::set<std::string> owned_tables;
+    std::set<std::string> owned_tables;  // glob patterns; e.g. "*" owns all tables
     std::optional<std::set<std::string>> table_filter;
     ApproveOwnershipCallback approve_ownership = nullptr;  // server only
     ConflictCallback on_conflict = nullptr;
@@ -380,7 +507,22 @@ try {
 
 ## Schema migration
 
-Install a callback to run migrations on schema mismatch instead of erroring:
+`Database` handles migration automatically on construction. For custom
+migration workflows, use `generate_migration()` or the static
+`Database::migration()` method, which both delegate to sqlift's structural
+schema diffing:
+
+```cpp
+// Generate migration SQL between two DDL strings.
+auto sql = generate_migration(old_schema_ddl, new_schema_ddl);
+sqlite3_exec(db, sql.c_str(), 0, 0, 0);
+
+// Or via the static method:
+auto sql = Database::migration(old_schema_ddl, new_schema_ddl);
+```
+
+For lower-level use, install an `on_schema_mismatch` callback to run
+migrations on schema mismatch instead of erroring:
 
 ```cpp
 ReplicaConfig rc;
@@ -418,8 +560,8 @@ The Go wrapper provides a `Transport` interface in
 
 ## Thread safety
 
-`Master`, `Replica`, `Peer`, and `Relay` are **not thread-safe**. Each
-instance must be accessed from a single thread at a time. The `sqlite3*`
+`Master`, `Replica`, `Peer`, `Relay`, and `Database` are **not thread-safe**.
+Each instance must be accessed from a single thread at a time. The `sqlite3*`
 handle must not be used concurrently during sqlpipe operations.
 
 ## Message size limits
@@ -431,8 +573,12 @@ Messages exceeding these limits cause `deserialize()` to throw `ProtocolError`.
 
 ## Related projects
 
-- **[sqldeep](https://github.com/marcelocantos/sqldeep)** — JSON5-like SQL syntax transpiler for SQLite JSON functions
-- **[sqlift](https://github.com/marcelocantos/sqlift)** — Declarative SQLite schema migrations via structural diffing
+sqldeep and sqlift are bundled into the sqlpipe distribution and require no
+separate installation. Their standalone repos remain available for use outside
+of sqlpipe:
+
+- **[sqldeep](https://github.com/marcelocantos/sqldeep)** — JSON5-like SQL syntax transpiler for SQLite JSON functions (bundled into sqlpipe)
+- **[sqlift](https://github.com/marcelocantos/sqlift)** — Declarative SQLite schema migrations via structural diffing (bundled into sqlpipe)
 
 ## License
 
@@ -445,4 +591,5 @@ Third-party dependencies:
 - **nlohmann/json** — MIT
 - **liteparser** — MIT
 - **sqlift** — Apache 2.0
+- **sqldeep** — Apache 2.0
 - **doctest** — MIT (test only)

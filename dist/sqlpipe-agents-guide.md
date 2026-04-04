@@ -1,14 +1,16 @@
 # sqlpipe — Agent Reference
 
-Streaming SQLite replication. Two files: `sqlpipe.h` (header) + `sqlpipe.cpp`
-(implementation). C++20. Apache 2.0.
+Streaming SQLite replication with bundled query transpilation (sqldeep) and
+schema migration (sqlift). Two files: `sqlpipe.h` (header) + `sqlpipe.cpp`
+(implementation). C++23. Apache 2.0.
 
 ## Integration
 
-Add `sqlpipe.h` and `sqlpipe.cpp` to your project. Compile with:
+Add `sqlpipe.h` and `sqlpipe.cpp` to your project. The `dist/` bundle includes
+sqldeep and sqlift — no separate installs needed. Compile with:
 
 ```
--std=c++20 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK
+-std=c++23 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK
 ```
 
 Requires SQLite 3 on the include path. All tables must have explicit `PRIMARY
@@ -18,6 +20,37 @@ KEY`s. `WITHOUT ROWID` tables are not supported.
 
 Everything is in `namespace sqlpipe`. All operations may throw
 `sqlpipe::Error` (has `.code()` returning `ErrorCode` and `.what()`).
+
+### Database (unified API)
+
+`Database` is the primary entry point for most users. It owns the `sqlite3*`
+handle, auto-migrates schema via sqlift, and auto-transpiles sqldeep syntax
+in all SQL methods.
+
+```cpp
+// Open with schema — creates or migrates existing schema via sqlift.
+Database db(":memory:", "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+
+// exec/query auto-transpile sqldeep syntax.
+db.exec("INSERT INTO t VALUES (1, 'hello')");
+auto r = db.query("SELECT {id, val} FROM t");  // sqldeep → json_object(...)
+// r.id=0, r.columns, r.rows
+
+// Subscribe — fires callback on data change. RAII: auto-unsubscribes on destruction.
+auto sub = db.subscribe("SELECT count(*) FROM t", [](const QueryResult& r) {
+    // r.rows[0][0] is the count
+});
+db.exec("INSERT INTO t VALUES (2, 'world')");  // callback fires
+
+// For replication: expose the sqlite3* handle (Database retains ownership).
+Master master(db.handle());
+// After replication applies changes, fire Database subscriptions manually:
+db.notify();           // scan all tracked tables
+db.notify({"t"});      // specific tables only
+
+// Schema migration plan (static utility).
+auto plan = Database::migration("", "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+```
 
 ### Master (sending side)
 
@@ -64,8 +97,10 @@ replica.reset();              // return to Init; subscriptions preserved
 
 ```cpp
 PeerConfig cfg;
-cfg.owned_tables = {"drafts"};           // tables this side masters
-Peer client(db, cfg);                    // does NOT own db
+cfg.owned_tables = {"*"};            // glob: own all user tables
+cfg.owned_tables = {"draft*"};       // glob: own tables starting with "draft"
+cfg.owned_tables = {"drafts"};       // exact match (still works)
+Peer client(db, cfg);                // does NOT own db
 
 auto msgs = client.start();              // initiate handshake (client only)
 PeerHandleResult r = client.handle_message(incoming);
@@ -79,7 +114,7 @@ client.reset();                          // return to Init for reconnect
 ```
 
 `PeerConfig`:
-- `owned_tables` — tables this side wants to own (client sends in hello)
+- `owned_tables` — tables this side wants to own; supports glob patterns
 - `approve_ownership` — server-side callback; non-null marks this peer as
   server. `nullptr` = auto-approve.
 - `on_conflict` — forwarded to internal Replica
@@ -91,6 +126,23 @@ routing. Wire format: `[4B LE length][1B sender_role][1B tag][payload]`.
 Server creates Peer without `owned_tables` — it owns whatever the client
 doesn't claim. Client calls `start()`; server receives messages via
 `handle_message()`.
+
+### sqldeep (bundled query transpiler)
+
+All `Database` methods auto-transpile sqldeep syntax — do not call
+`sqldeep_transpile()` manually on SQL that goes through `Database`.
+
+Key features:
+- `SELECT {id, name}` → `SELECT json_object('id', id, 'name', name)`
+- Works in `exec()`, `query()`, `subscribe()`
+- Direct access: `sqldeep_transpile(sql, &err_msg, &err_line, &err_col)`
+
+### sqlift (bundled schema migration)
+
+- `Database` constructor auto-migrates schema on open
+- `Database::migration(from_ddl, to_ddl)` — returns JSON migration plan
+- `generate_migration(old_ddl, new_ddl)` — same as the static method
+- Direct access: `sqlift_parse()`, `sqlift_diff()`, `sqlift_apply()`
 
 ### Typical loop (unidirectional)
 
@@ -165,10 +217,17 @@ for (auto& m : peer_msgs) {
 
 ## Gotchas
 
+- `Database` owns the `sqlite3*` handle. `Master`, `Replica`, and `Peer` do
+  **not** — they borrow it and must not outlive the owning `Database` (or your
+  own `sqlite3*`).
+- After replication operations (`handle_message`, `flush`), call `db.notify()`
+  (or `db.notify(tables)`) to fire any `Database` subscriptions — replication
+  bypasses the normal change-detection path.
+- sqldeep transpilation is automatic in all `Database` methods. Do not call
+  `sqldeep_transpile()` on SQL that will also pass through `exec()`, `query()`,
+  or `subscribe()` — it will be double-transpiled.
 - Library is transport-agnostic: `handle_message` in, `HandleResult` out.
   You provide the transport.
-- Both `Master` and `Replica` do **not** own the `sqlite3*` handle. Keep it
-  open for their lifetime.
 - Replica returns `AckMsg` in `result.messages` after each `ChangesetMsg` —
   forward to the master.
 - Replica may return `ErrorMsg` in `result.messages` — forward to the master.
@@ -178,4 +237,4 @@ for (auto& m : peer_msgs) {
 - Diff sync happens automatically during handshake: bucket hash exchange
   discovers differences, then only the delta is transferred.
 - Schema mismatch is an error (not auto-resolved). Migrate schemas before
-  connecting.
+  connecting, or use `Database` which handles migration automatically.
