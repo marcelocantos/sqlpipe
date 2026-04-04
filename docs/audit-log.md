@@ -107,3 +107,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `0c7552d`
 - **Outcome**: Released v0.18.0. Glob patterns for PeerConfig::owned_tables (use `"*"` to own all user tables). STABILITY.md updated to current surface — all items now Stable. README Mermaid diagrams.
+
+## 2026-04-04 — /release v0.19.0
+
+- **Commit**: `facd91d`
+- **Outcome**: Released v0.19.0. Unified Database class with auto-migrating schema (sqlift), auto-transpiling queries (sqldeep), and RAII subscriptions. Single dist pair bundles sqlpipe + sqlift + sqldeep. Web demo with live subscriptions. Docs updated.

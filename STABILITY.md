@@ -26,23 +26,25 @@ API surface complexity:
 
 The clock starts from the last breaking change to the interaction surface.
 
-Current surface: ~87 items → 3 months. Last breaking change: v0.17.0
+Current surface: ~100 items → 3 months. Last breaking change: v0.17.0
 (Delivery/OutMessage/PeerOutMessage removed — all methods return Message/
 PeerMessage directly; FlushCallback/SinkCallback simplified, 2026-03-30).
 Eligible: 2026-06-30.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.18.0. Items annotated with stability assessments.
+Snapshot as of v0.19.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.18.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.19.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `18` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `19` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
+| `SQLDEEP_VERSION` | `"0.8.0"` | **Stable** (bundled) |
+| `SQLIFT_VERSION` | `"0.12.0"` | **Stable** (bundled) |
 
 ### Type aliases
 
@@ -58,8 +60,9 @@ Snapshot as of v0.18.0. Items annotated with stability assessments.
 | `LogCallback` | `std::function<void(LogLevel, std::string_view)>` | **Stable** |
 | `SchemaMismatchCallback` | `std::function<bool(SchemaVersion remote, SchemaVersion local, const std::string& remote_schema_sql)>` | **Stable** |
 | `ApproveOwnershipCallback` | `std::function<bool(const std::set<std::string>&)>` | **Stable** |
-| `FlushCallback` | `std::function<void(const std::vector<Message>&)>` | **Stable** (simplified from OutMessage in v0.17.0) |
-| `SinkCallback` | `std::function<void(const Message&)>` | **Stable** (simplified from OutMessage in v0.17.0) |
+| `FlushCallback` | `std::function<void(const std::vector<Message>&)>` | **Stable** |
+| `SinkCallback` | `std::function<void(const Message&)>` | **Stable** |
+| `SubscriptionCallback` | `std::function<void(const QueryResult&)>` | **Fluid** (new in v0.19.0) |
 
 ### Enums
 
@@ -247,6 +250,39 @@ class QueryWatch {
 
 **Stability**: **Stable**
 
+### Database class
+
+```cpp
+class Database {
+    explicit Database(const std::string& path, const std::string& schema_ddl = {});
+    ~Database();
+    Database(Database&&) noexcept;
+    Database& operator=(Database&&) noexcept;
+
+    void exec(const std::string& sql);
+    QueryResult query(const std::string& sql) const;
+    Subscription subscribe(const std::string& sql, SubscriptionCallback cb);
+    void notify(const std::set<std::string>& affected_tables);
+    void notify();
+    sqlite3* handle() const;
+    static std::string migration(const std::string& from_ddl, const std::string& to_ddl);
+};
+```
+
+**Stability**: **Fluid** (new in v0.19.0 — API shape may evolve before 1.0)
+
+### Subscription class
+
+```cpp
+class Subscription {
+    ~Subscription();  // auto-unsubscribes
+    Subscription(Subscription&&) noexcept;
+    Subscription& operator=(Subscription&&) noexcept;
+};
+```
+
+**Stability**: **Fluid** (new in v0.19.0)
+
 ### Free functions
 
 | Signature | Stability |
@@ -259,6 +295,23 @@ class QueryWatch {
 | `void sync_handshake(Peer& client, Peer& server)` | **Stable** |
 | `void sync_handshake(Master&, Relay&)` | **Stable** |
 | `QueryResult query(sqlite3* db, const std::string& sql)` | **Stable** |
+| `std::string generate_migration(const std::string&, const std::string&)` | **Fluid** (new in v0.19.0) |
+
+### Bundled C APIs (sqldeep, sqlift)
+
+The following C APIs are bundled into `dist/sqlpipe.h` and available to consumers. They are pass-through wrappers of the standalone sqldeep and sqlift libraries.
+
+| Function | Stability |
+|---|---|
+| `sqldeep_transpile()` | **Stable** (matches sqldeep 0.8.0) |
+| `sqldeep_transpile_fk()` | **Stable** |
+| `sqldeep_transpile_backend()` | **Stable** |
+| `sqldeep_transpile_fk_backend()` | **Stable** |
+| `sqldeep_version()` / `sqldeep_free()` | **Stable** |
+| `sqlift_parse()` / `sqlift_diff()` / `sqlift_apply()` | **Stable** (matches sqlift 0.12.0) |
+| `sqlift_extract()` / `sqlift_db_wrap()` / `sqlift_db_close()` | **Stable** |
+| `sqlift_schema_hash()` / `sqlift_detect_redundant_indexes()` | **Stable** |
+| `sqlift_free()` | **Stable** |
 
 ### Wire format
 
@@ -278,7 +331,10 @@ Keys: `seq` (Master/Replica solo), `master_seq` / `replica_seq` (Peer mode).
 
 ## Gaps
 
-- Agent guide (`agents-guide.md`) does not exist yet.
+- Database and Subscription APIs are new and marked Fluid — need real-world
+  usage to validate the design before stabilising.
+- Database does not yet expose sqldeep FK-guided transpilation (only
+  convention-based). May need a method to register foreign keys.
 
 ## Out of scope for 1.0
 
