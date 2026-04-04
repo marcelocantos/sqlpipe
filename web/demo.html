@@ -76,6 +76,7 @@
 
     <div class="version" id="versionInfo"></div>
 
+    <script src="../build/wasm/sqlpipe.js"></script>
     <script type="module">
         import { createSqlpipe } from './dist/index.js';
 
@@ -83,6 +84,12 @@
         const status = (msg, cls) => { $('status').textContent = msg; $('status').className = cls; };
 
         let sp, db, qw, subId = null;
+
+        // Wasm module factory — createSqlpipeModule is defined by the
+        // Emscripten script tag above.
+        async function wasmFactory() {
+            return createSqlpipeModule();
+        }
 
         function log(msg, cls = 'info') {
             const el = $('log');
@@ -121,7 +128,7 @@
 
         async function init() {
             try {
-                sp = await createSqlpipe();
+                sp = await createSqlpipe(wasmFactory);
                 $('versionInfo').textContent = `sqlpipe ${sp.version} · protocol v${sp.protocolVersion}`;
                 status('Wasm loaded. Open a database to start.', 'ok');
                 $('initBtn').disabled = false;

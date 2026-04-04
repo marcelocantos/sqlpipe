@@ -5,10 +5,10 @@ export * from './types.js';
 
 import type {
   ApproveOwnershipCallback, ConflictCallback, HandleResult,
-  LogCallback, MasterConfig, OutMessage, PeerConfig, PeerHandleResult,
+  LogCallback, MasterConfig, WireMessage, PeerConfig, PeerHandleResult,
   ProgressCallback, QueryResult, ReplicaConfig, SchemaMismatchCallback,
 } from './types.js';
-import { ConflictAction, Delivery, PeerState, ReplicaState, SqldeepBackend } from './types.js';
+import { ConflictAction, PeerState, ReplicaState, SqldeepBackend } from './types.js';
 import { decodeHandleResult, decodeMessages, decodePeerHandleResult, decodeQueryResult, decodeChangeEvent, Reader } from './decode.js';
 import { type WasmModule, SqlpipeError, readBuf, checkError, withStack } from './wasm.js';
 
@@ -225,7 +225,7 @@ export class Master {
   }
 
   /** Flush pending changes. Returns tagged messages to send to replicas. */
-  flush(): OutMessage[] {
+  flush(): WireMessage[] {
     this.M._sqlpipe_master_flush(this.ptr, this.bufPtr, this.errPtr);
     checkError(this.M, this.errPtr);
     const raw = readBuf(this.M, this.bufPtr);
@@ -233,7 +233,7 @@ export class Master {
   }
 
   /** Handle a message from a replica. Returns tagged response messages. */
-  handleMessage(msg: Uint8Array): OutMessage[] {
+  handleMessage(msg: Uint8Array): WireMessage[] {
     const msgPtr = this.M._malloc(msg.length);
     this.M.HEAPU8.set(msg, msgPtr);
     try {
@@ -305,14 +305,11 @@ export class Replica {
   }
 
   /** Generate the HelloMsg to send to the master. */
-  hello(): OutMessage {
+  hello(): WireMessage {
     this.M._sqlpipe_replica_hello(this.ptr, this.bufPtr, this.errPtr);
     checkError(this.M, this.errPtr);
-    const raw = readBuf(this.M, this.bufPtr);
-    // Last byte is the delivery hint; preceding bytes are the wire message.
-    const data = raw.slice(0, raw.length - 1);
-    const delivery = raw[raw.length - 1] as Delivery;
-    return { data, delivery };
+    const data = readBuf(this.M, this.bufPtr);
+    return { data };
   }
 
   /** Handle a message from the master. */
@@ -424,7 +421,7 @@ export class Peer {
   }
 
   /** Initiate the handshake (client only). Returns tagged messages to send. */
-  start(): OutMessage[] {
+  start(): WireMessage[] {
     this.M._sqlpipe_peer_start(this.ptr, this.bufPtr, this.errPtr);
     checkError(this.M, this.errPtr);
     const raw = readBuf(this.M, this.bufPtr);
@@ -432,7 +429,7 @@ export class Peer {
   }
 
   /** Flush local changes on owned tables. Returns tagged messages to send. */
-  flush(): OutMessage[] {
+  flush(): WireMessage[] {
     this.M._sqlpipe_peer_flush(this.ptr, this.bufPtr, this.errPtr);
     checkError(this.M, this.errPtr);
     const raw = readBuf(this.M, this.bufPtr);

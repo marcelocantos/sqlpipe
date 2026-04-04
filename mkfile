@@ -59,7 +59,9 @@ wasm_emflags = -sMODULARIZE=1 -sEXPORT_NAME=createSqlpipeModule \
     -sALLOW_TABLE_GROWTH -sINITIAL_MEMORY=16777216 -sALLOW_MEMORY_GROWTH=1 \
     -sSTACK_SIZE=1048576 -sDISABLE_EXCEPTION_CATCHING=0
 
-build/wasm/sqlpipe.js: build/wasm/sqlpipe_wapi.o build/wasm/sqldeep_wapi.o build/wasm/sqldeep.o build/wasm/sqlpipe.o build/wasm/sqlift.o build/wasm/sqlite3.o build/wasm/lz4.o
+wasm_lp_objs = $[patsubst %,build/wasm/liteparser/%.o,$lp_srcs]
+
+build/wasm/sqlpipe.js: build/wasm/sqlpipe_wapi.o build/wasm/sqldeep_wapi.o build/wasm/sqldeep.o build/wasm/sqlpipe.o build/wasm/sqlift.o build/wasm/sqlite3.o build/wasm/lz4.o $wasm_lp_objs
     em++ -std=c++23 $wasm_emflags -o $target $inputs
 
 build/wasm/sqlpipe_wapi.o: web/sqlpipe_wapi.cpp
@@ -104,4 +106,7 @@ build/examples/{name}.o: examples/{name}.cpp
 
 build/liteparser/{name}.o: $liteparser/src/{name}.c
     $cc -w -O2 -I$liteparser/src -c $input -o $target
+
+build/wasm/liteparser/{name}.o: $liteparser/src/{name}.c
+    emcc -w -O2 -DARENA_DEFAULT_ALIGN=16 -I$liteparser/src -c $input -o $target
 
