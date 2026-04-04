@@ -20,7 +20,7 @@ test_objs = $[patsubst %.cpp,build/%.o,$test_srcs]
 lp_srcs = arena liteparser lp_tokenize lp_unparse parse
 lp_objs = $[patsubst %,build/liteparser/%.o,$lp_srcs]
 
-build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlift.o build/sqlpipe.o $lp_objs
+build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlpipe.o $lp_objs
     $ar rcs $target $inputs
 
 # ── Tasks ────────────────────────────────────────────────────────────
@@ -59,22 +59,18 @@ wasm_emflags = -sMODULARIZE=1 -sEXPORT_NAME=createSqlpipeModule \
     -sALLOW_TABLE_GROWTH -sINITIAL_MEMORY=16777216 -sALLOW_MEMORY_GROWTH=1 \
     -sSTACK_SIZE=1048576 -sDISABLE_EXCEPTION_CATCHING=0
 
-build/wasm/sqlpipe.js: build/wasm/sqlpipe_wapi.o build/wasm/sqldeep_wapi.o build/wasm/sqldeep.o build/wasm/sqlpipe.o build/wasm/sqlift.o build/wasm/sqlite3.o build/wasm/lz4.o
+wasm_lp_objs = $[patsubst %,build/wasm/liteparser/%.o,$lp_srcs]
+
+build/wasm/sqlpipe.js: build/wasm/sqlpipe_wapi.o build/wasm/sqldeep_wapi.o build/wasm/sqlpipe.o build/wasm/sqlite3.o build/wasm/lz4.o $wasm_lp_objs
     em++ -std=c++23 $wasm_emflags -o $target $inputs
 
 build/wasm/sqlpipe_wapi.o: web/sqlpipe_wapi.cpp
     em++ -std=c++23 $cxxflags $incflags -c $input -o $target
 
 build/wasm/sqldeep_wapi.o: web/sqldeep_wapi.cpp
-    em++ -std=c++20 -I$sqldeep/dist -c $input -o $target
-
-build/wasm/sqldeep.o: $sqldeep/dist/sqldeep.cpp
-    em++ -std=c++20 -I$sqldeep/dist -Wall -Wextra -Wpedantic -c $input -o $target
-
-build/wasm/sqlpipe.o: dist/sqlpipe.cpp
     em++ -std=c++23 $cxxflags $incflags -c $input -o $target
 
-build/wasm/sqlift.o: $vendor/src/sqlift.cpp
+build/wasm/sqlpipe.o: dist/sqlpipe.cpp
     em++ -std=c++23 $cxxflags $incflags -c $input -o $target
 
 build/wasm/sqlite3.o: $vendor/src/sqlite3.c
@@ -90,9 +86,6 @@ build/sqlite3.o: $vendor/src/sqlite3.c
 build/lz4.o: $vendor/src/lz4.c
     $cc $cflags -I$vendor/include -c $input -o $target
 
-build/sqlift.o: $vendor/src/sqlift.cpp
-    $cxx $cxxflags $incflags -c $input -o $target
-
 build/sqlpipe.o: dist/sqlpipe.cpp
     $cxx $cxxflags $incflags -c $input -o $target
 
@@ -104,4 +97,7 @@ build/examples/{name}.o: examples/{name}.cpp
 
 build/liteparser/{name}.o: $liteparser/src/{name}.c
     $cc -w -O2 -I$liteparser/src -c $input -o $target
+
+build/wasm/liteparser/{name}.o: $liteparser/src/{name}.c
+    emcc -w -O2 -DARENA_DEFAULT_ALIGN=16 -I$liteparser/src -c $input -o $target
 

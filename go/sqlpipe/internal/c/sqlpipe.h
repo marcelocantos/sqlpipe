@@ -7,6 +7,118 @@
 #define SQLPIPE_VERSION_MINOR 18
 #define SQLPIPE_VERSION_PATCH 0
 
+// ── Bundled: sqldeep (query transpiler) ─────────────────────────
+// Converts sqldeep extended SQL syntax to standard SQL.
+// Integrated into Database::exec/query/subscribe automatically.
+
+#define SQLDEEP_VERSION       "0.8.0"
+#define SQLDEEP_VERSION_MAJOR 0
+#define SQLDEEP_VERSION_MINOR 8
+#define SQLDEEP_VERSION_PATCH 0
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    const char* from_column;
+    const char* to_column;
+} sqldeep_column_pair;
+
+typedef struct {
+    const char* from_table;
+    const char* to_table;
+    const sqldeep_column_pair* columns;
+    int column_count;
+} sqldeep_foreign_key;
+
+typedef enum { SQLDEEP_SQLITE = 0, SQLDEEP_POSTGRES = 1 } sqldeep_backend;
+
+/// Transpile sqldeep syntax to standard SQL (SQLite backend).
+/// Returns malloc'd string (caller frees with sqldeep_free).
+/// On error returns NULL, sets err_msg/err_line/err_col.
+char* sqldeep_transpile(const char* input,
+                        char** err_msg, int* err_line, int* err_col);
+
+/// Transpile with explicit foreign key relationships.
+char* sqldeep_transpile_fk(const char* input,
+                           const sqldeep_foreign_key* fks, int fk_count,
+                           char** err_msg, int* err_line, int* err_col);
+
+/// Transpile for a specific backend (SQLite or Postgres).
+char* sqldeep_transpile_backend(const char* input, sqldeep_backend backend,
+                                char** err_msg, int* err_line, int* err_col);
+
+/// Transpile with FKs for a specific backend.
+char* sqldeep_transpile_fk_backend(const char* input, sqldeep_backend backend,
+                                   const sqldeep_foreign_key* fks, int fk_count,
+                                   char** err_msg, int* err_line, int* err_col);
+
+const char* sqldeep_version(void);
+void sqldeep_free(void* ptr);
+
+#ifdef __cplusplus
+}
+#endif
+
+// ── Bundled: sqlift (schema migration) ──────────────────────────
+// Declarative SQLite schema diffing and migration.
+
+#define SQLIFT_VERSION       "0.12.0"
+#define SQLIFT_VERSION_MAJOR 0
+#define SQLIFT_VERSION_MINOR 12
+#define SQLIFT_VERSION_PATCH 0
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct sqlite3 sqlite3;
+
+enum sqlift_error_type {
+    SQLIFT_OK               = 0,
+    SQLIFT_ERROR            = 1,
+    SQLIFT_PARSE_ERROR      = 2,
+    SQLIFT_EXTRACT_ERROR    = 3,
+    SQLIFT_DIFF_ERROR       = 4,
+    SQLIFT_APPLY_ERROR      = 5,
+    SQLIFT_DRIFT_ERROR      = 6,
+    SQLIFT_DESTRUCTIVE_ERROR = 7,
+    SQLIFT_BREAKING_CHANGE_ERROR = 8,
+    SQLIFT_JSON_ERROR       = 9,
+};
+
+typedef struct sqlift_db sqlift_db;
+
+sqlift_db* sqlift_db_open(const char* path, int flags,
+                          int* err_type, char** err_msg);
+sqlift_db* sqlift_db_wrap(sqlite3* handle);
+void sqlift_db_close(sqlift_db* db);
+int sqlift_db_exec(sqlift_db* db, const char* sql, char** err_msg);
+char* sqlift_parse(const char* ddl, int* err_type, char** err_msg);
+char* sqlift_extract(sqlift_db* db, int* err_type, char** err_msg);
+char* sqlift_diff(const char* current_json, const char* desired_json,
+                  int* err_type, char** err_msg);
+int sqlift_apply(sqlift_db* db, const char* plan_json, int allow_destructive,
+                 int* err_type, char** err_msg);
+int64_t sqlift_migration_version(sqlift_db* db, int* err_type, char** err_msg);
+char* sqlift_detect_redundant_indexes(const char* schema_json,
+                                      int* err_type, char** err_msg);
+char* sqlift_schema_hash(const char* schema_json,
+                         int* err_type, char** err_msg);
+int sqlift_db_query_int64(sqlift_db* db, const char* sql,
+                          int64_t* result, char** err_msg);
+char* sqlift_db_query_text(sqlift_db* db, const char* sql, char** err_msg);
+void sqlift_free(void* ptr);
+
+#ifdef __cplusplus
+}
+#endif
+
+// ── sqlpipe ────────────────────────────────────────────────────
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -142,6 +254,91 @@ using SchemaMismatchCallback = std::function<bool(
 /// The returned QueryResult has id = 0 (not a subscription).
 /// Throws Error on SQL errors.
 QueryResult query(sqlite3* db, const std::string& sql);
+
+/// Callback for subscription results.
+using SubscriptionCallback = std::function<void(const QueryResult&)>;
+
+} // namespace sqlpipe
+
+// ── database.h ──────────────────────────────────────────────────
+namespace sqlpipe {
+
+class Database;
+
+/// RAII handle for a query subscription. Auto-unsubscribes on destruction.
+class Subscription {
+public:
+    ~Subscription();
+    Subscription(Subscription&&) noexcept;
+    Subscription& operator=(Subscription&&) noexcept;
+    Subscription(const Subscription&) = delete;
+    Subscription& operator=(const Subscription&) = delete;
+
+private:
+    friend class Database;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    Subscription(std::unique_ptr<Impl> impl);
+};
+
+/// Unified database handle with schema migration and query subscriptions.
+///
+/// Opens a SQLite database, optionally applying schema migrations via
+/// sqlift, and provides exec/query/subscribe operations. Subscriptions
+/// fire automatically after exec() when data changes.
+///
+/// Owns the sqlite3* handle. Use handle() to pass it to Master, Replica,
+/// or Peer for replication. After replication operations that modify the
+/// database, call notify() to fire subscriptions.
+class Database {
+public:
+    /// Open or create a database at path. Use ":memory:" for in-memory.
+    /// If schema_ddl is non-empty, applies schema migration using sqlift
+    /// (creates tables if new, alters if existing schema differs).
+    explicit Database(const std::string& path,
+                      const std::string& schema_ddl = {});
+    ~Database();
+
+    Database(Database&&) noexcept;
+    Database& operator=(Database&&) noexcept;
+    Database(const Database&) = delete;
+    Database& operator=(const Database&) = delete;
+
+    /// Execute DDL/DML SQL. Subscriptions fire if data changes.
+    void exec(const std::string& sql);
+
+    /// Execute a query and return the full result set.
+    QueryResult query(const std::string& sql) const;
+
+    /// Subscribe to a query. The callback fires whenever the query's
+    /// result set changes — from local exec(), replication, or any
+    /// other source of writes to the underlying database.
+    /// The callback fires once immediately with the initial result.
+    Subscription subscribe(const std::string& sql, SubscriptionCallback cb);
+
+    /// Fire subscriptions for changes to the given tables. Called
+    /// automatically by exec(); call manually after Master/Replica/Peer
+    /// operations that modify the database.
+    void notify(const std::set<std::string>& affected_tables);
+
+    /// Fire subscriptions by scanning all tracked tables.
+    /// Convenience overload when you don't know which tables changed.
+    void notify();
+
+    /// Access the underlying sqlite3 handle for use with
+    /// Master/Replica/Peer constructors.
+    sqlite3* handle() const;
+
+    /// Generate schema migration SQL from old DDL to new DDL using sqlift.
+    /// Returns empty string if schemas are equivalent.
+    static std::string migration(const std::string& from_ddl,
+                                 const std::string& to_ddl);
+
+private:
+    friend class Subscription;
+    struct Impl;
+    std::shared_ptr<Impl> impl_;
+};
 
 } // namespace sqlpipe
 
@@ -791,6 +988,14 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// ── Schema utilities ────────────────────────────────────────────
+
+/// Generate migration DDL from old_ddl to new_ddl using sqlift.
+/// Returns the SQL statements to transform the schema, or empty string
+/// if schemas are equivalent. Throws Error on parse/diff failures.
+std::string generate_migration(const std::string& old_ddl,
+                               const std::string& new_ddl);
 
 // ── Convenience utilities ───────────────────────────────────────
 

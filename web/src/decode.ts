@@ -1,8 +1,14 @@
 // Copyright 2026 Marcelo Cantos
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ChangeEvent, HandleResult, OutMessage, PeerHandleResult, QueryResult, Value } from './types.js';
-import { Delivery, OpType } from './types.js';
+import type { ChangeEvent, HandleResult, PeerHandleResult, QueryResult, Value } from './types.js';
+import { OpType } from './types.js';
+
+/** Wire message — a length-prefixed serialized protocol message. */
+export interface WireMessage {
+  /** Serialized wire-format message (including 4-byte length prefix). */
+  data: Uint8Array;
+}
 
 /** Little-endian binary reader over a Uint8Array. */
 export class Reader {
@@ -99,45 +105,36 @@ export function decodeQueryResult(r: Reader): QueryResult {
   return { id, columns, rows };
 }
 
-/** Extract wire messages with delivery hints from an encoded messages buffer. */
-export function decodeMessages(buf: Uint8Array): OutMessage[] {
-  const r = new Reader(buf);
-  const count = r.u32();
-  const msgs: OutMessage[] = [];
+function decodeWireMessages(buf: Uint8Array, r: Reader, count: number): WireMessage[] {
+  const msgs: WireMessage[] = [];
   for (let i = 0; i < count; i++) {
     const len = r.u32();
-    // Include the 4-byte length prefix in the message.
     const start = r.pos - 4;
     r.pos += len;
     const data = buf.slice(start, r.pos);
-    const delivery = r.u8() as Delivery;
-    msgs.push({ data, delivery });
+    msgs.push({ data });
   }
   return msgs;
+}
+
+/** Extract wire messages from an encoded messages buffer. */
+export function decodeMessages(buf: Uint8Array): WireMessage[] {
+  const r = new Reader(buf);
+  const count = r.u32();
+  return decodeWireMessages(buf, r, count);
 }
 
 /** Decode a HandleResult buffer. */
 export function decodeHandleResult(buf: Uint8Array): HandleResult {
   const r = new Reader(buf);
 
-  // Response messages (with delivery hints).
   const msgCount = r.u32();
-  const messages: OutMessage[] = [];
-  for (let i = 0; i < msgCount; i++) {
-    const len = r.u32();
-    const start = r.pos - 4;
-    r.pos += len;
-    const data = buf.slice(start, r.pos);
-    const delivery = r.u8() as Delivery;
-    messages.push({ data, delivery });
-  }
+  const messages = decodeWireMessages(buf, r, msgCount);
 
-  // Changes.
   const changeCount = r.u32();
   const changes: ChangeEvent[] = [];
   for (let i = 0; i < changeCount; i++) changes.push(decodeChangeEvent(r));
 
-  // Subscriptions.
   const subCount = r.u32();
   const subscriptions: QueryResult[] = [];
   for (let i = 0; i < subCount; i++) subscriptions.push(decodeQueryResult(r));
@@ -150,15 +147,7 @@ export function decodePeerHandleResult(buf: Uint8Array): PeerHandleResult {
   const r = new Reader(buf);
 
   const msgCount = r.u32();
-  const messages: OutMessage[] = [];
-  for (let i = 0; i < msgCount; i++) {
-    const len = r.u32();
-    const start = r.pos - 4;
-    r.pos += len;
-    const data = buf.slice(start, r.pos);
-    const delivery = r.u8() as Delivery;
-    messages.push({ data, delivery });
-  }
+  const messages = decodeWireMessages(buf, r, msgCount);
 
   const changeCount = r.u32();
   const changes: ChangeEvent[] = [];

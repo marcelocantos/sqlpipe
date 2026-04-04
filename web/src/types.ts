@@ -11,20 +11,10 @@ export enum OpType {
   Delete = 3,
 }
 
-/** Transport delivery hint for a protocol message. */
-export enum Delivery {
-  /** Must be delivered reliably and in order (TCP, WebSocket, etc.). */
-  Reliable = 0,
-  /** May be sent via unreliable/unordered transport (UDP, BLE, etc.). */
-  BestEffort = 1,
-}
-
-/** A protocol message paired with a transport delivery hint. */
-export interface OutMessage {
-  /** Serialized wire-format message (including 4-byte length prefix). */
+/** A serialized wire-format protocol message. */
+export interface WireMessage {
+  /** Serialized message (including 4-byte length prefix). */
   data: Uint8Array;
-  /** Delivery hint for the transport layer. */
-  delivery: Delivery;
 }
 
 /** A row-level change extracted from a changeset. */
@@ -157,14 +147,14 @@ export interface PeerConfig {
 
 /** Result from Replica.handleMessage(). */
 export interface HandleResult {
-  messages: OutMessage[];
+  messages: WireMessage[];
   changes: ChangeEvent[];
   subscriptions: QueryResult[];
 }
 
 /** Result from Peer.handleMessage(). */
 export interface PeerHandleResult {
-  messages: OutMessage[];
+  messages: WireMessage[];
   changes: ChangeEvent[];
   subscriptions: QueryResult[];
 }
