@@ -118,6 +118,12 @@
             $('subResult').innerHTML = html;
         }
 
+        // Transpile sqldeep syntax to standard SQL.
+        function transpile(sql) {
+            try { return sp.transpile(sql); }
+            catch { return sql; }  // plain SQL passes through
+        }
+
         // Get all user table names for notification.
         function getTableNames() {
             const r = db.query(
@@ -164,7 +170,7 @@
 
         $('execBtn').addEventListener('click', () => {
             try {
-                const sql = $('sql').value.trim();
+                const sql = transpile($('sql').value.trim());
                 db.exec(sql);
                 log(`Executed: ${sql}`);
 
@@ -187,7 +193,7 @@
         $('subBtn').addEventListener('click', () => {
             try {
                 if (subId !== null) { qw.unsubscribe(subId); }
-                const sql = $('subSql').value.trim();
+                const sql = transpile($('subSql').value.trim());
                 subId = qw.subscribe(sql);
                 log(`Subscribed: ${sql}`, 'sub');
                 $('unsubBtn').disabled = false;

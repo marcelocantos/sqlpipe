@@ -180,3 +180,20 @@ TEST_CASE("database: sqldeep subscription works") {
     CHECK(fired == 2);
     CHECK(last_json.find("Alice") != std::string::npos);
 }
+
+TEST_CASE("database: sqldeep mixed columns with object literal") {
+    Database db(":memory:",
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)");
+    db.exec("INSERT INTO items VALUES (1, 'Widget', 10)");
+    db.exec("INSERT INTO items VALUES (2, 'Gadget', 25)");
+
+    // Mix plain columns with sqldeep object literal.
+    auto r = db.query("SELECT id, {name, qty} FROM items ORDER BY id");
+    REQUIRE(r.rows.size() == 2);
+    // First column should be the plain id.
+    CHECK(std::get<int64_t>(r.rows[0][0]) == 1);
+    // Second column should be a JSON object string.
+    auto& json = std::get<std::string>(r.rows[0][1]);
+    CHECK(json.find("Widget") != std::string::npos);
+    CHECK(json.find("10") != std::string::npos);
+}
