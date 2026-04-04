@@ -37,19 +37,24 @@ needed. Sources are copied into `go/sqlpipe/internal/c/` so the module
 works standalone via `go get`.
 
 When `dist/sqlpipe.h`, `dist/sqlpipe.cpp`, or vendored dependencies change,
-re-copy them into `go/sqlpipe/internal/c/`:
+run `scripts/bundle-deps.sh` to regenerate the bundled dist files and copy
+them to Go/Swift wrappers automatically. The script vendors sqldeep from the
+sibling repo, bundles sqlift + sqldeep into dist/sqlpipe.cpp, and copies to
+wrappers.
+
+For manual updates beyond what the bundle script handles:
 ```sh
-cp dist/sqlpipe.{h,cpp} go/sqlpipe/internal/c/
-cp vendor/src/{sqlite3.c,lz4.c,sqlift.cpp} go/sqlpipe/internal/c/
-cp vendor/include/{sqlite3.h,lz4.h,sqlift.h} go/sqlpipe/internal/c/
+# Go wrapper (sqlite3, lz4, nlohmann/json are not bundled)
+cp vendor/src/sqlite3.c go/sqlpipe/internal/c/
+cp vendor/src/lz4.c go/sqlpipe/internal/c/
+cp vendor/include/{sqlite3.h,lz4.h} go/sqlpipe/internal/c/
 cp vendor/include/nlohmann/json.hpp go/sqlpipe/internal/c/nlohmann/
 ```
 
 Also update the Swift package (`swift/Sources/CSqlpipe/`):
 ```sh
-cp dist/sqlpipe.{h,cpp} swift/Sources/CSqlpipe/ && cp dist/sqlpipe.h swift/Sources/CSqlpipe/include/
-cp vendor/src/{sqlite3.c,lz4.c,sqlift.cpp} swift/Sources/CSqlpipe/
-cp vendor/include/{sqlite3.h,lz4.h,sqlift.h} swift/Sources/CSqlpipe/include/
+cp vendor/src/{sqlite3.c,lz4.c} swift/Sources/CSqlpipe/
+cp vendor/include/{sqlite3.h,lz4.h} swift/Sources/CSqlpipe/include/
 cp vendor/include/nlohmann/json.hpp swift/Sources/CSqlpipe/include/nlohmann/
 cp go/sqlpipe/sqlpipe_capi.{h,cpp} swift/Sources/CSqlpipe/ && cp go/sqlpipe/sqlpipe_capi.h swift/Sources/CSqlpipe/include/
 ```
@@ -218,8 +223,11 @@ mkfile              Build system (mk)
 
 ## Tests
 
-Test cases across 7 files (all use doctest):
+Test cases across 8 files (all use doctest):
 
+- `test_database.cpp` — Database class: open/exec/query, schema migration,
+  subscriptions (fire/no-fire/auto-unsubscribe/move), sqldeep transpilation,
+  Master/Replica integration with notify()
 - `test_protocol.cpp` — Serialization round-trips for all message types
   including PeerMessage, diff protocol messages, and LZ4 compression paths
 - `test_master.cpp` — Master state, flush behaviour, handshake state machine
@@ -229,7 +237,7 @@ Test cases across 7 files (all use doctest):
 - `test_diff_sync.cpp` — Schema mismatch, populated/empty sync, overlap,
   already-in-sync, diff-then-live
 - `test_peer.cpp` — Peer handshake, ownership negotiation, bidirectional
-  streaming, diff sync after reconnect
+  streaming, diff sync after reconnect, glob patterns
 
 Add new tests to the file matching the component under test.
 
