@@ -333,7 +333,8 @@ struct DeepSelect {
     std::variant<ObjectLiteral, ArrayLiteral, SqlParts> projection;
     SqlParts tail;
     bool singular = false;    // SELECT/1: no json_group_array, add LIMIT 1
-    bool xml_context = false;  // true = use xml_agg instead of json_group_array
+    bool xml_context = false;    // true = use xml_agg instead of json_group_array
+    bool jsonml_context = false; // true = use jsonml_agg instead of xml_agg
 };
 
 struct RecursiveSelect {
@@ -363,6 +364,7 @@ struct XmlElement {
     };
     std::vector<Child> children;
     bool self_closing = false;
+    bool jsonml = false;  // true = emit _jsonml variant functions
 };
 
 // ── Parser ──────────────────────────────────────────────────────────
@@ -892,6 +894,39 @@ private:
                 continue;
             }
 
+            // Check for xml_to_jsonml(<...>)
+            if (t.type == TokenType::Ident && t.text == "xml_to_jsonml") {
+                auto st = lex_.save();
+                lex_.next(); // consume xml_to_jsonml
+                Token t2 = lex_.peek();
+                if (t2.type == TokenType::LParen) {
+                    lex_.next(); // consume (
+                    Token t3 = lex_.peek();
+                    if (t3.type == TokenType::Other && t3.text == "<") {
+                        auto st2 = lex_.save();
+                        lex_.next(); // consume <
+                        Token t4 = lex_.peek();
+                        if (t4.type == TokenType::Ident) {
+                            lex_.restore(st2); // put back < ident
+                            flush_before(t);
+                            auto el = parse_xml_element(depth + 1,
+                                                        /*jsonml=*/true);
+                            Token close = lex_.peek();
+                            if (close.type != TokenType::RParen)
+                                lex_.error("expected ')' after xml_to_jsonml",
+                                           close.line, close.col);
+                            lex_.next(); // consume )
+                            parts.push_back(std::move(el));
+                            last_end = lex_.offset();
+                            need_space = true;
+                            continue;
+                        }
+                        lex_.restore(st2);
+                    }
+                }
+                lex_.restore(st);
+            }
+
             // Check for XML element: < followed by ident (tag name)
             if (paren_depth == 0 &&
                 t.type == TokenType::Other && t.text == "<") {
@@ -1318,13 +1353,15 @@ private:
         return name;
     }
 
-    std::unique_ptr<XmlElement> parse_xml_element(int depth) {
+    std::unique_ptr<XmlElement> parse_xml_element(int depth,
+                                                     bool jsonml = false) {
         Token lt = lex_.next(); // consume <
         if (lt.type != TokenType::Other || lt.text != "<")
             lex_.error("expected '<'", lt.line, lt.col);
         check_depth(depth, lt.line, lt.col);
 
         auto el = std::make_unique<XmlElement>();
+        el->jsonml = jsonml;
         el->tag = parse_xml_tag_name();
 
         // Parse attributes until > or />
@@ -1438,7 +1475,7 @@ private:
                     lex_.restore(st);
                     XmlElement::Child child;
                     child.kind = XmlElement::Child::Element;
-                    child.element = parse_xml_element(depth + 1);
+                    child.element = parse_xml_element(depth + 1, jsonml);
                     el->children.push_back(std::move(child));
                     continue;
                 }
@@ -1478,7 +1515,7 @@ private:
                         Token t4 = lex_.peek();
                         lex_.restore(st2);
                         if (t4.type == TokenType::Ident) {
-                            auto xml_el = parse_xml_element(depth + 1);
+                            auto xml_el = parse_xml_element(depth + 1, jsonml);
                             SqlParts proj;
                             proj.push_back(std::move(xml_el));
 
@@ -1494,6 +1531,7 @@ private:
                             ds->tail = std::move(tail);
                             ds->singular = singular;
                             ds->xml_context = true;
+                            ds->jsonml_context = jsonml;
 
                             Token rb = lex_.next();
                             if (rb.type != TokenType::RBrace)
@@ -1545,6 +1583,7 @@ private:
                     ds->projection = std::move(proj);
                     ds->singular = singular;
                     ds->xml_context = true;
+                    ds->jsonml_context = jsonml;
 
                     Token rb = lex_.next();
                     if (rb.type != TokenType::RBrace)
@@ -1819,7 +1858,7 @@ private:
             if (nested) out += "(";
             out += "SELECT ";
             if (ds.xml_context && !ds.singular) {
-                out += "xml_agg(";
+                out += ds.jsonml_context ? "jsonml_agg(" : "xml_agg(";
                 render_parts(std::get<SqlParts>(ds.projection), out, true);
                 out += ")";
             } else {
@@ -2089,14 +2128,19 @@ private:
         out += " FROM (SELECT _fragment FROM _sdq_events ORDER BY _sort_key)";
     }
 
-    void render_xml_element(const XmlElement& el, std::string& out) {
-        out += "xml_element('";
+    void render_xml_element(const XmlElement& el, std::string& out,
+                             bool jsonml_override = false) {
+        bool jsonml = el.jsonml || jsonml_override;
+        const char* fn_element = jsonml ? "xml_element_jsonml('" : "xml_element('";
+        const char* fn_attrs = jsonml ? ", xml_attrs_jsonml(" : ", xml_attrs(";
+
+        out += fn_element;
         out += el.tag;
         out += "'";
 
         // Attributes
         if (!el.attrs.empty()) {
-            out += ", xml_attrs(";
+            out += fn_attrs;
             for (size_t i = 0; i < el.attrs.size(); ++i) {
                 if (i > 0) out += ", ";
                 out += "'";
@@ -2129,7 +2173,7 @@ private:
                 render_parts(child.expr, out, /*nested=*/true);
                 break;
             case XmlElement::Child::Element:
-                render_xml_element(*child.element, out);
+                render_xml_element(*child.element, out, jsonml);
                 break;
             }
         }
