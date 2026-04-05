@@ -4403,6 +4403,9 @@ Database::Database(const std::string& path, const std::string& schema_ddl)
     // Register update hook to track dirty tables.
     sqlite3_update_hook(db, &Impl::update_hook, impl_.get());
 
+    // Register sqldeep XML runtime functions (xml_element, xml_attrs, xml_agg).
+    sqldeep_register_sqlite_xml(db);
+
     // Apply schema migration if DDL provided.
     if (!schema_ddl.empty()) {
         // Extract current schema from the database.
@@ -8482,6 +8485,17 @@ public:
 
     const std::string& source() const { return src_; }
 
+    // Read raw source characters until '<' or '{', for XML body text.
+    // Returns the accumulated text. Lexer position advances past it.
+    std::string read_raw_until_xml_special() {
+        std::string text;
+        while (pos_ < src_.size() && src_[pos_] != '<' && src_[pos_] != '{') {
+            text += src_[pos_];
+            advance();
+        }
+        return text;
+    }
+
     [[noreturn]] void error(const std::string& msg) {
         throw Error(msg, line_, col_);
     }
@@ -8607,6 +8621,7 @@ struct ObjectLiteral;
 struct ArrayLiteral;
 struct JoinPath;
 struct RecursiveSelect;
+struct XmlElement;
 
 using SqlPart = std::variant<
     std::string,
@@ -8614,7 +8629,8 @@ using SqlPart = std::variant<
     std::unique_ptr<ObjectLiteral>,
     std::unique_ptr<ArrayLiteral>,
     std::unique_ptr<JoinPath>,
-    std::unique_ptr<RecursiveSelect>
+    std::unique_ptr<RecursiveSelect>,
+    std::unique_ptr<XmlElement>
 >;
 using SqlParts = std::vector<SqlPart>;
 
@@ -8650,7 +8666,9 @@ struct JoinPath {
 struct DeepSelect {
     std::variant<ObjectLiteral, ArrayLiteral, SqlParts> projection;
     SqlParts tail;
-    bool singular = false; // SELECT/1: no json_group_array, add LIMIT 1
+    bool singular = false;    // SELECT/1: no json_group_array, add LIMIT 1
+    bool xml_context = false;    // true = use xml_agg instead of json_group_array
+    bool jsonml_context = false; // true = use jsonml_agg instead of xml_agg
 };
 
 struct RecursiveSelect {
@@ -8661,6 +8679,26 @@ struct RecursiveSelect {
     std::string pk_column;                    // PK column (default: "id")
     SqlParts root_condition;                  // WHERE condition (without WHERE keyword)
     bool singular = false;                    // SELECT/1: single root
+};
+
+struct XmlElement {
+    std::string tag;  // e.g. "div", "ui:Table.Row"
+    struct Attr {
+        std::string name;
+        SqlParts value;    // rendered expression (static string or dynamic)
+        bool is_dynamic;   // true = {expr}, false = "static"
+    };
+    std::vector<Attr> attrs;
+    struct Child {
+        enum Kind { Text, Interpolation, Element };
+        Kind kind;
+        std::string text;                      // kind == Text: raw body text
+        SqlParts expr;                         // kind == Interpolation: {expr}
+        std::unique_ptr<XmlElement> element;   // kind == Element: nested <tag>
+    };
+    std::vector<Child> children;
+    bool self_closing = false;
+    bool jsonml = false;  // true = emit _jsonml variant functions
 };
 
 // ── Parser ──────────────────────────────────────────────────────────
@@ -9190,6 +9228,57 @@ private:
                 continue;
             }
 
+            // Check for xml_to_jsonml(<...>)
+            if (t.type == TokenType::Ident && t.text == "xml_to_jsonml") {
+                auto st = lex_.save();
+                lex_.next(); // consume xml_to_jsonml
+                Token t2 = lex_.peek();
+                if (t2.type == TokenType::LParen) {
+                    lex_.next(); // consume (
+                    Token t3 = lex_.peek();
+                    if (t3.type == TokenType::Other && t3.text == "<") {
+                        auto st2 = lex_.save();
+                        lex_.next(); // consume <
+                        Token t4 = lex_.peek();
+                        if (t4.type == TokenType::Ident) {
+                            lex_.restore(st2); // put back < ident
+                            flush_before(t);
+                            auto el = parse_xml_element(depth + 1,
+                                                        /*jsonml=*/true);
+                            Token close = lex_.peek();
+                            if (close.type != TokenType::RParen)
+                                lex_.error("expected ')' after xml_to_jsonml",
+                                           close.line, close.col);
+                            lex_.next(); // consume )
+                            parts.push_back(std::move(el));
+                            last_end = lex_.offset();
+                            need_space = true;
+                            continue;
+                        }
+                        lex_.restore(st2);
+                    }
+                }
+                lex_.restore(st);
+            }
+
+            // Check for XML element: < followed by ident (tag name)
+            if (paren_depth == 0 &&
+                t.type == TokenType::Other && t.text == "<") {
+                auto st = lex_.save();
+                lex_.next(); // consume <
+                Token t2 = lex_.peek();
+                if (t2.type == TokenType::Ident) {
+                    lex_.restore(st);
+                    flush_before(t);
+                    auto el = parse_xml_element(depth + 1);
+                    parts.push_back(std::move(el));
+                    last_end = lex_.offset();
+                    need_space = true;
+                    continue;
+                }
+                lex_.restore(st);
+            }
+
             // Track paren depth
             if (t.type == TokenType::LParen) ++paren_depth;
             if (t.type == TokenType::RParen) {
@@ -9573,6 +9662,295 @@ private:
         return arr;
     }
 
+    // Parse XML tag name, allowing dots and colons for namespaced tags
+    // (e.g. "ui:Table.Row").
+    std::string parse_xml_tag_name() {
+        Token t = lex_.next();
+        if (t.type != TokenType::Ident)
+            lex_.error("expected tag name", t.line, t.col);
+        std::string name = t.text;
+        while (true) {
+            Token next = lex_.peek();
+            if (next.type == TokenType::Colon ||
+                (next.type == TokenType::Other && next.text == ".")) {
+                lex_.next();
+                name += next.text;
+                Token part = lex_.next();
+                if (part.type != TokenType::Ident)
+                    lex_.error("expected identifier after '" + next.text +
+                               "' in tag name", part.line, part.col);
+                name += part.text;
+            } else {
+                break;
+            }
+        }
+        return name;
+    }
+
+    std::unique_ptr<XmlElement> parse_xml_element(int depth,
+                                                     bool jsonml = false) {
+        Token lt = lex_.next(); // consume <
+        if (lt.type != TokenType::Other || lt.text != "<")
+            lex_.error("expected '<'", lt.line, lt.col);
+        check_depth(depth, lt.line, lt.col);
+
+        auto el = std::make_unique<XmlElement>();
+        el->jsonml = jsonml;
+        el->tag = parse_xml_tag_name();
+
+        // Parse attributes until > or />
+        while (true) {
+            Token t = lex_.peek();
+
+            // Self-closing />
+            if (t.type == TokenType::Other && t.text == "/") {
+                lex_.next();
+                Token gt = lex_.next();
+                if (gt.type != TokenType::Other || gt.text != ">")
+                    lex_.error("expected '>' after '/'", gt.line, gt.col);
+                el->self_closing = true;
+                return el;
+            }
+
+            // End of open tag
+            if (t.type == TokenType::Other && t.text == ">") {
+                lex_.next();
+                break;
+            }
+
+            if (t.type == TokenType::Eof)
+                lex_.error("unterminated XML element", lt.line, lt.col);
+
+            // Attribute: name [ = value ]
+            if (t.type != TokenType::Ident)
+                lex_.error("expected attribute name or '>'", t.line, t.col);
+            lex_.next();
+            std::string attr_name = t.text;
+
+            Token eq = lex_.peek();
+            if (eq.type != TokenType::Other || eq.text != "=") {
+                // Boolean attribute: emit name as value (disabled="disabled")
+                SqlParts val;
+                val.push_back(std::string("'") + attr_name + "'");
+                el->attrs.push_back({attr_name, std::move(val), false});
+                continue;
+            }
+            lex_.next(); // consume =
+
+            Token val = lex_.peek();
+            if (val.type == TokenType::DqString) {
+                // Static attribute: name="value"
+                lex_.next();
+                SqlParts sval;
+                // Convert "..." to '...' for SQL
+                std::string content = val.text.substr(1, val.text.size() - 2);
+                sval.push_back(std::string("'") + content + "'");
+                el->attrs.push_back({attr_name, std::move(sval), false});
+            } else if (val.type == TokenType::LBrace) {
+                // Dynamic attribute: name={expr}
+                lex_.next(); // consume {
+                auto expr = parse_sql_parts(/*stop_comma=*/false,
+                                            /*stop_rbrace=*/true,
+                                            /*stop_rbracket=*/false,
+                                            /*stop_rparen=*/false,
+                                            depth);
+                Token rb = lex_.next();
+                if (rb.type != TokenType::RBrace)
+                    lex_.error("expected '}' after attribute expression",
+                               rb.line, rb.col);
+                el->attrs.push_back({attr_name, std::move(expr), true});
+            } else {
+                lex_.error("expected '\"...' or '{...}' after '='",
+                           val.line, val.col);
+            }
+        }
+
+        // Parse children until </tag>
+        while (true) {
+            // Read raw text until < or {
+            std::string text = lex_.read_raw_until_xml_special();
+            if (!text.empty()) {
+                XmlElement::Child child;
+                child.kind = XmlElement::Child::Text;
+                child.text = std::move(text);
+                el->children.push_back(std::move(child));
+            }
+
+            // Check what stopped us
+            Token t = lex_.peek();
+            if (t.type == TokenType::Eof)
+                lex_.error("unterminated XML element '<" + el->tag + ">'",
+                           lt.line, lt.col);
+
+            if (t.type == TokenType::Other && t.text == "<") {
+                // Peek further: < followed by / = closing tag,
+                // < followed by ident = child element
+                auto st = lex_.save();
+                lex_.next(); // consume <
+                Token t2 = lex_.peek();
+
+                if (t2.type == TokenType::Other && t2.text == "/") {
+                    // Closing tag </tag>
+                    lex_.next(); // consume /
+                    std::string close_tag = parse_xml_tag_name();
+                    if (close_tag != el->tag)
+                        lex_.error("mismatched closing tag: expected '</" +
+                                   el->tag + ">' but found '</" +
+                                   close_tag + ">'", t.line, t.col);
+                    Token gt = lex_.next();
+                    if (gt.type != TokenType::Other || gt.text != ">")
+                        lex_.error("expected '>' in closing tag",
+                                   gt.line, gt.col);
+                    break;
+                }
+
+                if (t2.type == TokenType::Ident) {
+                    // Child element — restore to before < and recurse
+                    lex_.restore(st);
+                    XmlElement::Child child;
+                    child.kind = XmlElement::Child::Element;
+                    child.element = parse_xml_element(depth + 1, jsonml);
+                    el->children.push_back(std::move(child));
+                    continue;
+                }
+
+                // Bare < in content is an error
+                lex_.error("unexpected '<' in XML content", t.line, t.col);
+            }
+
+            if (t.type == TokenType::LBrace) {
+                lex_.next(); // consume {
+
+                // Check for {{ — JSON object inside interpolation
+                Token t2 = lex_.peek();
+                if (t2.type == TokenType::LBrace) {
+                    auto obj = parse_object_literal(depth + 1);
+                    Token rb = lex_.next();
+                    if (rb.type != TokenType::RBrace)
+                        lex_.error("expected '}' after interpolated object",
+                                   rb.line, rb.col);
+                    XmlElement::Child child;
+                    child.kind = XmlElement::Child::Interpolation;
+                    child.expr.push_back(std::move(obj));
+                    el->children.push_back(std::move(child));
+                    continue;
+                }
+
+                // {SELECT ...} — subquery inside XML
+                if (is_keyword(t2, "SELECT")) {
+                    lex_.next(); // consume SELECT
+                    bool singular = try_consume_singular();
+                    Token t3 = lex_.peek();
+
+                    // SELECT followed by XML element: wrap in DeepSelect
+                    if (t3.type == TokenType::Other && t3.text == "<") {
+                        auto st2 = lex_.save();
+                        lex_.next(); // consume <
+                        Token t4 = lex_.peek();
+                        lex_.restore(st2);
+                        if (t4.type == TokenType::Ident) {
+                            auto xml_el = parse_xml_element(depth + 1, jsonml);
+                            SqlParts proj;
+                            proj.push_back(std::move(xml_el));
+
+                            auto tail = parse_sql_parts(
+                                /*stop_comma=*/false,
+                                /*stop_rbrace=*/true,
+                                /*stop_rbracket=*/false,
+                                /*stop_rparen=*/false,
+                                depth + 1);
+
+                            auto ds = std::make_unique<DeepSelect>();
+                            ds->projection = std::move(proj);
+                            ds->tail = std::move(tail);
+                            ds->singular = singular;
+                            ds->xml_context = true;
+                            ds->jsonml_context = jsonml;
+
+                            Token rb = lex_.next();
+                            if (rb.type != TokenType::RBrace)
+                                lex_.error("expected '}' after XML subquery",
+                                           rb.line, rb.col);
+                            XmlElement::Child child;
+                            child.kind = XmlElement::Child::Interpolation;
+                            child.expr.push_back(std::move(ds));
+                            el->children.push_back(std::move(child));
+                            continue;
+                        }
+                    }
+
+                    // SELECT followed by { or [ — existing deep select
+                    if (t3.type == TokenType::LBrace ||
+                        t3.type == TokenType::LBracket) {
+                        auto part = parse_deep_or_recursive_select(
+                            t2, singular,
+                            /*stop_comma=*/false,
+                            /*stop_rbrace=*/true,
+                            /*stop_rbracket=*/false,
+                            /*stop_rparen=*/false,
+                            depth + 1);
+                        Token rb = lex_.next();
+                        if (rb.type != TokenType::RBrace)
+                            lex_.error("expected '}' after subquery",
+                                       rb.line, rb.col);
+                        XmlElement::Child child;
+                        child.kind = XmlElement::Child::Interpolation;
+                        child.expr.push_back(std::move(part));
+                        el->children.push_back(std::move(child));
+                        continue;
+                    }
+
+                    // SELECT followed by plain expression — restore and
+                    // fall through to generic expression parsing
+                    // We need to un-consume SELECT, but we already consumed it.
+                    // Simplest: build a DeepSelect with SqlParts projection.
+                    auto proj = parse_sql_parts(
+                        /*stop_comma=*/false,
+                        /*stop_rbrace=*/true,
+                        /*stop_rbracket=*/false,
+                        /*stop_rparen=*/false,
+                        depth + 1,
+                        /*stop_at_select=*/false);
+                    // Split projection from tail at FROM keyword
+                    // Actually, just wrap in DeepSelect with plain projection
+                    auto ds = std::make_unique<DeepSelect>();
+                    ds->projection = std::move(proj);
+                    ds->singular = singular;
+                    ds->xml_context = true;
+                    ds->jsonml_context = jsonml;
+
+                    Token rb = lex_.next();
+                    if (rb.type != TokenType::RBrace)
+                        lex_.error("expected '}' after subquery",
+                                   rb.line, rb.col);
+                    XmlElement::Child child;
+                    child.kind = XmlElement::Child::Interpolation;
+                    child.expr.push_back(std::move(ds));
+                    el->children.push_back(std::move(child));
+                    continue;
+                }
+
+                // {expr} — plain interpolation
+                auto expr = parse_sql_parts(/*stop_comma=*/false,
+                                            /*stop_rbrace=*/true,
+                                            /*stop_rbracket=*/false,
+                                            /*stop_rparen=*/false,
+                                            depth + 1);
+                Token rb = lex_.next();
+                if (rb.type != TokenType::RBrace)
+                    lex_.error("expected '}' after interpolation",
+                               rb.line, rb.col);
+                XmlElement::Child child;
+                child.kind = XmlElement::Child::Interpolation;
+                child.expr = std::move(expr);
+                el->children.push_back(std::move(child));
+                continue;
+            }
+        }
+
+        return el;
+    }
+
     // Check if '(' at position start in accum is a JSON path base
     // (not a function call). A function call has an identifier (not a SQL
     // keyword) immediately before '('. SQL keywords like WHERE, AND, SELECT
@@ -9777,12 +10155,13 @@ public:
 
     std::string render_document(const SqlParts& parts) {
         std::string out;
-        render_parts(parts, out, /*nested=*/false);
+        render_parts(parts, out, /*nested=*/false, /*cast_xml=*/true);
         return out;
     }
 
 private:
-    void render_parts(const SqlParts& parts, std::string& out, bool nested) {
+    void render_parts(const SqlParts& parts, std::string& out, bool nested,
+                       bool cast_xml = false) {
         for (const auto& part : parts) {
             std::visit([&](const auto& v) {
                 using T = std::decay_t<decltype(v)>;
@@ -9798,21 +10177,32 @@ private:
                     render_join_path(*v, out);
                 } else if constexpr (std::is_same_v<T, std::unique_ptr<RecursiveSelect>>) {
                     render_recursive_select(*v, out);
+                } else if constexpr (std::is_same_v<T, std::unique_ptr<XmlElement>>) {
+                    if (cast_xml) out += "CAST(";
+                    render_xml_element(*v, out);
+                    if (cast_xml) out += " AS TEXT)";
                 }
             }, part);
         }
     }
 
     void render_deep_select(const DeepSelect& ds, std::string& out, bool nested) {
-        // Plain FROM-first: just rearrange, no JSON wrapping
+        // SqlParts projection: plain rearrangement or XML subquery
         if (std::holds_alternative<SqlParts>(ds.projection)) {
             if (nested) out += "(";
             out += "SELECT ";
-            render_parts(std::get<SqlParts>(ds.projection), out, true);
+            if (ds.xml_context && !ds.singular) {
+                out += ds.jsonml_context ? "jsonml_agg(" : "xml_agg(";
+                render_parts(std::get<SqlParts>(ds.projection), out, true);
+                out += ")";
+            } else {
+                render_parts(std::get<SqlParts>(ds.projection), out, true);
+            }
             if (!ds.tail.empty()) {
                 out += " ";
                 render_parts(ds.tail, out, true);
             }
+            if (ds.singular) out += " LIMIT 1";
             if (nested) out += ")";
             return;
         }
@@ -9871,10 +10261,10 @@ private:
             } else if (f.aggregate) {
                 out += fn_group_array_;
                 out += "(";
-                render_parts(f.value, out, /*nested=*/true);
+                render_parts(f.value, out, /*nested=*/true, /*cast_xml=*/true);
                 out += ")";
             } else {
-                render_parts(f.value, out, /*nested=*/true);
+                render_parts(f.value, out, /*nested=*/true, /*cast_xml=*/true);
             }
         }
         out += ")";
@@ -9885,7 +10275,7 @@ private:
         out += "(";
         for (size_t i = 0; i < arr.elements.size(); ++i) {
             if (i > 0) out += ", ";
-            render_parts(arr.elements[i], out, /*nested=*/true);
+            render_parts(arr.elements[i], out, /*nested=*/true, /*cast_xml=*/true);
         }
         out += ")";
     }
@@ -10072,6 +10462,59 @@ private:
         out += " FROM (SELECT _fragment FROM _sdq_events ORDER BY _sort_key)";
     }
 
+    void render_xml_element(const XmlElement& el, std::string& out,
+                             bool jsonml_override = false) {
+        bool jsonml = el.jsonml || jsonml_override;
+        const char* fn_element = jsonml ? "xml_element_jsonml('" : "xml_element('";
+        const char* fn_attrs = jsonml ? ", xml_attrs_jsonml(" : ", xml_attrs(";
+
+        out += fn_element;
+        out += el.tag;
+        out += "'";
+
+        // Attributes
+        if (!el.attrs.empty()) {
+            out += fn_attrs;
+            for (size_t i = 0; i < el.attrs.size(); ++i) {
+                if (i > 0) out += ", ";
+                out += "'";
+                out += el.attrs[i].name;
+                out += "', ";
+                if (el.attrs[i].is_dynamic) {
+                    render_parts(el.attrs[i].value, out, /*nested=*/true);
+                } else {
+                    render_parts(el.attrs[i].value, out, /*nested=*/true);
+                }
+            }
+            out += ")";
+        }
+
+        // Children
+        for (const auto& child : el.children) {
+            out += ", ";
+            switch (child.kind) {
+            case XmlElement::Child::Text: {
+                out += "'";
+                // Escape single quotes for SQL string literal
+                for (char c : child.text) {
+                    if (c == '\'') out += "''";
+                    else out += c;
+                }
+                out += "'";
+                break;
+            }
+            case XmlElement::Child::Interpolation:
+                render_parts(child.expr, out, /*nested=*/true);
+                break;
+            case XmlElement::Child::Element:
+                render_xml_element(*child.element, out, jsonml);
+                break;
+            }
+        }
+
+        out += ")";
+    }
+
     const FkIndex* fk_index_;
     Backend backend_;
     const char* fn_object_;
@@ -10227,4 +10670,457 @@ void sqldeep_free(void* ptr) {
     std::free(ptr);
 }
 
+} // extern "C"
+
+// ── sqldeep_xml (XML runtime for SQLite) ───────────────────────
+// Source: vendor/src/sqldeep_xml.c
+
+extern "C" {
+// Copyright 2026 Marcelo Cantos
+// SPDX-License-Identifier: Apache-2.0
+//
+// SQLite runtime implementations of xml_element, xml_attrs, and xml_agg.
+//
+// BLOB protocol: all XML output is returned as BLOB so xml_element can
+// distinguish "already-XML" children (pass through) from plain TEXT
+// (which must be escaped).  The caller uses CAST(... AS TEXT) to
+// convert the final result back to a string.
+
+
+#include <string.h>
+
+static int is_xml_blob(sqlite3_value *v) {
+    return sqlite3_value_type(v) == SQLITE_BLOB;
+}
+
+// ── Escaping helpers ────────────────────────────────────────────────
+
+static int xml_escaped_len(const char *s) {
+    int n = 0;
+    for (; *s; ++s) {
+        switch (*s) {
+        case '<': n += 4; break;
+        case '>': n += 4; break;
+        case '&': n += 5; break;
+        default:  n++; break;
+        }
+    }
+    return n;
+}
+
+static void xml_escape_text_to(const char *s, char *out, int *pos) {
+    for (; *s; ++s) {
+        switch (*s) {
+        case '<': memcpy(out + *pos, "&lt;", 4); *pos += 4; break;
+        case '>': memcpy(out + *pos, "&gt;", 4); *pos += 4; break;
+        case '&': memcpy(out + *pos, "&amp;", 5); *pos += 5; break;
+        default:  out[*pos] = *s; (*pos)++; break;
+        }
+    }
+}
+
+// ── xml_attrs(name1, value1, name2, value2, ...) ────────────────────
+
+static void sd_xml_attrs(sqlite3_context *ctx, int argc,
+                          sqlite3_value **argv) {
+    int i, len = 0;
+    if (argc % 2 != 0) {
+        sqlite3_result_error(ctx, "xml_attrs requires even number of args", -1);
+        return;
+    }
+    for (i = 0; i < argc; i += 2) {
+        const char *val;
+        if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
+        len += 1; /* space */
+        len += (int)strlen((const char *)sqlite3_value_text(argv[i]));
+        val = (const char *)sqlite3_value_text(argv[i + 1]);
+        len += 2 + xml_escaped_len(val); /* ="..." */
+    }
+    char *out = (char *)sqlite3_malloc(len + 1);
+    if (!out) { sqlite3_result_error_nomem(ctx); return; }
+    int pos = 0;
+    for (i = 0; i < argc; i += 2) {
+        const char *name, *val;
+        if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
+        name = (const char *)sqlite3_value_text(argv[i]);
+        val = (const char *)sqlite3_value_text(argv[i + 1]);
+        out[pos++] = ' ';
+        memcpy(out + pos, name, strlen(name));
+        pos += (int)strlen(name);
+        out[pos++] = '=';
+        out[pos++] = '"';
+        for (const char *p = val; *p; ++p) {
+            switch (*p) {
+            case '"': memcpy(out + pos, "&quot;", 6); pos += 6; break;
+            case '<': memcpy(out + pos, "&lt;", 4); pos += 4; break;
+            case '>': memcpy(out + pos, "&gt;", 4); pos += 4; break;
+            case '&': memcpy(out + pos, "&amp;", 5); pos += 5; break;
+            default:  out[pos++] = *p; break;
+            }
+        }
+        out[pos++] = '"';
+    }
+    out[pos] = '\0';
+    sqlite3_result_blob(ctx, out, pos, sqlite3_free);
+}
+
+// ── xml_element(tag, [attrs], ...children) ──────────────────────────
+
+static void sd_xml_element(sqlite3_context *ctx, int argc,
+                            sqlite3_value **argv) {
+    if (argc < 1) {
+        sqlite3_result_error(ctx, "xml_element requires at least 1 arg", -1);
+        return;
+    }
+    const char *tag = (const char *)sqlite3_value_text(argv[0]);
+    int taglen = (int)strlen(tag);
+    const char *attrs = "";
+    int attrslen = 0;
+    int child_start = 1;
+
+    if (argc > 1 && is_xml_blob(argv[1])) {
+        const char *a = (const char *)sqlite3_value_blob(argv[1]);
+        int alen = sqlite3_value_bytes(argv[1]);
+        if (alen > 0 && a[0] == ' ') {
+            attrs = a;
+            attrslen = alen;
+            child_start = 2;
+        }
+    }
+
+    int has_children = 0;
+    int children_len = 0;
+    for (int i = child_start; i < argc; ++i) {
+        if (sqlite3_value_type(argv[i]) == SQLITE_NULL) continue;
+        has_children = 1;
+        if (is_xml_blob(argv[i])) {
+            children_len += sqlite3_value_bytes(argv[i]);
+        } else {
+            const char *c = (const char *)sqlite3_value_text(argv[i]);
+            children_len += xml_escaped_len(c);
+        }
+    }
+
+    /* <tag attrs> children </tag> + NUL */
+    int outlen = 1 + taglen + attrslen +
+                 (has_children ? 1 + children_len + 2 + taglen + 1 : 2) + 1;
+    char *out = (char *)sqlite3_malloc(outlen);
+    if (!out) { sqlite3_result_error_nomem(ctx); return; }
+    int pos = 0;
+    out[pos++] = '<';
+    memcpy(out + pos, tag, taglen); pos += taglen;
+    memcpy(out + pos, attrs, attrslen); pos += attrslen;
+
+    if (has_children) {
+        out[pos++] = '>';
+        for (int i = child_start; i < argc; ++i) {
+            if (sqlite3_value_type(argv[i]) == SQLITE_NULL) continue;
+            if (is_xml_blob(argv[i])) {
+                int blen = sqlite3_value_bytes(argv[i]);
+                memcpy(out + pos, sqlite3_value_blob(argv[i]), blen);
+                pos += blen;
+            } else {
+                const char *c = (const char *)sqlite3_value_text(argv[i]);
+                xml_escape_text_to(c, out, &pos);
+            }
+        }
+        out[pos++] = '<';
+        out[pos++] = '/';
+        memcpy(out + pos, tag, taglen); pos += taglen;
+        out[pos++] = '>';
+    } else {
+        out[pos++] = '/';
+        out[pos++] = '>';
+    }
+    out[pos] = '\0';
+    sqlite3_result_blob(ctx, out, pos, sqlite3_free);
+}
+
+// ── xml_agg (aggregate) ─────────────────────────────────────────────
+
+typedef struct XmlAggCtx {
+    char *buf;
+    int len;
+    int cap;
+} XmlAggCtx;
+
+static void xml_agg_append(XmlAggCtx *p, const char *s, int n) {
+    if (p->len + n >= p->cap) {
+        int newcap = (p->cap + n) * 2 + 64;
+        p->buf = (char *)sqlite3_realloc(p->buf, newcap);
+        p->cap = newcap;
+    }
+    memcpy(p->buf + p->len, s, n);
+    p->len += n;
+}
+
+static void sd_xml_agg_step(sqlite3_context *ctx, int argc,
+                             sqlite3_value **argv) {
+    (void)argc;
+    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return;
+    XmlAggCtx *p = (XmlAggCtx *)sqlite3_aggregate_context(ctx, sizeof(*p));
+    if (!p) return;
+    if (is_xml_blob(argv[0])) {
+        int blen = sqlite3_value_bytes(argv[0]);
+        xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen);
+    } else {
+        const char *v = (const char *)sqlite3_value_text(argv[0]);
+        for (const char *c = v; *c; ++c) {
+            switch (*c) {
+            case '<': xml_agg_append(p, "&lt;", 4); break;
+            case '>': xml_agg_append(p, "&gt;", 4); break;
+            case '&': xml_agg_append(p, "&amp;", 5); break;
+            default: xml_agg_append(p, c, 1); break;
+            }
+        }
+    }
+}
+
+static void sd_xml_agg_final(sqlite3_context *ctx) {
+    XmlAggCtx *p = (XmlAggCtx *)sqlite3_aggregate_context(ctx, 0);
+    if (!p || !p->buf || p->len == 0) {
+        sqlite3_result_blob(ctx, "", 0, SQLITE_STATIC);
+        return;
+    }
+    sqlite3_result_blob(ctx, p->buf, p->len, sqlite3_free);
+}
+
+// ── JSON string escaping helper ──────────────────────────────────────
+
+static int json_escaped_len(const char *s, int n) {
+    int len = 0;
+    for (int i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"': case '\\': len += 2; break;
+        case '\b': case '\f': case '\n': case '\r': case '\t': len += 2; break;
+        default:
+            if (c < 0x20) len += 6; /* \uXXXX */
+            else len++;
+            break;
+        }
+    }
+    return len;
+}
+
+static void json_escape_to(const char *s, int n, char *out, int *pos) {
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"':  out[(*pos)++] = '\\'; out[(*pos)++] = '"'; break;
+        case '\\': out[(*pos)++] = '\\'; out[(*pos)++] = '\\'; break;
+        case '\b': out[(*pos)++] = '\\'; out[(*pos)++] = 'b'; break;
+        case '\f': out[(*pos)++] = '\\'; out[(*pos)++] = 'f'; break;
+        case '\n': out[(*pos)++] = '\\'; out[(*pos)++] = 'n'; break;
+        case '\r': out[(*pos)++] = '\\'; out[(*pos)++] = 'r'; break;
+        case '\t': out[(*pos)++] = '\\'; out[(*pos)++] = 't'; break;
+        default:
+            if (c < 0x20) {
+                out[(*pos)++] = '\\'; out[(*pos)++] = 'u';
+                out[(*pos)++] = '0'; out[(*pos)++] = '0';
+                out[(*pos)++] = hex[c >> 4]; out[(*pos)++] = hex[c & 0xf];
+            } else {
+                out[(*pos)++] = (char)c;
+            }
+            break;
+        }
+    }
+}
+
+// ── xml_attrs_jsonml(name1, value1, name2, value2, ...) ─────────────
+
+static void sd_xml_attrs_jsonml(sqlite3_context *ctx, int argc,
+                                 sqlite3_value **argv) {
+    int i, len = 2; /* {} */
+    int nattrs = 0;
+    if (argc % 2 != 0) {
+        sqlite3_result_error(ctx, "xml_attrs_jsonml requires even number of args", -1);
+        return;
+    }
+    for (i = 0; i < argc; i += 2) {
+        const char *name, *val;
+        int namelen, vallen;
+        if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
+        nattrs++;
+        name = (const char *)sqlite3_value_text(argv[i]);
+        namelen = (int)strlen(name);
+        val = (const char *)sqlite3_value_text(argv[i + 1]);
+        vallen = (int)strlen(val);
+        len += 2 + json_escaped_len(name, namelen); /* "name" */
+        len += 1; /* : */
+        len += 2 + json_escaped_len(val, vallen);   /* "val" */
+    }
+    if (nattrs > 1) len += nattrs - 1; /* commas */
+    char *out = (char *)sqlite3_malloc(len + 1);
+    if (!out) { sqlite3_result_error_nomem(ctx); return; }
+    int pos = 0;
+    int written = 0;
+    out[pos++] = '{';
+    for (i = 0; i < argc; i += 2) {
+        const char *name, *val;
+        int namelen, vallen;
+        if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
+        if (written++ > 0) out[pos++] = ',';
+        name = (const char *)sqlite3_value_text(argv[i]);
+        namelen = (int)strlen(name);
+        val = (const char *)sqlite3_value_text(argv[i + 1]);
+        vallen = (int)strlen(val);
+        out[pos++] = '"';
+        json_escape_to(name, namelen, out, &pos);
+        out[pos++] = '"';
+        out[pos++] = ':';
+        out[pos++] = '"';
+        json_escape_to(val, vallen, out, &pos);
+        out[pos++] = '"';
+    }
+    out[pos++] = '}';
+    out[pos] = '\0';
+    sqlite3_result_blob(ctx, out, pos, sqlite3_free);
+}
+
+// ── xml_element_jsonml(tag, [attrs], ...children) ───────────────────
+
+static void sd_xml_element_jsonml(sqlite3_context *ctx, int argc,
+                                   sqlite3_value **argv) {
+    if (argc < 1) {
+        sqlite3_result_error(ctx, "xml_element_jsonml requires at least 1 arg", -1);
+        return;
+    }
+    const char *tag = (const char *)sqlite3_value_text(argv[0]);
+    int taglen = (int)strlen(tag);
+    int child_start = 1;
+    const char *attrs = NULL;
+    int attrslen = 0;
+
+    /* Detect attrs BLOB: starts with '{' */
+    if (argc > 1 && is_xml_blob(argv[1])) {
+        const char *a = (const char *)sqlite3_value_blob(argv[1]);
+        int alen = sqlite3_value_bytes(argv[1]);
+        if (alen > 0 && a[0] == '{') {
+            attrs = a;
+            attrslen = alen;
+            child_start = 2;
+        }
+    }
+
+    /* Calculate output length: ["tag",{attrs},children...] */
+    int len = 1; /* [ */
+    len += 2 + json_escaped_len(tag, taglen); /* "tag" */
+    if (attrs) {
+        len += 1 + attrslen; /* ,{attrs} */
+    }
+    for (int i = child_start; i < argc; ++i) {
+        int blen;
+        if (sqlite3_value_type(argv[i]) == SQLITE_NULL) continue;
+        if (is_xml_blob(argv[i])) {
+            blen = sqlite3_value_bytes(argv[i]);
+            if (blen == 0) continue; /* empty agg result */
+            len += 1 + blen; /* comma + raw JSONML */
+        } else {
+            /* Text — JSON string */
+            const char *c = (const char *)sqlite3_value_text(argv[i]);
+            int clen = (int)strlen(c);
+            len += 1 + 2 + json_escaped_len(c, clen); /* comma + "..." */
+        }
+    }
+    len += 1; /* ] */
+
+    char *out = (char *)sqlite3_malloc(len + 1);
+    if (!out) { sqlite3_result_error_nomem(ctx); return; }
+    int pos = 0;
+    out[pos++] = '[';
+    out[pos++] = '"';
+    json_escape_to(tag, taglen, out, &pos);
+    out[pos++] = '"';
+    if (attrs) {
+        out[pos++] = ',';
+        memcpy(out + pos, attrs, attrslen);
+        pos += attrslen;
+    }
+    for (int i = child_start; i < argc; ++i) {
+        if (sqlite3_value_type(argv[i]) == SQLITE_NULL) continue;
+        if (is_xml_blob(argv[i])) {
+            int blen = sqlite3_value_bytes(argv[i]);
+            if (blen == 0) continue;
+            out[pos++] = ',';
+            memcpy(out + pos, sqlite3_value_blob(argv[i]), blen);
+            pos += blen;
+        } else {
+            const char *c = (const char *)sqlite3_value_text(argv[i]);
+            int clen = (int)strlen(c);
+            out[pos++] = ',';
+            out[pos++] = '"';
+            json_escape_to(c, clen, out, &pos);
+            out[pos++] = '"';
+        }
+    }
+    out[pos++] = ']';
+    out[pos] = '\0';
+    sqlite3_result_blob(ctx, out, pos, sqlite3_free);
+}
+
+// ── jsonml_agg (aggregate) ──────────────────────────────────────────
+// Collects JSONML fragments as comma-separated bytes in a BLOB.
+// xml_element_jsonml splices the result into its children.
+
+static void sd_jsonml_agg_step(sqlite3_context *ctx, int argc,
+                                sqlite3_value **argv) {
+    (void)argc;
+    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return;
+    XmlAggCtx *p = (XmlAggCtx *)sqlite3_aggregate_context(ctx, sizeof(*p));
+    if (!p) return;
+    if (p->len > 0) xml_agg_append(p, ",", 1);
+    if (is_xml_blob(argv[0])) {
+        int blen = sqlite3_value_bytes(argv[0]);
+        xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen);
+    } else {
+        /* Text child — emit as JSON string */
+        const char *v = (const char *)sqlite3_value_text(argv[0]);
+        int vlen = (int)strlen(v);
+        int elen = 2 + json_escaped_len(v, vlen);
+        /* Ensure capacity and write directly */
+        if (p->len + elen >= p->cap) {
+            int newcap = (p->cap + elen) * 2 + 64;
+            p->buf = (char *)sqlite3_realloc(p->buf, newcap);
+            p->cap = newcap;
+        }
+        p->buf[p->len++] = '"';
+        json_escape_to(v, vlen, p->buf, &p->len);
+        p->buf[p->len++] = '"';
+    }
+}
+
+static void sd_jsonml_agg_final(sqlite3_context *ctx) {
+    XmlAggCtx *p = (XmlAggCtx *)sqlite3_aggregate_context(ctx, 0);
+    if (!p || !p->buf || p->len == 0) {
+        sqlite3_result_blob(ctx, "", 0, SQLITE_STATIC);
+        return;
+    }
+    sqlite3_result_blob(ctx, p->buf, p->len, sqlite3_free);
+}
+
+// ── Public registration ─────────────────────────────────────────────
+
+int sqldeep_register_sqlite_xml(sqlite3 *db) {
+    int rc;
+    rc = sqlite3_create_function(db, "xml_element", -1, SQLITE_UTF8,
+                                 0, sd_xml_element, 0, 0);
+    if (rc != SQLITE_OK) return rc;
+    rc = sqlite3_create_function(db, "xml_attrs", -1, SQLITE_UTF8,
+                                 0, sd_xml_attrs, 0, 0);
+    if (rc != SQLITE_OK) return rc;
+    rc = sqlite3_create_function(db, "xml_agg", 1, SQLITE_UTF8,
+                                 0, 0, sd_xml_agg_step, sd_xml_agg_final);
+    if (rc != SQLITE_OK) return rc;
+    rc = sqlite3_create_function(db, "xml_element_jsonml", -1, SQLITE_UTF8,
+                                 0, sd_xml_element_jsonml, 0, 0);
+    if (rc != SQLITE_OK) return rc;
+    rc = sqlite3_create_function(db, "xml_attrs_jsonml", -1, SQLITE_UTF8,
+                                 0, sd_xml_attrs_jsonml, 0, 0);
+    if (rc != SQLITE_OK) return rc;
+    rc = sqlite3_create_function(db, "jsonml_agg", 1, SQLITE_UTF8,
+                                 0, 0, sd_jsonml_agg_step, sd_jsonml_agg_final);
+    return rc;
+}
 } // extern "C"

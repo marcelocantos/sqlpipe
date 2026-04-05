@@ -112,3 +112,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `facd91d`
 - **Outcome**: Released v0.19.0. Unified Database class with auto-migrating schema (sqlift), auto-transpiling queries (sqldeep), and RAII subscriptions. Single dist pair bundles sqlpipe + sqlift + sqldeep. Web demo with live subscriptions. Docs updated.
+
+## 2026-04-05 — /release v0.20.0
+
+- **Commit**: `a75ab05`
+- **Outcome**: Released v0.20.0. sqldeep 0.12.0 bundled with XML literal support — SQL queries produce HTML/JSONML directly via xml_element/xml_attrs/xml_agg functions. Dual output modes (HTML strings and JSONML for React component trees). XML functions auto-registered on Database handle.
