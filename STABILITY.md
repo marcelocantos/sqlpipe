@@ -26,24 +26,24 @@ API surface complexity:
 
 The clock starts from the last breaking change to the interaction surface.
 
-Current surface: ~100 items → 3 months. Last breaking change: v0.17.0
+Current surface: ~105 items → 3 months. Last breaking change: v0.17.0
 (Delivery/OutMessage/PeerOutMessage removed — all methods return Message/
 PeerMessage directly; FlushCallback/SinkCallback simplified, 2026-03-30).
 Eligible: 2026-06-30.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.19.0. Items annotated with stability assessments.
+Snapshot as of v0.20.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.19.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.20.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `19` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `20` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
-| `SQLDEEP_VERSION` | `"0.8.0"` | **Stable** (bundled) |
+| `SQLDEEP_VERSION` | `"0.12.0"` | **Stable** (bundled) |
 | `SQLIFT_VERSION` | `"0.12.0"` | **Stable** (bundled) |
 
 ### Type aliases
@@ -308,6 +308,9 @@ The following C APIs are bundled into `dist/sqlpipe.h` and available to consumer
 | `sqldeep_transpile_backend()` | **Stable** |
 | `sqldeep_transpile_fk_backend()` | **Stable** |
 | `sqldeep_version()` / `sqldeep_free()` | **Stable** |
+| `sqldeep_register_sqlite_xml(db)` | **Fluid** (new in v0.20.0) |
+| SQLite: `xml_element()`, `xml_attrs()`, `xml_agg()` | **Fluid** (new in v0.20.0, HTML string output) |
+| SQLite: `xml_element_jsonml()`, `xml_attrs_jsonml()`, `jsonml_agg()` | **Fluid** (new in v0.20.0, JSONML output) |
 | `sqlift_parse()` / `sqlift_diff()` / `sqlift_apply()` | **Stable** (matches sqlift 0.12.0) |
 | `sqlift_extract()` / `sqlift_db_wrap()` / `sqlift_db_close()` | **Stable** |
 | `sqlift_schema_hash()` / `sqlift_detect_redundant_indexes()` | **Stable** |

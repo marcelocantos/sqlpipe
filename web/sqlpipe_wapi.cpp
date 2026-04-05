@@ -418,6 +418,7 @@ EMSCRIPTEN_KEEPALIVE
 sqlite3* sqlpipe_db_open(const char* path) {
     sqlite3* db = nullptr;
     sqlite3_open(path, &db);
+    if (db) sqldeep_register_sqlite_xml(db);
     return db;
 }
 
