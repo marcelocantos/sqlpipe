@@ -3,20 +3,18 @@
 //
 // SQLite runtime implementations of xml_element, xml_attrs, and xml_agg.
 //
-// Sentinel protocol: all XML output is prefixed with '\x01' so xml_element
-// can distinguish "already-XML" children (pass through) from plain text
-// (which must be escaped).  The sentinel is stripped when the outermost
-// result is returned to the caller.
+// BLOB protocol: all XML output is returned as BLOB so xml_element can
+// distinguish "already-XML" children (pass through) from plain TEXT
+// (which must be escaped).  The caller uses CAST(... AS TEXT) to
+// convert the final result back to a string.
 
 #include "sqldeep_xml.h"
 
 #include <sqlite3.h>
 #include <string.h>
 
-static const char kXmlSentinel = '\x01';
-
-static int is_xml_sentinel(const char *s) {
-    return s && s[0] == kXmlSentinel;
+static int is_xml_blob(sqlite3_value *v) {
+    return sqlite3_value_type(v) == SQLITE_BLOB;
 }
 
 // ── Escaping helpers ────────────────────────────────────────────────
@@ -49,7 +47,7 @@ static void xml_escape_text_to(const char *s, char *out, int *pos) {
 
 static void sd_xml_attrs(sqlite3_context *ctx, int argc,
                           sqlite3_value **argv) {
-    int i, len = 1; /* sentinel */
+    int i, len = 0;
     if (argc % 2 != 0) {
         sqlite3_result_error(ctx, "xml_attrs requires even number of args", -1);
         return;
@@ -65,7 +63,6 @@ static void sd_xml_attrs(sqlite3_context *ctx, int argc,
     char *out = (char *)sqlite3_malloc(len + 1);
     if (!out) { sqlite3_result_error_nomem(ctx); return; }
     int pos = 0;
-    out[pos++] = kXmlSentinel;
     for (i = 0; i < argc; i += 2) {
         const char *name, *val;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
@@ -88,7 +85,7 @@ static void sd_xml_attrs(sqlite3_context *ctx, int argc,
         out[pos++] = '"';
     }
     out[pos] = '\0';
-    sqlite3_result_text(ctx, out, pos, sqlite3_free);
+    sqlite3_result_blob(ctx, out, pos, sqlite3_free);
 }
 
 // ── xml_element(tag, [attrs], ...children) ──────────────────────────
@@ -105,11 +102,12 @@ static void sd_xml_element(sqlite3_context *ctx, int argc,
     int attrslen = 0;
     int child_start = 1;
 
-    if (argc > 1) {
-        const char *a = (const char *)sqlite3_value_text(argv[1]);
-        if (is_xml_sentinel(a) && a[1] == ' ') {
-            attrs = a + 1;
-            attrslen = (int)strlen(attrs);
+    if (argc > 1 && is_xml_blob(argv[1])) {
+        const char *a = (const char *)sqlite3_value_blob(argv[1]);
+        int alen = sqlite3_value_bytes(argv[1]);
+        if (alen > 0 && a[0] == ' ') {
+            attrs = a;
+            attrslen = alen;
             child_start = 2;
         }
     }
@@ -117,24 +115,22 @@ static void sd_xml_element(sqlite3_context *ctx, int argc,
     int has_children = 0;
     int children_len = 0;
     for (int i = child_start; i < argc; ++i) {
-        const char *c;
         if (sqlite3_value_type(argv[i]) == SQLITE_NULL) continue;
         has_children = 1;
-        c = (const char *)sqlite3_value_text(argv[i]);
-        if (is_xml_sentinel(c)) {
-            children_len += (int)strlen(c + 1);
+        if (is_xml_blob(argv[i])) {
+            children_len += sqlite3_value_bytes(argv[i]);
         } else {
+            const char *c = (const char *)sqlite3_value_text(argv[i]);
             children_len += xml_escaped_len(c);
         }
     }
 
-    /* sentinel + <tag attrs> children </tag> + NUL */
-    int outlen = 1 + 1 + taglen + attrslen +
+    /* <tag attrs> children </tag> + NUL */
+    int outlen = 1 + taglen + attrslen +
                  (has_children ? 1 + children_len + 2 + taglen + 1 : 2) + 1;
     char *out = (char *)sqlite3_malloc(outlen);
     if (!out) { sqlite3_result_error_nomem(ctx); return; }
     int pos = 0;
-    out[pos++] = kXmlSentinel;
     out[pos++] = '<';
     memcpy(out + pos, tag, taglen); pos += taglen;
     memcpy(out + pos, attrs, attrslen); pos += attrslen;
@@ -142,14 +138,13 @@ static void sd_xml_element(sqlite3_context *ctx, int argc,
     if (has_children) {
         out[pos++] = '>';
         for (int i = child_start; i < argc; ++i) {
-            const char *c;
             if (sqlite3_value_type(argv[i]) == SQLITE_NULL) continue;
-            c = (const char *)sqlite3_value_text(argv[i]);
-            if (is_xml_sentinel(c)) {
-                int slen = (int)strlen(c + 1);
-                memcpy(out + pos, c + 1, slen);
-                pos += slen;
+            if (is_xml_blob(argv[i])) {
+                int blen = sqlite3_value_bytes(argv[i]);
+                memcpy(out + pos, sqlite3_value_blob(argv[i]), blen);
+                pos += blen;
             } else {
+                const char *c = (const char *)sqlite3_value_text(argv[i]);
                 xml_escape_text_to(c, out, &pos);
             }
         }
@@ -162,7 +157,7 @@ static void sd_xml_element(sqlite3_context *ctx, int argc,
         out[pos++] = '>';
     }
     out[pos] = '\0';
-    sqlite3_result_text(ctx, out, pos, sqlite3_free);
+    sqlite3_result_blob(ctx, out, pos, sqlite3_free);
 }
 
 // ── xml_agg (aggregate) ─────────────────────────────────────────────
@@ -189,10 +184,11 @@ static void sd_xml_agg_step(sqlite3_context *ctx, int argc,
     if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return;
     XmlAggCtx *p = (XmlAggCtx *)sqlite3_aggregate_context(ctx, sizeof(*p));
     if (!p) return;
-    const char *v = (const char *)sqlite3_value_text(argv[0]);
-    if (is_xml_sentinel(v)) {
-        xml_agg_append(p, v + 1, (int)strlen(v + 1));
+    if (is_xml_blob(argv[0])) {
+        int blen = sqlite3_value_bytes(argv[0]);
+        xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen);
     } else {
+        const char *v = (const char *)sqlite3_value_text(argv[0]);
         for (const char *c = v; *c; ++c) {
             switch (*c) {
             case '<': xml_agg_append(p, "&lt;", 4); break;
@@ -207,16 +203,10 @@ static void sd_xml_agg_step(sqlite3_context *ctx, int argc,
 static void sd_xml_agg_final(sqlite3_context *ctx) {
     XmlAggCtx *p = (XmlAggCtx *)sqlite3_aggregate_context(ctx, 0);
     if (!p || !p->buf || p->len == 0) {
-        sqlite3_result_text(ctx, "", 0, SQLITE_STATIC);
+        sqlite3_result_blob(ctx, "", 0, SQLITE_STATIC);
         return;
     }
-    char *out = (char *)sqlite3_malloc(1 + p->len + 1);
-    if (!out) { sqlite3_result_error_nomem(ctx); return; }
-    out[0] = kXmlSentinel;
-    memcpy(out + 1, p->buf, p->len);
-    out[1 + p->len] = '\0';
-    sqlite3_result_text(ctx, out, 1 + p->len, sqlite3_free);
-    sqlite3_free(p->buf);
+    sqlite3_result_blob(ctx, p->buf, p->len, sqlite3_free);
 }
 
 // ── Public registration ─────────────────────────────────────────────

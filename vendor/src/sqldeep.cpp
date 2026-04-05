@@ -1782,12 +1782,13 @@ public:
 
     std::string render_document(const SqlParts& parts) {
         std::string out;
-        render_parts(parts, out, /*nested=*/false);
+        render_parts(parts, out, /*nested=*/false, /*cast_xml=*/true);
         return out;
     }
 
 private:
-    void render_parts(const SqlParts& parts, std::string& out, bool nested) {
+    void render_parts(const SqlParts& parts, std::string& out, bool nested,
+                       bool cast_xml = false) {
         for (const auto& part : parts) {
             std::visit([&](const auto& v) {
                 using T = std::decay_t<decltype(v)>;
@@ -1804,7 +1805,9 @@ private:
                 } else if constexpr (std::is_same_v<T, std::unique_ptr<RecursiveSelect>>) {
                     render_recursive_select(*v, out);
                 } else if constexpr (std::is_same_v<T, std::unique_ptr<XmlElement>>) {
+                    if (cast_xml) out += "CAST(";
                     render_xml_element(*v, out);
+                    if (cast_xml) out += " AS TEXT)";
                 }
             }, part);
         }
@@ -1885,10 +1888,10 @@ private:
             } else if (f.aggregate) {
                 out += fn_group_array_;
                 out += "(";
-                render_parts(f.value, out, /*nested=*/true);
+                render_parts(f.value, out, /*nested=*/true, /*cast_xml=*/true);
                 out += ")";
             } else {
-                render_parts(f.value, out, /*nested=*/true);
+                render_parts(f.value, out, /*nested=*/true, /*cast_xml=*/true);
             }
         }
         out += ")";
@@ -1899,7 +1902,7 @@ private:
         out += "(";
         for (size_t i = 0; i < arr.elements.size(); ++i) {
             if (i > 0) out += ", ";
-            render_parts(arr.elements[i], out, /*nested=*/true);
+            render_parts(arr.elements[i], out, /*nested=*/true, /*cast_xml=*/true);
         }
         out += ")";
     }
