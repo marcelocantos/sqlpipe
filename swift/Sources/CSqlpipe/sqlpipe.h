@@ -11,10 +11,12 @@
 // Converts sqldeep extended SQL syntax to standard SQL.
 // Integrated into Database::exec/query/subscribe automatically.
 
-#define SQLDEEP_VERSION       "0.8.0"
+#define SQLDEEP_VERSION       "0.10.0"
 #define SQLDEEP_VERSION_MAJOR 0
-#define SQLDEEP_VERSION_MINOR 8
+#define SQLDEEP_VERSION_MINOR 10
 #define SQLDEEP_VERSION_PATCH 0
+
+typedef struct sqlite3 sqlite3;
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,6 +59,10 @@ char* sqldeep_transpile_fk_backend(const char* input, sqldeep_backend backend,
 const char* sqldeep_version(void);
 void sqldeep_free(void* ptr);
 
+/// Register xml_element, xml_attrs, and xml_agg on a SQLite connection.
+/// Called automatically by Database constructor. Returns SQLITE_OK on success.
+int sqldeep_register_sqlite_xml(sqlite3* db);
+
 #ifdef __cplusplus
 }
 #endif
@@ -74,8 +80,6 @@ void sqldeep_free(void* ptr);
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-typedef struct sqlite3 sqlite3;
 
 enum sqlift_error_type {
     SQLIFT_OK               = 0,

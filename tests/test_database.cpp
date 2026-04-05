@@ -197,3 +197,31 @@ TEST_CASE("database: sqldeep mixed columns with object literal") {
     CHECK(json.find("Widget") != std::string::npos);
     CHECK(json.find("10") != std::string::npos);
 }
+
+TEST_CASE("database: sqldeep XML literals") {
+    Database db(":memory:",
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)");
+    db.exec("INSERT INTO items VALUES (1, 'Widget', 10)");
+    db.exec("INSERT INTO items VALUES (2, 'Gadget', 25)");
+
+    // xml_element output has a \x01 sentinel prefix; strip it for assertions.
+    auto strip = [](const std::string& s) {
+        return (!s.empty() && s[0] == '\x01') ? s.substr(1) : s;
+    };
+
+    // XML element with dynamic content.
+    auto r = db.query("SELECT <li>{name}</li> FROM items WHERE id = 1");
+    REQUIRE(r.rows.size() == 1);
+    CHECK(strip(std::get<std::string>(r.rows[0][0])) == "<li>Widget</li>");
+
+    // XML with attributes.
+    auto r2 = db.query("SELECT <span class=\"price\">{qty}</span> FROM items WHERE id = 2");
+    REQUIRE(r2.rows.size() == 1);
+    CHECK(strip(std::get<std::string>(r2.rows[0][0])) == "<span class=\"price\">25</span>");
+
+    // Escaping: name with special chars.
+    db.exec("INSERT INTO items VALUES (3, '<b>Bold</b>', 5)");
+    auto r3 = db.query("SELECT <td>{name}</td> FROM items WHERE id = 3");
+    REQUIRE(r3.rows.size() == 1);
+    CHECK(strip(std::get<std::string>(r3.rows[0][0])).find("&lt;b&gt;") != std::string::npos);
+}
