@@ -303,8 +303,9 @@ using SqlParts = std::vector<SqlPart>;
 struct ObjectLiteral {
     struct Field {
         std::string key;
+        std::string qualified_value; // non-empty = qualified bare field (sm.repo)
         SqlParts computed_key; // non-empty = (expr) computed key
-        SqlParts value; // empty = bare field
+        SqlParts value; // empty = bare field (uses key or qualified_value)
         bool aggregate = false; // SELECT expr (no FROM) → json_group_array(expr)
         bool recursive = false; // * = recurse with same shape
     };
@@ -329,12 +330,14 @@ struct JoinPath {
     std::vector<Step> steps;
 };
 
+enum class XmlMode { Xml, Jsonml, Jsx };
+
 struct DeepSelect {
     std::variant<ObjectLiteral, ArrayLiteral, SqlParts> projection;
     SqlParts tail;
-    bool singular = false;    // SELECT/1: no json_group_array, add LIMIT 1
-    bool xml_context = false;    // true = use xml_agg instead of json_group_array
-    bool jsonml_context = false; // true = use jsonml_agg instead of xml_agg
+    bool singular = false;      // SELECT/1: no json_group_array, add LIMIT 1
+    bool xml_context = false;   // true = use xml/jsonml/jsx agg
+    XmlMode xml_mode = XmlMode::Xml;
 };
 
 struct RecursiveSelect {
@@ -364,8 +367,92 @@ struct XmlElement {
     };
     std::vector<Child> children;
     bool self_closing = false;
-    bool jsonml = false;  // true = emit _jsonml variant functions
+    XmlMode mode = XmlMode::Xml;
 };
+
+// ── XML dedent ─────────────────────────────────────────────────────
+//
+// Multi-line XML literals carry source indentation in their text
+// children.  xml_dedent strips the common leading-space prefix from
+// all lines that follow a newline, so the output reflects relative
+// indentation only.
+
+static int xml_min_indent(const XmlElement& el) {
+    int min_indent = INT_MAX;
+    for (const auto& child : el.children) {
+        if (child.kind == XmlElement::Child::Text) {
+            const std::string& t = child.text;
+            size_t i = 0;
+            while (i < t.size()) {
+                size_t nl = t.find('\n', i);
+                if (nl == std::string::npos) break;
+                size_t ls = nl + 1;
+                int sp = 0;
+                while (ls + sp < t.size() && t[ls + sp] == ' ') ++sp;
+                // Skip only lines that are blank between two newlines.
+                // Lines that end at the text boundary still carry
+                // meaningful indentation (before a child element or
+                // closing tag).
+                if (ls + sp < t.size() && t[ls + sp] == '\n') {
+                    i = ls;
+                    continue;  // blank interior line
+                }
+                min_indent = std::min(min_indent, sp);
+                i = ls;
+            }
+        } else if (child.kind == XmlElement::Child::Element) {
+            min_indent = std::min(min_indent, xml_min_indent(*child.element));
+        }
+    }
+    return min_indent;
+}
+
+static void xml_strip_indent(XmlElement& el, int n) {
+    for (auto& child : el.children) {
+        if (child.kind == XmlElement::Child::Text) {
+            std::string out;
+            size_t i = 0;
+            while (i < child.text.size()) {
+                size_t nl = child.text.find('\n', i);
+                if (nl == std::string::npos) {
+                    out.append(child.text, i, std::string::npos);
+                    break;
+                }
+                out.append(child.text, i, nl - i + 1); // include \n
+                size_t ls = nl + 1;
+                int stripped = 0;
+                while (stripped < n && ls + stripped < child.text.size() &&
+                       child.text[ls + stripped] == ' ')
+                    ++stripped;
+                i = ls + stripped;
+            }
+            child.text = std::move(out);
+        } else if (child.kind == XmlElement::Child::Element) {
+            xml_strip_indent(*child.element, n);
+        }
+    }
+}
+
+static void xml_dedent(XmlElement& el) {
+    int n = xml_min_indent(el);
+    if (n > 0 && n < INT_MAX) xml_strip_indent(el, n);
+}
+
+// In JSON/XML value contexts, wrap a standalone true/false token as
+// sqldeep_json('true')/sqldeep_json('false') so it is returned as a
+// BLOB carrying JSON boolean semantics rather than integer 1/0.
+static void wrap_json_bool(SqlParts& parts) {
+    if (parts.size() != 1) return;
+    auto* s = std::get_if<std::string>(&parts[0]);
+    if (!s || s->size() < 4 || s->size() > 5) return;
+    // Case-insensitive check
+    std::string lower;
+    lower.reserve(s->size());
+    for (char c : *s)
+        lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "true")       *s = "sqldeep_json('true')";
+    else if (lower == "false") *s = "sqldeep_json('false')";
+}
 
 // ── Parser ──────────────────────────────────────────────────────────
 
@@ -708,6 +795,10 @@ private:
             if (!accum.empty()) {
                 parts.push_back(std::move(accum));
                 accum.clear();
+                // Invalidate paren-start positions that referred into the
+                // flushed accum — they're no longer meaningful.
+                for (auto& ps : accum_paren_starts)
+                    ps = SIZE_MAX;
             }
             has_raw = false;
         };
@@ -721,7 +812,8 @@ private:
         };
 
         bool need_space = false; // space needed after a non-string AST part
-        bool in_from_context = false; // true after FROM/JOIN at depth 0
+        bool in_from_context = false; // true after FROM/JOIN in current scope
+        std::vector<bool> from_context_stack; // saved per paren scope
 
         auto accum_token = [&](const Token& tok) {
             if (has_raw) {
@@ -761,8 +853,8 @@ private:
                 break;
             }
 
-            // Check for (SELECT {/[) pattern — subquery with deep construct
-            if (t.type == TokenType::LParen && paren_depth == 0) {
+            // Check for (SELECT {/[) or (FROM ... SELECT {/[) pattern
+            if (t.type == TokenType::LParen) {
                 auto st = lex_.save();
                 lex_.next(); // consume (
                 Token t2 = lex_.peek();
@@ -781,7 +873,12 @@ private:
                         Token rp = lex_.next(); // consume )
                         if (rp.type != TokenType::RParen)
                             lex_.error("expected ')' after subquery", rp.line, rp.col);
+                        // At paren_depth > 0, we consumed explicit (...)
+                        // so emit parens — the renderer won't add them
+                        // because the part is at the top of a SqlParts.
+                        if (paren_depth > 0) parts.push_back(std::string("("));
                         parts.push_back(std::move(part));
+                        if (paren_depth > 0) parts.push_back(std::string(")"));
                         last_end = rp.src_end;
                         need_space = true;
                         continue;
@@ -816,7 +913,9 @@ private:
                         }
                         parts.push_back(std::string(")"));
                     } else {
+                        if (paren_depth > 0) parts.push_back(std::string("("));
                         parts.push_back(std::move(ds));
+                        if (paren_depth > 0) parts.push_back(std::string(")"));
                     }
                     last_end = rp.src_end;
                     need_space = true;
@@ -827,9 +926,8 @@ private:
                 lex_.restore(st);
             }
 
-            // Check for SELECT[/1] {/[ at depth 0 (top-level deep select)
-            if (is_keyword(t, "SELECT") && paren_depth == 0 &&
-                !stop_at_select) {
+            // Check for SELECT[/1] {/[/xml at any depth
+            if (is_keyword(t, "SELECT") && !stop_at_select) {
                 auto st = lex_.save();
                 lex_.next(); // consume SELECT
                 bool singular = try_consume_singular();
@@ -848,7 +946,24 @@ private:
                     need_space = true;
                     continue;
                 }
-                // Not deep — restore and accumulate SELECT as raw SQL
+                if (singular) {
+                    // SELECT/1 without {/[ — parse rest as plain SELECT
+                    // with LIMIT 1. Emit "SELECT" as raw SQL and let
+                    // the expression (XML, wrapper, etc.) be parsed by
+                    // subsequent handlers; append LIMIT 1 at the end.
+                    flush_before(t);
+                    auto rest = parse_sql_parts(stop_comma, stop_rbrace,
+                                                stop_rbracket, stop_rparen,
+                                                depth);
+                    parts.push_back(std::string("SELECT "));
+                    for (auto& p : rest)
+                        parts.push_back(std::move(p));
+                    parts.push_back(std::string(" LIMIT 1"));
+                    last_end = lex_.offset();
+                    need_space = true;
+                    continue;
+                }
+                // Not deep, not singular — restore and accumulate
                 lex_.restore(st);
             }
 
@@ -859,8 +974,7 @@ private:
             }
 
             // Check for FROM-first: FROM ... SELECT {/[
-            if (is_keyword(t, "FROM") && paren_depth == 0 &&
-                !stop_at_select) {
+            if (is_keyword(t, "FROM") && !stop_at_select) {
                 if (is_from_first(stop_comma, stop_rbrace,
                                   stop_rbracket, stop_rparen)) {
                     flush_before(t);
@@ -875,8 +989,9 @@ private:
                 }
             }
 
-            // Check for inline { or [ at depth 0
-            if (paren_depth == 0 && t.type == TokenType::LBrace) {
+            // Check for inline { or [ (object/array literals).
+            // Valid at any paren depth — e.g. json_group_array({name, value}).
+            if (t.type == TokenType::LBrace) {
                 flush_before(t);
                 auto obj = parse_object_literal(depth + 1);
                 parts.push_back(std::move(obj));
@@ -885,7 +1000,7 @@ private:
                 continue;
             }
 
-            if (paren_depth == 0 && t.type == TokenType::LBracket) {
+            if (t.type == TokenType::LBracket) {
                 flush_before(t);
                 auto arr = parse_array_literal(depth + 1);
                 parts.push_back(std::move(arr));
@@ -894,10 +1009,12 @@ private:
                 continue;
             }
 
-            // Check for xml_to_jsonml(<...>)
-            if (t.type == TokenType::Ident && t.text == "xml_to_jsonml") {
+            // Check for jsx(<...>), jsonml(<...>)
+            if (t.type == TokenType::Ident &&
+                (t.text == "jsx" || t.text == "jsonml")) {
+                XmlMode wrapper_mode = (t.text == "jsx") ? XmlMode::Jsx : XmlMode::Jsonml;
                 auto st = lex_.save();
-                lex_.next(); // consume xml_to_jsonml
+                lex_.next(); // consume wrapper name
                 Token t2 = lex_.peek();
                 if (t2.type == TokenType::LParen) {
                     lex_.next(); // consume (
@@ -910,10 +1027,11 @@ private:
                             lex_.restore(st2); // put back < ident
                             flush_before(t);
                             auto el = parse_xml_element(depth + 1,
-                                                        /*jsonml=*/true);
+                                                        wrapper_mode);
+                            xml_dedent(*el);
                             Token close = lex_.peek();
                             if (close.type != TokenType::RParen)
-                                lex_.error("expected ')' after xml_to_jsonml",
+                                lex_.error("expected ')' after XML wrapper",
                                            close.line, close.col);
                             lex_.next(); // consume )
                             parts.push_back(std::move(el));
@@ -927,9 +1045,9 @@ private:
                 lex_.restore(st);
             }
 
-            // Check for XML element: < followed by ident (tag name)
-            if (paren_depth == 0 &&
-                t.type == TokenType::Other && t.text == "<") {
+            // Check for XML element: < followed by ident (tag name).
+            // Unambiguous at any depth — < cannot start a SQL expression.
+            if (t.type == TokenType::Other && t.text == "<") {
                 auto st = lex_.save();
                 lex_.next(); // consume <
                 Token t2 = lex_.peek();
@@ -937,6 +1055,7 @@ private:
                     lex_.restore(st);
                     flush_before(t);
                     auto el = parse_xml_element(depth + 1);
+                    xml_dedent(*el);
                     parts.push_back(std::move(el));
                     last_end = lex_.offset();
                     need_space = true;
@@ -945,17 +1064,25 @@ private:
                 lex_.restore(st);
             }
 
-            // Track paren depth
-            if (t.type == TokenType::LParen) ++paren_depth;
+            // Track paren depth with per-scope FROM context
+            if (t.type == TokenType::LParen) {
+                ++paren_depth;
+                from_context_stack.push_back(in_from_context);
+                in_from_context = false; // new scope starts outside FROM
+            }
             if (t.type == TokenType::RParen) {
                 if (paren_depth == 0)
                     lex_.error("unmatched ')'", t.line, t.col);
                 --paren_depth;
+                if (!from_context_stack.empty()) {
+                    in_from_context = from_context_stack.back();
+                    from_context_stack.pop_back();
+                }
             }
 
             // Track FROM context for join path detection.
             // -> and <- are only join operators after FROM/JOIN.
-            if (paren_depth == 0 && t.type == TokenType::Ident) {
+            if (t.type == TokenType::Ident) {
                 if (is_from_or_join(t)) {
                     in_from_context = true;
                 } else if (is_keyword(t, "SELECT") || is_keyword(t, "WHERE") ||
@@ -968,8 +1095,7 @@ private:
             }
 
             // Check for ident (-> | <-) ... (join path) — only in FROM context
-            if (t.type == TokenType::Ident && paren_depth == 0 &&
-                in_from_context) {
+            if (t.type == TokenType::Ident && in_from_context) {
                 auto st = lex_.save();
                 Token alias_tok = lex_.next(); // consume ident
                 Token arrow = lex_.peek();
@@ -1032,7 +1158,8 @@ private:
                 if (!accum_paren_starts.empty()) {
                     size_t start = accum_paren_starts.back();
                     accum_paren_starts.pop_back();
-                    if (try_transform_json_path(accum, start))
+                    if (start != SIZE_MAX &&
+                        try_transform_json_path(accum, start))
                         last_end = lex_.offset();
                 }
             } else {
@@ -1223,6 +1350,31 @@ private:
             key = lex_.next();
             if (key.type == TokenType::Ident) {
                 field.key = key.text;
+                // Qualified bare field: sm.repo → key="repo", value="sm.repo"
+                // Look ahead for .ident chains before the colon check.
+                std::string qualified;
+                while (true) {
+                    Token dot = lex_.peek();
+                    if (dot.type != TokenType::Other || dot.text != ".") break;
+                    auto st = lex_.save();
+                    lex_.next(); // consume .
+                    Token next = lex_.peek();
+                    if (next.type != TokenType::Ident) {
+                        lex_.restore(st);
+                        break;
+                    }
+                    lex_.next(); // consume ident
+                    if (qualified.empty()) {
+                        qualified = field.key + "." + next.text;
+                    } else {
+                        qualified += "." + next.text;
+                    }
+                    field.key = next.text; // key is always the last component
+                }
+                if (!qualified.empty()) {
+                    // Stash the full qualified name as the value
+                    field.qualified_value = qualified;
+                }
             } else if (key.type == TokenType::DqString) {
                 // Strip outer quotes and unescape \" → " and \\ → \.
                 auto raw = key.text.substr(1, key.text.size() - 2);
@@ -1276,6 +1428,7 @@ private:
                     if (field.value.empty())
                         lex_.error("expected expression after 'SELECT'",
                                    t2.line, t2.col);
+                    wrap_json_bool(field.value);
                     return field;
                 }
                 // SELECT {/[ — restore and fall through to normal parsing
@@ -1289,6 +1442,7 @@ private:
                                           depth);
             if (field.value.empty())
                 lex_.error("expected expression after ':'", t.line, t.col);
+            wrap_json_bool(field.value);
         }
 
         return field;
@@ -1315,6 +1469,7 @@ private:
                                         depth);
             if (elem.empty())
                 lex_.error("expected expression in array literal");
+            wrap_json_bool(elem);
             arr->elements.push_back(std::move(elem));
 
             t = lex_.peek();
@@ -1354,14 +1509,14 @@ private:
     }
 
     std::unique_ptr<XmlElement> parse_xml_element(int depth,
-                                                     bool jsonml = false) {
+                                                     XmlMode xml_mode = XmlMode::Xml) {
         Token lt = lex_.next(); // consume <
         if (lt.type != TokenType::Other || lt.text != "<")
             lex_.error("expected '<'", lt.line, lt.col);
         check_depth(depth, lt.line, lt.col);
 
         auto el = std::make_unique<XmlElement>();
-        el->jsonml = jsonml;
+        el->mode = xml_mode;
         el->tag = parse_xml_tag_name();
 
         // Parse attributes until > or />
@@ -1395,9 +1550,9 @@ private:
 
             Token eq = lex_.peek();
             if (eq.type != TokenType::Other || eq.text != "=") {
-                // Boolean attribute: emit name as value (disabled="disabled")
+                // Boolean attribute: emit sqldeep_json('true') so xml_attrs renders bare name
                 SqlParts val;
-                val.push_back(std::string("'") + attr_name + "'");
+                val.push_back(std::string("sqldeep_json('true')"));
                 el->attrs.push_back({attr_name, std::move(val), false});
                 continue;
             }
@@ -1424,6 +1579,7 @@ private:
                 if (rb.type != TokenType::RBrace)
                     lex_.error("expected '}' after attribute expression",
                                rb.line, rb.col);
+                wrap_json_bool(expr);
                 el->attrs.push_back({attr_name, std::move(expr), true});
             } else {
                 lex_.error("expected '\"...' or '{...}' after '='",
@@ -1475,7 +1631,7 @@ private:
                     lex_.restore(st);
                     XmlElement::Child child;
                     child.kind = XmlElement::Child::Element;
-                    child.element = parse_xml_element(depth + 1, jsonml);
+                    child.element = parse_xml_element(depth + 1, xml_mode);
                     el->children.push_back(std::move(child));
                     continue;
                 }
@@ -1515,7 +1671,7 @@ private:
                         Token t4 = lex_.peek();
                         lex_.restore(st2);
                         if (t4.type == TokenType::Ident) {
-                            auto xml_el = parse_xml_element(depth + 1, jsonml);
+                            auto xml_el = parse_xml_element(depth + 1, xml_mode);
                             SqlParts proj;
                             proj.push_back(std::move(xml_el));
 
@@ -1531,7 +1687,7 @@ private:
                             ds->tail = std::move(tail);
                             ds->singular = singular;
                             ds->xml_context = true;
-                            ds->jsonml_context = jsonml;
+                            ds->xml_mode = xml_mode;
 
                             Token rb = lex_.next();
                             if (rb.type != TokenType::RBrace)
@@ -1583,11 +1739,31 @@ private:
                     ds->projection = std::move(proj);
                     ds->singular = singular;
                     ds->xml_context = true;
-                    ds->jsonml_context = jsonml;
+                    ds->xml_mode = xml_mode;
 
                     Token rb = lex_.next();
                     if (rb.type != TokenType::RBrace)
                         lex_.error("expected '}' after subquery",
+                                   rb.line, rb.col);
+                    XmlElement::Child child;
+                    child.kind = XmlElement::Child::Interpolation;
+                    child.expr.push_back(std::move(ds));
+                    el->children.push_back(std::move(child));
+                    continue;
+                }
+
+                // {FROM ... SELECT ...} — FROM-first subquery inside XML
+                if (is_keyword(t2, "FROM") &&
+                    is_from_first(false, true, false, false)) {
+                    auto ds = parse_from_first_select(
+                        /*stop_comma=*/false, /*stop_rbrace=*/true,
+                        /*stop_rbracket=*/false, /*stop_rparen=*/false,
+                        depth + 1);
+                    ds->xml_context = true;
+                    ds->xml_mode = xml_mode;
+                    Token rb = lex_.next();
+                    if (rb.type != TokenType::RBrace)
+                        lex_.error("expected '}' after FROM-first subquery",
                                    rb.line, rb.col);
                     XmlElement::Child child;
                     child.kind = XmlElement::Child::Interpolation;
@@ -1606,6 +1782,7 @@ private:
                 if (rb.type != TokenType::RBrace)
                     lex_.error("expected '}' after interpolation",
                                rb.line, rb.col);
+                wrap_json_bool(expr);
                 XmlElement::Child child;
                 child.kind = XmlElement::Child::Interpolation;
                 child.expr = std::move(expr);
@@ -1721,9 +1898,9 @@ private:
             }
             accum += ")";
         } else {
-            accum += "json_extract(";
+            accum += "json_extract(CAST((";
             accum += base;
-            accum += ", '$";
+            accum += ") AS TEXT), '$";
             for (const auto& seg : segs) {
                 if (seg.is_field) {
                     accum += ".";
@@ -1812,22 +1989,21 @@ public:
             fn_group_array_ = "jsonb_agg";
             break;
         default:
-            fn_object_      = "json_object";
-            fn_array_       = "json_array";
-            fn_group_array_ = "json_group_array";
+            fn_object_      = "sqldeep_json_object";
+            fn_array_       = "sqldeep_json_array";
+            fn_group_array_ = "sqldeep_json_group_array";
             break;
         }
     }
 
     std::string render_document(const SqlParts& parts) {
         std::string out;
-        render_parts(parts, out, /*nested=*/false, /*cast_xml=*/true);
+        render_parts(parts, out, /*nested=*/false);
         return out;
     }
 
 private:
-    void render_parts(const SqlParts& parts, std::string& out, bool nested,
-                       bool cast_xml = false) {
+    void render_parts(const SqlParts& parts, std::string& out, bool nested) {
         for (const auto& part : parts) {
             std::visit([&](const auto& v) {
                 using T = std::decay_t<decltype(v)>;
@@ -1844,9 +2020,7 @@ private:
                 } else if constexpr (std::is_same_v<T, std::unique_ptr<RecursiveSelect>>) {
                     render_recursive_select(*v, out);
                 } else if constexpr (std::is_same_v<T, std::unique_ptr<XmlElement>>) {
-                    if (cast_xml) out += "CAST(";
                     render_xml_element(*v, out);
-                    if (cast_xml) out += " AS TEXT)";
                 }
             }, part);
         }
@@ -1858,7 +2032,11 @@ private:
             if (nested) out += "(";
             out += "SELECT ";
             if (ds.xml_context && !ds.singular) {
-                out += ds.jsonml_context ? "jsonml_agg(" : "xml_agg(";
+                switch (ds.xml_mode) {
+                case XmlMode::Jsx:    out += "jsx_agg(";    break;
+                case XmlMode::Jsonml: out += "jsonml_agg("; break;
+                default:              out += "xml_agg(";    break;
+                }
                 render_parts(std::get<SqlParts>(ds.projection), out, true);
                 out += ")";
             } else {
@@ -1923,14 +2101,16 @@ private:
             }
             out += ", ";
             if (f.value.empty()) {
-                out += f.key;
+                out += f.qualified_value.empty() ? f.key : f.qualified_value;
             } else if (f.aggregate) {
                 out += fn_group_array_;
                 out += "(";
-                render_parts(f.value, out, /*nested=*/true, /*cast_xml=*/true);
+                // No CAST inside custom JSON functions — they handle
+                // BLOBs natively (SQLite) or N/A (PostgreSQL).
+                render_parts(f.value, out, /*nested=*/true);
                 out += ")";
             } else {
-                render_parts(f.value, out, /*nested=*/true, /*cast_xml=*/true);
+                render_parts(f.value, out, /*nested=*/true);
             }
         }
         out += ")";
@@ -1941,7 +2121,7 @@ private:
         out += "(";
         for (size_t i = 0; i < arr.elements.size(); ++i) {
             if (i > 0) out += ", ";
-            render_parts(arr.elements[i], out, /*nested=*/true, /*cast_xml=*/true);
+            render_parts(arr.elements[i], out, /*nested=*/true);
         }
         out += ")";
     }
@@ -2026,7 +2206,7 @@ private:
             std::string col = f.value.empty() ? f.key : f.key; // column name
             std::string expr;
             if (f.value.empty()) {
-                expr = f.key; // bare field
+                expr = f.qualified_value.empty() ? f.key : f.qualified_value;
             } else {
                 // For renamed fields, the value is the SQL expression
                 std::string val_str;
@@ -2129,13 +2309,28 @@ private:
     }
 
     void render_xml_element(const XmlElement& el, std::string& out,
-                             bool jsonml_override = false) {
-        bool jsonml = el.jsonml || jsonml_override;
-        const char* fn_element = jsonml ? "xml_element_jsonml('" : "xml_element('";
-        const char* fn_attrs = jsonml ? ", xml_attrs_jsonml(" : ", xml_attrs(";
+                             XmlMode mode_override = XmlMode::Xml) {
+        XmlMode mode = (el.mode != XmlMode::Xml) ? el.mode : mode_override;
+        const char* fn_element;
+        const char* fn_attrs;
+        switch (mode) {
+        case XmlMode::Jsx:
+            fn_element = "xml_element_jsx('";
+            fn_attrs = ", xml_attrs_jsx(";
+            break;
+        case XmlMode::Jsonml:
+            fn_element = "xml_element_jsonml('";
+            fn_attrs = ", xml_attrs_jsonml(";
+            break;
+        default:
+            fn_element = "xml_element('";
+            fn_attrs = ", xml_attrs(";
+            break;
+        }
 
         out += fn_element;
         out += el.tag;
+        if (el.self_closing) out += "/";
         out += "'";
 
         // Attributes
@@ -2146,11 +2341,7 @@ private:
                 out += "'";
                 out += el.attrs[i].name;
                 out += "', ";
-                if (el.attrs[i].is_dynamic) {
-                    render_parts(el.attrs[i].value, out, /*nested=*/true);
-                } else {
-                    render_parts(el.attrs[i].value, out, /*nested=*/true);
-                }
+                render_parts(el.attrs[i].value, out, /*nested=*/true);
             }
             out += ")";
         }
@@ -2173,7 +2364,7 @@ private:
                 render_parts(child.expr, out, /*nested=*/true);
                 break;
             case XmlElement::Child::Element:
-                render_xml_element(*child.element, out, jsonml);
+                render_xml_element(*child.element, out, mode);
                 break;
             }
         }

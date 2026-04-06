@@ -59,11 +59,6 @@ class Database {
 public:
     explicit Database(const std::string& path,
                       int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
-
-    /// Borrow an existing sqlite3* handle. The caller retains ownership;
-    /// the Database will NOT close it on destruction.
-    explicit Database(sqlite3* db) : db_(db), owned_(false) {}
-
     ~Database();
 
     Database(Database&& other) noexcept;
@@ -78,7 +73,6 @@ public:
 
 private:
     sqlite3* db_ = nullptr;
-    bool owned_ = true;
 };
 
 // RAII wrapper for sqlite3_stmt*.
@@ -321,22 +315,18 @@ Database::Database(const std::string& path, int flags) {
 }
 
 Database::~Database() {
-    if (db_ && owned_) sqlite3_close(db_);
+    if (db_) sqlite3_close(db_);
 }
 
-Database::Database(Database&& other) noexcept
-    : db_(other.db_), owned_(other.owned_) {
+Database::Database(Database&& other) noexcept : db_(other.db_) {
     other.db_ = nullptr;
-    other.owned_ = false;
 }
 
 Database& Database::operator=(Database&& other) noexcept {
     if (this != &other) {
-        if (db_ && owned_) sqlite3_close(db_);
+        if (db_) sqlite3_close(db_);
         db_ = other.db_;
-        owned_ = other.owned_;
         other.db_ = nullptr;
-        other.owned_ = false;
     }
     return *this;
 }
@@ -2435,7 +2425,6 @@ struct sqlift_db {
     sqlift::Database db;
     explicit sqlift_db(const std::string& path, int flags)
         : db(path, flags ? flags : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)) {}
-    explicit sqlift_db(sqlite3* handle) : db(handle) {}
 };
 
 // --- C API -------------------------------------------------------------------
@@ -2451,12 +2440,6 @@ sqlift_db* sqlift_db_open(const char* path, int flags,
         set_error(err_type, err_msg, classify_exception(e), e.what());
         return nullptr;
     }
-}
-
-// Wrap an existing sqlite3* handle. The caller retains ownership;
-// sqlift_db_close will NOT close the underlying handle.
-sqlift_db* sqlift_db_wrap(sqlite3* handle) {
-    return new sqlift_db(handle);
 }
 
 void sqlift_db_close(sqlift_db* db) {

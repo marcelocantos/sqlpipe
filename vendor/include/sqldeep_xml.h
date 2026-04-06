@@ -3,11 +3,15 @@
 
 #pragma once
 
-// sqldeep XML runtime functions for SQLite.
+// sqldeep runtime functions for SQLite.
 //
-// Registers xml_element(), xml_attrs(), and xml_agg() as custom SQLite
-// functions. These are the runtime counterparts to the XML literal syntax
-// that the sqldeep transpiler emits.
+// Registers all custom SQLite functions that the sqldeep transpiler emits:
+// xml_element, xml_attrs, xml_agg (and _jsonml/_jsx variants),
+// sqldeep_json, sqldeep_json_object, sqldeep_json_array,
+// sqldeep_json_group_array.
+//
+// All structured values use a pure BLOB protocol — no SQLite subtypes.
+// BLOBs starting with '<' are XML; all others are JSON.
 //
 // Requires sqlite3.h to be available at compile time and the SQLite library
 // at link time.
@@ -18,7 +22,7 @@
 extern "C" {
 #endif
 
-// Register xml_element, xml_attrs, and xml_agg on the given connection.
+// Register all sqldeep runtime functions on the given connection.
 // Returns SQLITE_OK on success.
 int sqldeep_register_sqlite_xml(sqlite3* db);
 

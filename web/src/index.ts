@@ -94,17 +94,20 @@ function unregisterAll(M: WasmModule, fns: RegisteredFn[]): void {
 export class Database {
   /** @internal */ readonly _M: WasmModule;
   /** @internal */ readonly _ptr: number;
+  /** @internal */ readonly _transpile: (sql: string) => string;
 
   /** @internal */
-  constructor(M: WasmModule, ptr: number) {
+  constructor(M: WasmModule, ptr: number, transpile: (sql: string) => string) {
     this._M = M;
     this._ptr = ptr;
+    this._transpile = transpile;
   }
 
-  /** Execute SQL (no result). Throws on error. */
+  /** Execute SQL (no result). Auto-transpiles sqldeep syntax. Throws on error. */
   exec(sql: string): void {
+    const tsql = this._transpile(sql);
     const rc = withStack(this._M, () =>
-      this._M._sqlpipe_db_exec(this._ptr, this._M.stringToUTF8OnStack(sql))
+      this._M._sqlpipe_db_exec(this._ptr, this._M.stringToUTF8OnStack(tsql))
     );
     if (rc !== 0) {
       const msg = this._M.UTF8ToString(this._M._sqlpipe_db_errmsg(this._ptr));
@@ -112,13 +115,14 @@ export class Database {
     }
   }
 
-  /** Execute a one-shot SQL query and return the result set. */
+  /** Execute a one-shot SQL query and return the result set. Auto-transpiles sqldeep syntax. */
   query(sql: string): QueryResult {
+    const tsql = this._transpile(sql);
     const errPtr = this._M._malloc(8);
     const bufPtr = this._M._malloc(8);
     try {
       withStack(this._M, () => {
-        this._M._sqlpipe_db_query(this._ptr, this._M.stringToUTF8OnStack(sql),
+        this._M._sqlpipe_db_query(this._ptr, this._M.stringToUTF8OnStack(tsql),
                                    bufPtr, errPtr);
       });
       checkError(this._M, errPtr);
@@ -586,7 +590,7 @@ export class Sqlpipe {
       this._M._sqlpipe_db_open(this._M.stringToUTF8OnStack(path))
     );
     if (!ptr) throw new SqlpipeError(1, `failed to open database: ${path}`);
-    return new Database(this._M, ptr);
+    return new Database(this._M, ptr, (sql) => this.transpile(sql));
   }
 
   createMaster(db: Database, config?: MasterConfig): Master {

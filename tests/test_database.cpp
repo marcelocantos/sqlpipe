@@ -148,6 +148,15 @@ TEST_CASE("database: query returns correct columns") {
     CHECK(std::get<std::string>(r.rows[0][1]) == "Alice");
 }
 
+// Helper to extract string from a Value that may be TEXT or BLOB.
+static std::string value_to_string(const Value& v) {
+    if (auto* s = std::get_if<std::string>(&v)) return *s;
+    if (auto* b = std::get_if<std::vector<std::uint8_t>>(&v))
+        return std::string(b->begin(), b->end());
+    FAIL("expected TEXT or BLOB");
+    return {};
+}
+
 TEST_CASE("database: sqldeep transpilation is automatic") {
     Database db(":memory:",
         "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)");
@@ -157,8 +166,7 @@ TEST_CASE("database: sqldeep transpilation is automatic") {
     // sqldeep object syntax: SELECT {col, col} → json_object(...)
     auto r = db.query("SELECT {id, name, qty} FROM items ORDER BY id");
     REQUIRE(r.rows.size() == 2);
-    // The result should be a JSON string from json_object().
-    auto& val = std::get<std::string>(r.rows[0][0]);
+    auto val = value_to_string(r.rows[0][0]);
     CHECK(val.find("Widget") != std::string::npos);
 }
 
@@ -171,7 +179,7 @@ TEST_CASE("database: sqldeep subscription works") {
         [&](const QueryResult& r) {
             fired++;
             if (!r.rows.empty()) {
-                last_json = std::get<std::string>(r.rows[0][0]);
+                last_json = value_to_string(r.rows[0][0]);
             }
         });
     CHECK(fired == 1); // initial (empty)
@@ -192,8 +200,8 @@ TEST_CASE("database: sqldeep mixed columns with object literal") {
     REQUIRE(r.rows.size() == 2);
     // First column should be the plain id.
     CHECK(std::get<int64_t>(r.rows[0][0]) == 1);
-    // Second column should be a JSON object string.
-    auto& json = std::get<std::string>(r.rows[0][1]);
+    // Second column should be a JSON object (TEXT or BLOB).
+    auto json = value_to_string(r.rows[0][1]);
     CHECK(json.find("Widget") != std::string::npos);
     CHECK(json.find("10") != std::string::npos);
 }
@@ -207,16 +215,16 @@ TEST_CASE("database: sqldeep XML literals") {
     // XML element with dynamic content.
     auto r = db.query("SELECT <li>{name}</li> FROM items WHERE id = 1");
     REQUIRE(r.rows.size() == 1);
-    CHECK(std::get<std::string>(r.rows[0][0]) == "<li>Widget</li>");
+    CHECK(value_to_string(r.rows[0][0]) == "<li>Widget</li>");
 
     // XML with attributes.
     auto r2 = db.query("SELECT <span class=\"price\">{qty}</span> FROM items WHERE id = 2");
     REQUIRE(r2.rows.size() == 1);
-    CHECK(std::get<std::string>(r2.rows[0][0]) == "<span class=\"price\">25</span>");
+    CHECK(value_to_string(r2.rows[0][0]) == "<span class=\"price\">25</span>");
 
     // Escaping: name with special chars.
     db.exec("INSERT INTO items VALUES (3, '<b>Bold</b>', 5)");
     auto r3 = db.query("SELECT <td>{name}</td> FROM items WHERE id = 3");
     REQUIRE(r3.rows.size() == 1);
-    CHECK(std::get<std::string>(r3.rows[0][0]).find("&lt;b&gt;") != std::string::npos);
+    CHECK(value_to_string(r3.rows[0][0]).find("&lt;b&gt;") != std::string::npos);
 }

@@ -461,4 +461,17 @@
 - **Status**: identified
 - **Discovered**: 2026-04-03
 
+### 🎯T12 Diff sync performance is characterised and acceptable at scale
+- **Weight**: 3 (value 8 / cost 3)
+- **Estimated-cost**: 3
+- **Acceptance**:
+  - Benchmark suite covering diff sync with 1k, 10k, 100k, and 1M rows
+  - Diff sync with 10k rows and no differences completes in under 1 second
+  - Diff sync with 10k rows and continuous writes (1 write/500ms) converges within 5 seconds
+  - Reconnect after accumulating 10k rows while disconnected completes diff sync without stalling
+  - Results documented with baseline numbers for regression tracking
+- **Context**: The SRE dashboard demo revealed that diff sync stalls when the dataset grows during a session (the server generates data continuously, and reconnecting a replica triggers a diff sync that may never converge if writes continue during the handshake). The bucket hashing protocol is designed for O(d+b) efficiency, but the interaction between ongoing writes and the multi-round-trip handshake needs validation. Flush-during-handshake may be the root cause.
+- **Status**: identified
+- **Discovered**: 2026-04-06
+
 ## Achieved
