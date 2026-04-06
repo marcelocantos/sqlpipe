@@ -471,7 +471,7 @@
   - Reconnect after accumulating 10k rows while disconnected completes diff sync without stalling
   - Results documented with baseline numbers for regression tracking
 - **Context**: The SRE dashboard demo revealed that diff sync stalls when the dataset grows during a session (the server generates data continuously, and reconnecting a replica triggers a diff sync that may never converge if writes continue during the handshake). The bucket hashing protocol is designed for O(d+b) efficiency, but the interaction between ongoing writes and the multi-round-trip handshake needs validation. Flush-during-handshake may be the root cause.
-- **Status**: identified
+- **Status**: converging — baseline benchmarks pass (10k in-sync: 11ms, 10k 1%-diff: 29ms, 100k in-sync: 96ms). Remaining: 1M rows, continuous-writes-during-sync, and reconnect-after-disconnect scenarios.
 - **Discovered**: 2026-04-06
 
 ## Achieved
