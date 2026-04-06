@@ -1,6 +1,6 @@
 # Targets
 
-<!-- last-evaluated: eff507fdd6922c4df1a1f84f5c870328128023f7 -->
+<!-- last-evaluated: 03775ef -->
 
 ## Active
 
@@ -21,11 +21,11 @@
 - **Weight**: 4 (value 13 / cost 3)
 - **Estimated-cost**: 3
 - **Acceptance**:
-  - 4 consecutive stable minor releases with no breaking wire/API changes, OR 4 months elapsed since v0.7.0 (2026-03-04)
+  - 3-month settling period with no breaking wire/API changes (per STABILITY.md surface-item scale)
   - All "must fix" items resolved (currently clear)
   - STABILITY.md documents the stability guarantee
   - v1.0.0 tag and GitHub release published
-- **Context**: 1.0 signals production readiness and API stability. The settling threshold prevents premature commitment. Last breaking change was v0.7.0 (protocol v5, sqlift structural schema hashing, 2026-03-04).
+- **Context**: 1.0 signals production readiness and API stability. The settling threshold prevents premature commitment. Last breaking change was v0.17.0 (Delivery/OutMessage/PeerOutMessage removed, FlushCallback/SinkCallback simplified, 2026-03-30). Eligible: 2026-06-30.
 - **Gates**: 🎯T1
 - **Status**: identified
 - **Discovered**: 2026-03-12
