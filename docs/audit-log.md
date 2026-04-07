@@ -117,3 +117,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `a75ab05`
 - **Outcome**: Released v0.20.0. sqldeep 0.12.0 bundled with XML literal support — SQL queries produce HTML/JSONML directly via xml_element/xml_attrs/xml_agg functions. Dual output modes (HTML strings and JSONML for React component trees). XML functions auto-registered on Database handle.
+
+## 2026-04-07 — /release v0.21.0
+
+- **Commit**: `b995c49`
+- **Outcome**: Released v0.21.0. Diff sync performance benchmark suite (🎯T12) — 6 scenarios covering 10k–1M rows, continuous writes during handshake, and reconnect after disconnect. All pass well under acceptance criteria. Submodule vendoring for sqldeep/sqlift.
