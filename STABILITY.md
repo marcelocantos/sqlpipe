@@ -33,17 +33,17 @@ Eligible: 2026-06-30.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.20.0. Items annotated with stability assessments.
+Snapshot as of v0.21.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.20.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.21.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `20` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `21` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
-| `SQLDEEP_VERSION` | `"0.12.0"` | **Stable** (bundled) |
+| `SQLDEEP_VERSION` | `"0.13.0"` | **Stable** (bundled) |
 | `SQLIFT_VERSION` | `"0.12.0"` | **Stable** (bundled) |
 
 ### Type aliases
