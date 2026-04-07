@@ -1,3 +1,9 @@
 [submodule "vendor/github.com/sqliteai/liteparser"]
 	path = vendor/github.com/sqliteai/liteparser
 	url = https://github.com/sqliteai/liteparser.git
+[submodule "vendor/github.com/marcelocantos/sqlift"]
+	path = vendor/github.com/marcelocantos/sqlift
+	url = https://github.com/marcelocantos/sqlift.git
+[submodule "vendor/github.com/marcelocantos/sqldeep"]
+	path = vendor/github.com/marcelocantos/sqldeep
+	url = https://github.com/marcelocantos/sqldeep.git

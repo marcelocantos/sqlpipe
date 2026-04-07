@@ -11,9 +11,9 @@
 // Converts sqldeep extended SQL syntax to standard SQL.
 // Integrated into Database::exec/query/subscribe automatically.
 
-#define SQLDEEP_VERSION       "0.12.0"
+#define SQLDEEP_VERSION       "0.13.0"
 #define SQLDEEP_VERSION_MAJOR 0
-#define SQLDEEP_VERSION_MINOR 12
+#define SQLDEEP_VERSION_MINOR 13
 #define SQLDEEP_VERSION_PATCH 0
 
 typedef struct sqlite3 sqlite3;

@@ -1,6 +1,6 @@
 # Targets
 
-<!-- last-evaluated: eff507fdd6922c4df1a1f84f5c870328128023f7 -->
+<!-- last-evaluated: 03775ef -->
 
 ## Active
 
@@ -21,11 +21,11 @@
 - **Weight**: 4 (value 13 / cost 3)
 - **Estimated-cost**: 3
 - **Acceptance**:
-  - 4 consecutive stable minor releases with no breaking wire/API changes, OR 4 months elapsed since v0.7.0 (2026-03-04)
+  - 3-month settling period with no breaking wire/API changes (per STABILITY.md surface-item scale)
   - All "must fix" items resolved (currently clear)
   - STABILITY.md documents the stability guarantee
   - v1.0.0 tag and GitHub release published
-- **Context**: 1.0 signals production readiness and API stability. The settling threshold prevents premature commitment. Last breaking change was v0.7.0 (protocol v5, sqlift structural schema hashing, 2026-03-04).
+- **Context**: 1.0 signals production readiness and API stability. The settling threshold prevents premature commitment. Last breaking change was v0.17.0 (Delivery/OutMessage/PeerOutMessage removed, FlushCallback/SinkCallback simplified, 2026-03-30). Eligible: 2026-06-30.
 - **Gates**: 🎯T1
 - **Status**: identified
 - **Discovered**: 2026-03-12
@@ -460,5 +460,19 @@
 - **Parent**: 🎯T11.6
 - **Status**: identified
 - **Discovered**: 2026-04-03
+
+### 🎯T12 Diff sync performance is characterised and acceptable at scale
+- **Weight**: 3 (value 8 / cost 3)
+- **Estimated-cost**: 3
+- **Acceptance**:
+  - Benchmark suite covering diff sync with 1k, 10k, 100k, and 1M rows
+  - Diff sync with 10k rows and no differences completes in under 1 second
+  - Diff sync with 10k rows and continuous writes (1 write/500ms) converges within 5 seconds
+  - Reconnect after accumulating 10k rows while disconnected completes diff sync without stalling
+  - Results documented with baseline numbers for regression tracking
+- **Context**: The SRE dashboard demo revealed that diff sync stalls when the dataset grows during a session (the server generates data continuously, and reconnecting a replica triggers a diff sync that may never converge if writes continue during the handshake). The bucket hashing protocol is designed for O(d+b) efficiency, but the interaction between ongoing writes and the multi-round-trip handshake needs validation. Flush-during-handshake may be the root cause.
+- **Status**: achieved — all scenarios pass well under budget. 10k in-sync: 11ms, 10k 1%-diff: 29ms, 100k in-sync: 96ms, 1M in-sync: 959ms, continuous writes during handshake: 2.2ms (converges with 7 mid-handshake writes), reconnect after 10k accumulated: 109ms.
+- **Discovered**: 2026-04-06
+- **Achieved**: 2026-04-07
 
 ## Achieved
