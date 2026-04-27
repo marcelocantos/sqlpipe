@@ -1,6 +1,7 @@
 # ── Toolchain ────────────────────────────────────────────────────────
-cc  = cc
-cxx = c++ -std=c++23
+ccache = $[shell command -v ccache 2>/dev/null]
+cc  = $ccache cc
+cxx = $ccache c++ -std=c++23
 ar  = ar
 
 sqlite_flags = -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE
