@@ -7,9 +7,9 @@
 // C API for FFI consumers (cgo, etc.). Data interchange is JSON strings.
 // Callers must free returned strings with sqlift_free().
 
-#define SQLIFT_VERSION "0.12.0"
+#define SQLIFT_VERSION "0.13.0"
 #define SQLIFT_VERSION_MAJOR 0
-#define SQLIFT_VERSION_MINOR 12
+#define SQLIFT_VERSION_MINOR 13
 #define SQLIFT_VERSION_PATCH 0
 
 #include <stdint.h>
@@ -30,7 +30,35 @@ enum sqlift_error_type {
     SQLIFT_DESTRUCTIVE_ERROR = 7,
     SQLIFT_BREAKING_CHANGE_ERROR = 8,
     SQLIFT_JSON_ERROR       = 9,
+    SQLIFT_REBUILD_ERROR    = 10,
 };
+
+// Atomic permission bits for sqlift_apply_options.allow.
+// Adding a new bit is a non-breaking change: callers that don't set it
+// inherit the safe (deny) behaviour.
+
+// Allow RebuildTable operations (SQLite's 12-step table rebuild).
+// Required for any table change beyond appending nullable / DEFAULTed
+// columns -- e.g. column type change, dropping a CHECK/FK constraint,
+// reordering columns. Rebuilds are expensive on large tables.
+#define SQLIFT_ALLOW_REBUILD     (1u << 0)
+
+// Allow operations that drop data: DropTable, DropColumn (via rebuild),
+// and DropIndex/DropView/DropTrigger when the object is removed entirely.
+#define SQLIFT_ALLOW_DESTRUCTIVE (1u << 1)
+
+// Themed combinations.
+#define SQLIFT_ALLOW_NONE        0u
+#define SQLIFT_ALLOW_ALL         (SQLIFT_ALLOW_REBUILD | SQLIFT_ALLOW_DESTRUCTIVE)
+
+// Options controlling sqlift_apply policy. All fields default to 0 (deny).
+// Zero-init with `(sqlift_apply_options){0}` (C99) or `{}` (C++) for the
+// strictest defaults: only pure additions (CREATE, ADD COLUMN) and benign
+// reorderings are permitted; rebuilds and destructive ops are rejected.
+typedef struct sqlift_apply_options {
+    // Bitmask of SQLIFT_ALLOW_* flags. 0 = deny everything (strictest).
+    unsigned int allow;
+} sqlift_apply_options;
 
 // Opaque database handle.
 typedef struct sqlift_db sqlift_db;
@@ -58,8 +86,11 @@ char* sqlift_diff(const char* current_json, const char* desired_json,
                   int* err_type, char** err_msg);
 
 // Apply a migration plan (JSON) to a database.
+// `opts` controls policy gates; pass `{}` (C++) or `(sqlift_apply_options){0}`
+// (C99) for strictest defaults.
 // Returns 0 on success, non-zero on error.
-int sqlift_apply(sqlift_db* db, const char* plan_json, int allow_destructive,
+int sqlift_apply(sqlift_db* db, const char* plan_json,
+                 const sqlift_apply_options opts,
                  int* err_type, char** err_msg);
 
 // Return the migration version counter (0 if no migrations have run).

@@ -52,6 +52,10 @@ class JsonError : public Error {
     using Error::Error;
 };
 
+class RebuildError : public Error {
+    using Error::Error;
+};
+
 // --- sqlite_util.h ---
 
 // RAII wrapper for sqlite3*.
@@ -243,6 +247,7 @@ struct Operation {
     std::string description;
     std::vector<std::string> sql;
     bool destructive = false;
+    bool requires_rebuild = false;
 };
 
 class MigrationPlan {
@@ -250,6 +255,7 @@ public:
     const std::vector<Operation>& operations() const { return ops_; }
     const std::vector<Warning>& warnings() const { return warnings_; }
     bool has_destructive_operations() const;
+    bool has_rebuild_operations() const;
     bool empty() const { return ops_.empty(); }
 
 private:
@@ -267,6 +273,7 @@ std::vector<Warning> detect_redundant_indexes(const Schema& schema);
 
 struct ApplyOptions {
     bool allow_destructive = false;
+    bool allow_rebuild = false;
 };
 
 void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts = {});
@@ -1340,6 +1347,11 @@ bool MigrationPlan::has_destructive_operations() const {
                        [](const Operation& op) { return op.destructive; });
 }
 
+bool MigrationPlan::has_rebuild_operations() const {
+    return std::any_of(ops_.begin(), ops_.end(),
+                       [](const Operation& op) { return op.requires_rebuild; });
+}
+
 MigrationPlan diff(const Schema& current, const Schema& desired) {
     MigrationPlan plan;
 
@@ -1578,6 +1590,7 @@ MigrationPlan diff(const Schema& current, const Schema& desired) {
                 .description = describe_table_changes(current_table, desired_table),
                 .sql = rebuild_table_sql(current_table, desired_table, desired),
                 .destructive = rebuild_is_destructive(current_table, desired_table),
+                .requires_rebuild = true,
             });
         }
     }
@@ -1892,10 +1905,16 @@ std::string load_schema_hash(sqlite3* db) {
 void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts) {
     if (plan.empty()) return;
 
+    if (plan.has_rebuild_operations() && !opts.allow_rebuild) {
+        throw RebuildError(
+            "Migration plan contains table rebuild operations. "
+            "Set allow_rebuild=true to proceed.");
+    }
+
     if (plan.has_destructive_operations() && !opts.allow_destructive) {
         throw DestructiveError(
             "Migration plan contains destructive operations. "
-            "Set allow_destructive=true to proceed.");
+            "Set SQLIFT_ALLOW_DESTRUCTIVE in opts.allow to proceed.");
     }
 
     // Check for drift
@@ -2041,6 +2060,7 @@ std::string to_json(const MigrationPlan& plan) {
         jop["description"] = op.description;
         jop["sql"] = op.sql;
         jop["destructive"] = op.destructive;
+        jop["requires_rebuild"] = op.requires_rebuild;
         ops.push_back(std::move(jop));
     }
 
@@ -2111,6 +2131,16 @@ MigrationPlan from_json(const std::string& json_str) {
         if (!jop.contains("destructive") || !jop["destructive"].is_boolean())
             throw JsonError("Operation missing 'destructive' boolean field");
         op.destructive = jop["destructive"].get<bool>();
+
+        // requires_rebuild is optional for forward-compat with older plan JSON;
+        // default to true for RebuildTable ops, false otherwise, when absent.
+        if (jop.contains("requires_rebuild")) {
+            if (!jop["requires_rebuild"].is_boolean())
+                throw JsonError("Operation 'requires_rebuild' must be boolean");
+            op.requires_rebuild = jop["requires_rebuild"].get<bool>();
+        } else {
+            op.requires_rebuild = (op.type == OpType::RebuildTable);
+        }
 
         // Validate SQL prefix matches OpType
         if (!op.sql.empty()) {
@@ -2393,6 +2423,7 @@ int classify_exception(const std::exception& e) {
     if (dynamic_cast<const sqlift::DriftError*>(&e))          return SQLIFT_DRIFT_ERROR;
     if (dynamic_cast<const sqlift::DestructiveError*>(&e))    return SQLIFT_DESTRUCTIVE_ERROR;
     if (dynamic_cast<const sqlift::BreakingChangeError*>(&e)) return SQLIFT_BREAKING_CHANGE_ERROR;
+    if (dynamic_cast<const sqlift::RebuildError*>(&e))        return SQLIFT_REBUILD_ERROR;
     if (dynamic_cast<const sqlift::JsonError*>(&e))           return SQLIFT_JSON_ERROR;
     if (dynamic_cast<const sqlift::ApplyError*>(&e))          return SQLIFT_APPLY_ERROR;
     if (dynamic_cast<const sqlift::Error*>(&e))               return SQLIFT_ERROR;
@@ -2494,13 +2525,15 @@ char* sqlift_diff(const char* current_json, const char* desired_json,
     }
 }
 
-int sqlift_apply(sqlift_db* db, const char* plan_json, int allow_destructive,
+int sqlift_apply(sqlift_db* db, const char* plan_json,
+                 const sqlift_apply_options c_opts,
                  int* err_type, char** err_msg) {
     clear_error(err_type, err_msg);
     try {
         auto plan = sqlift::from_json(plan_json);
         sqlift::ApplyOptions opts;
-        opts.allow_destructive = (allow_destructive != 0);
+        opts.allow_destructive = (c_opts.allow & SQLIFT_ALLOW_DESTRUCTIVE) != 0;
+        opts.allow_rebuild = (c_opts.allow & SQLIFT_ALLOW_REBUILD) != 0;
         sqlift::apply(db->db, plan, opts);
         return 0;
     } catch (const std::exception& e) {

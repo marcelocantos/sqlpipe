@@ -1,3 +1,4 @@
+schema_version: 3
 last_evaluated: 03775ef
 targets:
   T1:
@@ -425,6 +426,39 @@ targets:
     origin: manual
     discovered: 2026-04-06
     achieved: 2026-04-07
+  T13:
+    name: sqlpipe Go wrapper exposes FTS5, sqlift Go bindings, and automatic sqldeep transpilation so Go consumers can use the same Database API the C++ side already provides
+    status: identified
+    value: 0.0
+    cost: 0.0
+    showcase: true
+    acceptance:
+    - 'go/sqlpipe/wrapper.go cgo CFLAGS/CXXFLAGS include -DSQLITE_ENABLE_FTS5; a test creates a virtual FTS5 table via OpenDatabase and inserts/queries successfully (currently fails with ''no such module: fts5'').'
+    - 'Go-level sqlift binding exists: OpenDatabase(path, schemaDDL) constructor that mirrors the C++ Database(path, schema_ddl) sqlift-driven migration, or an explicit (*Database).Migrate(schemaDDL string) error method calling sqlift_db_wrap → sqlift_extract → sqlift_parse(desired) → sqlift_diff → sqlift_apply with the destructive-op guard exposed.'
+    - sqldeep transpilation is applied inside Database.Exec / Database.Query / Database.Rows by default, mirroring the C++ Impl::transpile path. A test confirms a sqldeep-syntax SQL string (e.g. FROM ... SELECT { ... }) executes correctly via the Go API.
+    - Go tests cover the new surface (FTS5, sqlift Migrate, sqldeep transpile-on-exec). go test ./go/sqlpipe/... is green.
+    - sqlpipe's Go module is re-tagged (go/sqlpipe/vX.Y.0 + root vX.Y.0) so downstream consumers can go get the new API.
+    context: |-
+      Discovered 2026-04-29 while attempting mnemo 🎯T26 (adopt sqlpipe.Database as mnemo's SQLite layer). The sqlpipe Go wrapper currently exposes only OpenDatabase(path) with raw Exec/Query/Rows — none of the value-add features (FTS5, sqlift, sqldeep) that the C++ side provides. Without those, mnemo cannot adopt sqlpipe at all.
+
+      Verified empirically by the T26 surveyor agent:
+
+      1. FTS5 missing. OpenDatabase(":memory:") then CREATE VIRTUAL TABLE t USING fts5(content) fails with 'no such module: fts5'. The vendored amalgamation go/sqlpipe/internal/c/sqlite3.c contains FTS5 code, but go/sqlpipe/wrapper.go lines 7-8 do not pass -DSQLITE_ENABLE_FTS5. mnemo uses FTS5 in 16+ tables — non-negotiable.
+
+      2. sqlift bindings not exposed. Symbols (sqlift_db_wrap, sqlift_extract, sqlift_diff, sqlift_apply, sqlift_parse, sqlift_free) are bundled into go/sqlpipe/internal/c/sqlpipe.h and linked, but no Go wrapper exists. The C++ sqlpipe::Database(path, schema_ddl) constructor that does the migration work via sqlift (dist/sqlpipe.cpp lines 4390-4465) is unreachable from Go — sqlpipe.OpenDatabase(path) only takes a path.
+
+      3. sqldeep transpilation absent. The C++ Database::exec/query/subscribe route through Impl::transpile (sqlpipe.cpp lines 4472, 4485, 4490). The Go wrapper's Exec/Query/Rows go straight to sqlite3_exec / sqlite3_prepare_v2 without transpilation. To meet mnemo 🎯T26 acceptance criterion 4 (sqldeep transpilation active on all queries), every Exec/Query path needs transpilation by default.
+
+      Estimated effort: ~1 focused session of careful C++/Go/cgo work plus tests and a re-tag. Downstream impact: unblocks mnemo 🎯T26 (adopt sqlpipe.Database). Without this, T26 cannot proceed without forking sqlpipe or re-implementing the bindings inline in mnemo.
+    tags:
+    - go-api
+    - fts5
+    - sqlift
+    - sqldeep
+    - cgo
+    - downstream:mnemo
+    origin: Discovered 2026-04-29 during mnemo 🎯T26 survey — sqlpipe Go wrapper missing FTS5, sqlift, sqldeep auto-transpile that mnemo needs to adopt sqlpipe.Database
+    discovered: 2026-04-29
   T2:
     name: sqlpipe reaches 1.0
     status: identified

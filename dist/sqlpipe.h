@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#define SQLPIPE_VERSION       "0.21.0"
+#define SQLPIPE_VERSION       "0.22.0"
 #define SQLPIPE_VERSION_MAJOR 0
-#define SQLPIPE_VERSION_MINOR 21
+#define SQLPIPE_VERSION_MINOR 22
 #define SQLPIPE_VERSION_PATCH 0
 
 // ── Bundled: sqldeep (query transpiler) ─────────────────────────
@@ -70,9 +70,9 @@ int sqldeep_register_sqlite_xml(sqlite3* db);
 // ── Bundled: sqlift (schema migration) ──────────────────────────
 // Declarative SQLite schema diffing and migration.
 
-#define SQLIFT_VERSION       "0.12.0"
+#define SQLIFT_VERSION       "0.13.0"
 #define SQLIFT_VERSION_MAJOR 0
-#define SQLIFT_VERSION_MINOR 12
+#define SQLIFT_VERSION_MINOR 13
 #define SQLIFT_VERSION_PATCH 0
 
 #include <stdint.h>
@@ -92,7 +92,18 @@ enum sqlift_error_type {
     SQLIFT_DESTRUCTIVE_ERROR = 7,
     SQLIFT_BREAKING_CHANGE_ERROR = 8,
     SQLIFT_JSON_ERROR       = 9,
+    SQLIFT_REBUILD_ERROR    = 10,
 };
+
+// Atomic permission bits for sqlift_apply_options.allow.
+#define SQLIFT_ALLOW_REBUILD     (1u << 0)
+#define SQLIFT_ALLOW_DESTRUCTIVE (1u << 1)
+#define SQLIFT_ALLOW_NONE        0u
+#define SQLIFT_ALLOW_ALL         (SQLIFT_ALLOW_REBUILD | SQLIFT_ALLOW_DESTRUCTIVE)
+
+typedef struct sqlift_apply_options {
+    unsigned int allow;
+} sqlift_apply_options;
 
 typedef struct sqlift_db sqlift_db;
 
@@ -105,7 +116,8 @@ char* sqlift_parse(const char* ddl, int* err_type, char** err_msg);
 char* sqlift_extract(sqlift_db* db, int* err_type, char** err_msg);
 char* sqlift_diff(const char* current_json, const char* desired_json,
                   int* err_type, char** err_msg);
-int sqlift_apply(sqlift_db* db, const char* plan_json, int allow_destructive,
+int sqlift_apply(sqlift_db* db, const char* plan_json,
+                 const sqlift_apply_options opts,
                  int* err_type, char** err_msg);
 int64_t sqlift_migration_version(sqlift_db* db, int* err_type, char** err_msg);
 char* sqlift_detect_redundant_indexes(const char* schema_json,
