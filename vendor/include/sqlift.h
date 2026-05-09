@@ -7,9 +7,9 @@
 // C API for FFI consumers (cgo, etc.). Data interchange is JSON strings.
 // Callers must free returned strings with sqlift_free().
 
-#define SQLIFT_VERSION "0.13.0"
+#define SQLIFT_VERSION "0.14.0"
 #define SQLIFT_VERSION_MAJOR 0
-#define SQLIFT_VERSION_MINOR 13
+#define SQLIFT_VERSION_MINOR 14
 #define SQLIFT_VERSION_PATCH 0
 
 #include <stdint.h>
@@ -47,9 +47,24 @@ enum sqlift_error_type {
 // and DropIndex/DropView/DropTrigger when the object is removed entirely.
 #define SQLIFT_ALLOW_DESTRUCTIVE (1u << 1)
 
+// Allow rebuilds whose only changes are strict relaxations of existing
+// constraints (drop a CHECK or FK, NOT NULL becomes nullable). Rebuilds
+// with any other change still require SQLIFT_ALLOW_REBUILD. Use this for
+// "backwards-compatible only" policies: old readers and writers keep
+// working through a loosening rebuild.
+#define SQLIFT_ALLOW_LOOSEN      (1u << 2)
+
+// Allow operations whose success depends on existing data: tightening a
+// nullable column to NOT NULL, adding a FK or CHECK constraint to an
+// existing table, adding a NOT NULL column without DEFAULT. These can
+// succeed on an empty or known-clean database and fail elsewhere; sqlift
+// rejects them by default to keep migrations deterministic across
+// instances.
+#define SQLIFT_ALLOW_DATA_DEPENDENT (1u << 3)
+
 // Themed combinations.
 #define SQLIFT_ALLOW_NONE        0u
-#define SQLIFT_ALLOW_ALL         (SQLIFT_ALLOW_REBUILD | SQLIFT_ALLOW_DESTRUCTIVE)
+#define SQLIFT_ALLOW_ALL         (SQLIFT_ALLOW_REBUILD | SQLIFT_ALLOW_DESTRUCTIVE | SQLIFT_ALLOW_LOOSEN | SQLIFT_ALLOW_DATA_DEPENDENT)
 
 // Options controlling sqlift_apply policy. All fields default to 0 (deny).
 // Zero-init with `(sqlift_apply_options){0}` (C99) or `{}` (C++) for the
