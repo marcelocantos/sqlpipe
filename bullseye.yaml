@@ -459,6 +459,24 @@ targets:
     - downstream:mnemo
     origin: Discovered 2026-04-29 during mnemo 🎯T26 survey — sqlpipe Go wrapper missing FTS5, sqlift, sqldeep auto-transpile that mnemo needs to adopt sqlpipe.Database
     discovered: 2026-04-29
+  T14:
+    name: scripts/bundle-deps.sh syncs the sqlift API block in dist/sqlpipe.h automatically
+    status: identified
+    value: 0.0
+    cost: 0.0
+    acceptance:
+    - When sqlift's public API changes (new flag macros, new error codes, new struct fields in sqlift_apply_options, version macro bumps), running scripts/bundle-deps.sh updates the corresponding section of dist/sqlpipe.h without human intervention.
+    - The sqlift block in dist/sqlpipe.h (currently lines ~70-130) reflects the SQLIFT_VERSION macros, the sqlift_error_type enum, the SQLIFT_ALLOW_* flag macros, and the sqlift_apply_options struct from vendor/include/sqlift.h verbatim.
+    - A test or smoke check confirms that after bumping the sqlift submodule and running bundle-deps.sh, mk test still compiles cleanly without manual edits to dist/sqlpipe.h.
+    - scripts/bundle-deps.sh's docstring documents which sections of dist/sqlpipe.h it now manages.
+    context: |-
+      Discovered during the v0.23.0 release (sqlift bumped from v0.13.0 to v0.14.0). The bundle script copies sqlift.cpp into dist/sqlpipe.cpp but doesn't touch dist/sqlpipe.h's sqlift block — that section is hand-maintained. v0.14.0 added two new flag macros (SQLIFT_ALLOW_LOOSEN, SQLIFT_ALLOW_DATA_DEPENDENT) and updated SQLIFT_ALLOW_ALL; without manually editing dist/sqlpipe.h to match, dist/sqlpipe.cpp fails to compile because the appended sqlift_apply C wrapper references undefined SQLIFT_ALLOW_* identifiers. The next sqlift API change will hit the same gap.
+
+      Approach: extract the relevant section of vendor/include/sqlift.h (everything between extern "C" { and the closing }, minus the function declarations sqlpipe doesn't bundle) and splice it into dist/sqlpipe.h between marker comments. Mirror the existing pattern that bundle-deps.sh uses for dist/sqlpipe.cpp (truncate at marker, append from vendor source). Apply the same to the wrapper headers (go/sqlpipe/internal/c/sqlpipe.h, swift/Sources/CSqlpipe/include/sqlpipe.h, swift/Sources/CSqlpipe/sqlpipe.h) which are copied from dist/sqlpipe.h.
+
+      Files involved: scripts/bundle-deps.sh, dist/sqlpipe.h, vendor/include/sqlift.h.
+    origin: forked from v0.23.0 release — discovered while bumping sqlift v0.13.0 → v0.14.0
+    discovered: 2026-05-09
   T2:
     name: sqlpipe reaches 1.0
     status: identified
