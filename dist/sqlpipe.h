@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#define SQLPIPE_VERSION       "0.22.0"
+#define SQLPIPE_VERSION       "0.23.0"
 #define SQLPIPE_VERSION_MAJOR 0
-#define SQLPIPE_VERSION_MINOR 22
+#define SQLPIPE_VERSION_MINOR 23
 #define SQLPIPE_VERSION_PATCH 0
 
 // ── Bundled: sqldeep (query transpiler) ─────────────────────────
@@ -70,9 +70,9 @@ int sqldeep_register_sqlite_xml(sqlite3* db);
 // ── Bundled: sqlift (schema migration) ──────────────────────────
 // Declarative SQLite schema diffing and migration.
 
-#define SQLIFT_VERSION       "0.13.0"
+#define SQLIFT_VERSION       "0.14.0"
 #define SQLIFT_VERSION_MAJOR 0
-#define SQLIFT_VERSION_MINOR 13
+#define SQLIFT_VERSION_MINOR 14
 #define SQLIFT_VERSION_PATCH 0
 
 #include <stdint.h>
@@ -96,10 +96,13 @@ enum sqlift_error_type {
 };
 
 // Atomic permission bits for sqlift_apply_options.allow.
-#define SQLIFT_ALLOW_REBUILD     (1u << 0)
-#define SQLIFT_ALLOW_DESTRUCTIVE (1u << 1)
-#define SQLIFT_ALLOW_NONE        0u
-#define SQLIFT_ALLOW_ALL         (SQLIFT_ALLOW_REBUILD | SQLIFT_ALLOW_DESTRUCTIVE)
+#define SQLIFT_ALLOW_REBUILD        (1u << 0)
+#define SQLIFT_ALLOW_DESTRUCTIVE    (1u << 1)
+#define SQLIFT_ALLOW_LOOSEN         (1u << 2)
+#define SQLIFT_ALLOW_DATA_DEPENDENT (1u << 3)
+#define SQLIFT_ALLOW_NONE           0u
+#define SQLIFT_ALLOW_ALL            (SQLIFT_ALLOW_REBUILD | SQLIFT_ALLOW_DESTRUCTIVE \
+                                     | SQLIFT_ALLOW_LOOSEN | SQLIFT_ALLOW_DATA_DEPENDENT)
 
 typedef struct sqlift_apply_options {
     unsigned int allow;

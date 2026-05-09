@@ -5953,6 +5953,14 @@ struct Operation {
     std::vector<std::string> sql;
     bool destructive = false;
     bool requires_rebuild = false;
+    // True when every change in this op is a strict relaxation of an
+    // existing constraint (drop CHECK/FK, NOT NULL becomes nullable). Only
+    // ever set on RebuildTable ops; never on additive or destructive ops.
+    bool loosens_only = false;
+    // True when this op's success depends on existing data: nullable to
+    // NOT NULL, new FK or CHECK on an existing table, new NOT NULL column
+    // without DEFAULT. Always tied to a RebuildTable op.
+    bool data_dependent = false;
 };
 
 class MigrationPlan {
@@ -5979,6 +5987,8 @@ std::vector<Warning> detect_redundant_indexes(const Schema& schema);
 struct ApplyOptions {
     bool allow_destructive = false;
     bool allow_rebuild = false;
+    bool allow_loosen = false;
+    bool allow_data_dependent = false;
 };
 
 void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts = {});
@@ -7034,6 +7044,46 @@ std::string describe_table_changes(const Table& current, const Table& desired) {
     return oss.str();
 }
 
+// True when every difference between current and desired is a strict
+// relaxation: dropping a CHECK or FK, or making an existing NOT NULL
+// column nullable. Used to gate the SQLIFT_ALLOW_LOOSEN policy.
+bool rebuild_is_pure_loosening(const Table& current, const Table& desired) {
+    // Same column set, same order, same type/default/PK; only NOT NULL
+    // may relax (true -> false).
+    if (current.columns.size() != desired.columns.size()) return false;
+    for (size_t i = 0; i < current.columns.size(); ++i) {
+        const Column& c = current.columns[i];
+        const Column& d = desired.columns[i];
+        if (c.name != d.name) return false;
+        if (c.type != d.type) return false;
+        if (c.collation != d.collation) return false;
+        if (c.default_value != d.default_value) return false;
+        if (c.pk != d.pk) return false;
+        if (c.generated != d.generated) return false;
+        // NOT NULL may relax (true -> false), never tighten (false -> true).
+        if (!c.notnull && d.notnull) return false;
+    }
+    // FKs and CHECKs may be removed, never added or changed.
+    for (const auto& fk : desired.foreign_keys) {
+        bool found = false;
+        for (const auto& cur_fk : current.foreign_keys) {
+            if (cur_fk == fk) { found = true; break; }
+        }
+        if (!found) return false;
+    }
+    for (const auto& chk : desired.check_constraints) {
+        bool found = false;
+        for (const auto& cur_chk : current.check_constraints) {
+            if (cur_chk == chk) { found = true; break; }
+        }
+        if (!found) return false;
+    }
+    // Table-level options must be unchanged.
+    if (current.without_rowid != desired.without_rowid) return false;
+    if (current.strict != desired.strict) return false;
+    return true;
+}
+
 bool rebuild_is_destructive(const Table& current, const Table& desired) {
     std::set<std::string> desired_cols;
     for (const auto& c : desired.columns)
@@ -7185,84 +7235,82 @@ MigrationPlan diff(const Schema& current, const Schema& desired) {
         }
     }
 
-    // Check for breaking changes across all modified tables before building the plan.
-    {
+    // Detect data-dependent changes across all modified tables. Each table
+    // accumulates a list of violation messages; the resulting RebuildTable
+    // op carries them in its description so the apply-time gate can
+    // surface a useful error. We do NOT throw here -- the policy gate
+    // belongs in apply().
+    std::map<std::string, std::vector<std::string>> data_dependent_violations;
+    for (const auto& [name, desired_table] : desired.tables) {
+        auto it = current.tables.find(name);
+        if (it == current.tables.end()) continue;
+        const auto& current_table = it->second;
+        if (current_table == desired_table) continue;
+
         std::vector<std::string> violations;
-        for (const auto& [name, desired_table] : desired.tables) {
-            auto it = current.tables.find(name);
-            if (it == current.tables.end()) continue;
-            const auto& current_table = it->second;
-            if (current_table == desired_table) continue;
+        std::map<std::string, const Column*> cur_col_map;
+        for (const auto& col : current_table.columns)
+            cur_col_map[col.name] = &col;
 
-            // Build column lookup for the current table.
-            std::map<std::string, const Column*> cur_col_map;
-            for (const auto& col : current_table.columns)
-                cur_col_map[col.name] = &col;
-
-            // (a) Existing nullable column becomes NOT NULL.
-            for (const auto& col : desired_table.columns) {
-                auto cit = cur_col_map.find(col.name);
-                if (cit != cur_col_map.end() && !cit->second->notnull && col.notnull) {
-                    violations.push_back(
-                        "Table '" + name + "': column '" + col.name +
-                        "' changes from nullable to NOT NULL");
-                }
-            }
-
-            // (b) New FK constraint on existing table.
-            for (const auto& fk : desired_table.foreign_keys) {
-                bool found = false;
-                for (const auto& cur_fk : current_table.foreign_keys) {
-                    if (cur_fk == fk) { found = true; break; }
-                }
-                if (!found) {
-                    std::ostringstream oss;
-                    oss << "Table '" << name << "': adds foreign key (";
-                    for (size_t i = 0; i < fk.from_columns.size(); ++i) {
-                        if (i > 0) oss << ", ";
-                        oss << fk.from_columns[i];
-                    }
-                    oss << ") references " << fk.to_table << "(";
-                    for (size_t i = 0; i < fk.to_columns.size(); ++i) {
-                        if (i > 0) oss << ", ";
-                        oss << fk.to_columns[i];
-                    }
-                    oss << ")";
-                    violations.push_back(oss.str());
-                }
-            }
-
-            // (c) New CHECK constraint on existing table (existing data may violate it).
-            for (const auto& chk : desired_table.check_constraints) {
-                bool found = false;
-                for (const auto& cur_chk : current_table.check_constraints) {
-                    if (cur_chk == chk) { found = true; break; }
-                }
-                if (!found) {
-                    violations.push_back(
-                        "Table '" + name + "': adds CHECK constraint" +
-                        (chk.name.empty() ? "" : " '" + chk.name + "'") +
-                        " (" + chk.expression + ")");
-                }
-            }
-
-            // (d) New NOT NULL column without DEFAULT (guaranteed failure on non-empty table).
-            for (const auto& col : desired_table.columns) {
-                if (cur_col_map.find(col.name) == cur_col_map.end() &&
-                    col.notnull && col.default_value.empty() && col.pk == 0) {
-                    violations.push_back(
-                        "Table '" + name + "': new column '" + col.name +
-                        "' is NOT NULL without DEFAULT");
-                }
+        // (a) Existing nullable column becomes NOT NULL.
+        for (const auto& col : desired_table.columns) {
+            auto cit = cur_col_map.find(col.name);
+            if (cit != cur_col_map.end() && !cit->second->notnull && col.notnull) {
+                violations.push_back(
+                    "column '" + col.name +
+                    "' changes from nullable to NOT NULL");
             }
         }
-        if (!violations.empty()) {
-            std::ostringstream oss;
-            oss << "Breaking schema changes detected:";
-            for (const auto& v : violations)
-                oss << "\n- " << v;
-            throw BreakingChangeError(oss.str());
+
+        // (b) New FK constraint on existing table.
+        for (const auto& fk : desired_table.foreign_keys) {
+            bool found = false;
+            for (const auto& cur_fk : current_table.foreign_keys) {
+                if (cur_fk == fk) { found = true; break; }
+            }
+            if (!found) {
+                std::ostringstream oss;
+                oss << "adds foreign key (";
+                for (size_t i = 0; i < fk.from_columns.size(); ++i) {
+                    if (i > 0) oss << ", ";
+                    oss << fk.from_columns[i];
+                }
+                oss << ") references " << fk.to_table << "(";
+                for (size_t i = 0; i < fk.to_columns.size(); ++i) {
+                    if (i > 0) oss << ", ";
+                    oss << fk.to_columns[i];
+                }
+                oss << ")";
+                violations.push_back(oss.str());
+            }
         }
+
+        // (c) New CHECK constraint on existing table.
+        for (const auto& chk : desired_table.check_constraints) {
+            bool found = false;
+            for (const auto& cur_chk : current_table.check_constraints) {
+                if (cur_chk == chk) { found = true; break; }
+            }
+            if (!found) {
+                violations.push_back(
+                    std::string("adds CHECK constraint") +
+                    (chk.name.empty() ? "" : " '" + chk.name + "'") +
+                    " (" + chk.expression + ")");
+            }
+        }
+
+        // (d) New NOT NULL column without DEFAULT.
+        for (const auto& col : desired_table.columns) {
+            if (cur_col_map.find(col.name) == cur_col_map.end() &&
+                col.notnull && col.default_value.empty() && col.pk == 0) {
+                violations.push_back(
+                    "new column '" + col.name +
+                    "' is NOT NULL without DEFAULT");
+            }
+        }
+
+        if (!violations.empty())
+            data_dependent_violations[name] = std::move(violations);
     }
 
     // Modify existing tables
@@ -7289,13 +7337,24 @@ MigrationPlan diff(const Schema& current, const Schema& desired) {
             }
         } else {
             // Full rebuild
+            auto vit = data_dependent_violations.find(name);
+            bool data_dependent = vit != data_dependent_violations.end();
+            std::string description = describe_table_changes(current_table, desired_table);
+            if (data_dependent) {
+                description += " [data-dependent:";
+                for (const auto& v : vit->second)
+                    description += " " + v + ";";
+                description += "]";
+            }
             plan.ops_.push_back({
                 .type = OpType::RebuildTable,
                 .object_name = name,
-                .description = describe_table_changes(current_table, desired_table),
+                .description = std::move(description),
                 .sql = rebuild_table_sql(current_table, desired_table, desired),
                 .destructive = rebuild_is_destructive(current_table, desired_table),
                 .requires_rebuild = true,
+                .loosens_only = rebuild_is_pure_loosening(current_table, desired_table),
+                .data_dependent = data_dependent,
             });
         }
     }
@@ -7610,16 +7669,38 @@ std::string load_schema_hash(sqlite3* db) {
 void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts) {
     if (plan.empty()) return;
 
-    if (plan.has_rebuild_operations() && !opts.allow_rebuild) {
-        throw RebuildError(
-            "Migration plan contains table rebuild operations. "
-            "Set allow_rebuild=true to proceed.");
-    }
-
-    if (plan.has_destructive_operations() && !opts.allow_destructive) {
-        throw DestructiveError(
-            "Migration plan contains destructive operations. "
-            "Set SQLIFT_ALLOW_DESTRUCTIVE in opts.allow to proceed.");
+    // Policy gates, in order of severity. Each rebuild op is permitted
+    // when allow_rebuild is set, OR when it is pure loosening and
+    // allow_loosen is set. A data-dependent op also requires
+    // allow_data_dependent. Drops require allow_destructive.
+    for (const auto& op : plan.operations()) {
+        if (op.requires_rebuild) {
+            bool rebuild_ok = opts.allow_rebuild ||
+                              (opts.allow_loosen && op.loosens_only);
+            if (!rebuild_ok) {
+                throw RebuildError(
+                    "Migration plan requires a table rebuild for '" +
+                    op.object_name +
+                    "'. Set SQLIFT_ALLOW_REBUILD in opts.allow" +
+                    (op.loosens_only
+                        ? " (or SQLIFT_ALLOW_LOOSEN -- this rebuild is pure loosening)"
+                        : "") +
+                    " to proceed.");
+            }
+        }
+        if (op.data_dependent && !opts.allow_data_dependent) {
+            throw BreakingChangeError(
+                "Migration plan contains data-dependent change on '" +
+                op.object_name + "': " + op.description +
+                ". Set SQLIFT_ALLOW_DATA_DEPENDENT in opts.allow to proceed "
+                "(success depends on existing data).");
+        }
+        if (op.destructive && !opts.allow_destructive) {
+            throw DestructiveError(
+                "Migration plan contains destructive operation on '" +
+                op.object_name +
+                "'. Set SQLIFT_ALLOW_DESTRUCTIVE in opts.allow to proceed.");
+        }
     }
 
     // Check for drift
@@ -7766,6 +7847,8 @@ std::string to_json(const MigrationPlan& plan) {
         jop["sql"] = op.sql;
         jop["destructive"] = op.destructive;
         jop["requires_rebuild"] = op.requires_rebuild;
+        jop["loosens_only"] = op.loosens_only;
+        jop["data_dependent"] = op.data_dependent;
         ops.push_back(std::move(jop));
     }
 
@@ -7845,6 +7928,21 @@ MigrationPlan from_json(const std::string& json_str) {
             op.requires_rebuild = jop["requires_rebuild"].get<bool>();
         } else {
             op.requires_rebuild = (op.type == OpType::RebuildTable);
+        }
+
+        // loosens_only and data_dependent are optional for forward-compat
+        // with older plan JSON; default to false (the conservative choice
+        // -- callers will get a more restrictive gate on old plans, never
+        // a more permissive one).
+        if (jop.contains("loosens_only")) {
+            if (!jop["loosens_only"].is_boolean())
+                throw JsonError("Operation 'loosens_only' must be boolean");
+            op.loosens_only = jop["loosens_only"].get<bool>();
+        }
+        if (jop.contains("data_dependent")) {
+            if (!jop["data_dependent"].is_boolean())
+                throw JsonError("Operation 'data_dependent' must be boolean");
+            op.data_dependent = jop["data_dependent"].get<bool>();
         }
 
         // Validate SQL prefix matches OpType
@@ -8244,6 +8342,8 @@ int sqlift_apply(sqlift_db* db, const char* plan_json,
         sqlift::ApplyOptions opts;
         opts.allow_destructive = (c_opts.allow & SQLIFT_ALLOW_DESTRUCTIVE) != 0;
         opts.allow_rebuild = (c_opts.allow & SQLIFT_ALLOW_REBUILD) != 0;
+        opts.allow_loosen = (c_opts.allow & SQLIFT_ALLOW_LOOSEN) != 0;
+        opts.allow_data_dependent = (c_opts.allow & SQLIFT_ALLOW_DATA_DEPENDENT) != 0;
         sqlift::apply(db->db, plan, opts);
         return 0;
     } catch (const std::exception& e) {
