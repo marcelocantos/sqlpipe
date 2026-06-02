@@ -190,9 +190,9 @@ example including handshake and change event handling.
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-mk test     # build and run tests (146 test cases)
-mk example  # build and run the loopback demo
-mk wasm     # build Wasm module (requires emscripten)
+cv test     # build and run tests (146 test cases)
+cv example  # build and run the loopback demo
+cv wasm     # build Wasm module (requires emscripten)
 ```
 
 If you use an agentic coding tool (Claude Code, Cursor, Copilot, etc.), include

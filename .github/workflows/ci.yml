@@ -17,17 +17,17 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install mk
+      - name: Install cv
         run: |
-          MK_VERSION="0.5.0"
+          CV_VERSION="0.10.0"
           case "${{ runner.os }}-${{ runner.arch }}" in
-            Linux-X64)   ASSET="mk-${MK_VERSION}-linux-amd64.tar.gz" ;;
-            Linux-ARM64) ASSET="mk-${MK_VERSION}-linux-arm64.tar.gz" ;;
-            macOS-ARM64) ASSET="mk-${MK_VERSION}-darwin-arm64.tar.gz" ;;
+            Linux-X64)   ASSET="cv-${CV_VERSION}-linux-amd64.tar.gz" ;;
+            Linux-ARM64) ASSET="cv-${CV_VERSION}-linux-arm64.tar.gz" ;;
+            macOS-ARM64) ASSET="cv-${CV_VERSION}-darwin-arm64.tar.gz" ;;
             *) echo "Unsupported: ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
           esac
-          curl -fsSL "https://github.com/marcelocantos/mk/releases/download/v${MK_VERSION}/${ASSET}" \
-            | tar xz -C /usr/local/bin mk
+          curl -fsSL "https://github.com/marcelocantos/mk/releases/download/v${CV_VERSION}/${ASSET}" \
+            | tar xz -C /usr/local/bin cv
 
       - name: Build and test
-        run: mk test
+        run: cv test

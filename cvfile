@@ -38,7 +38,7 @@ build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlpipe.o $lp_objs
 !wasm: build/wasm/sqlpipe.js
 
 !clean:
-    rm -rf build/ .mk/
+    rm -rf build/ .cv/
 
 # ── Binaries ─────────────────────────────────────────────────────────
 build/sqlpipe_tests: $test_objs build/libsqlpipe.a
