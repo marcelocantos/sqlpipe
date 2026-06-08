@@ -19,9 +19,9 @@ Streaming replication protocol for SQLite. Two-file library: `dist/sqlpipe.h`
 ## Build
 
 ```sh
-mk test     # build and run all tests
-mk example  # build and run examples/loopback.cpp
-mk clean    # remove build/
+cv test     # build and run all tests
+cv example  # build and run examples/loopback.cpp
+cv clean    # remove build/
 ```
 
 ### Go wrapper
@@ -92,18 +92,18 @@ to resolve correctly (Go modules in subdirectories need path-prefixed tags).
 ### Wasm (browser)
 
 ```sh
-mk wasm                              # build Wasm module (requires emscripten)
+cv wasm                              # build Wasm module (requires emscripten)
 cd web && npx tsc && node dist/test/smoke.test.js  # TypeScript wrapper test
 ```
 
 Builds sqlpipe + sqldeep + SQLite + LZ4 + sqlift into a single Wasm module.
-The `sqldeep` variable in the mkfile defaults to `../sqldeep` (sibling directory).
+The `sqldeep` variable in the cvfile defaults to `../sqldeep` (sibling directory).
 
-Requires C++23. Uses [mk](https://github.com/marcelocantos/mk) as the build
-system (`mkfile`).
+Requires C++23. Uses [cv](https://github.com/marcelocantos/cv) as the build
+system (`cvfile`).
 
 SQLite must be compiled with `-DSQLITE_ENABLE_SESSION
--DSQLITE_ENABLE_PREUPDATE_HOOK` (the mkfile sets these).
+-DSQLITE_ENABLE_PREUPDATE_HOOK` (the cvfile sets these).
 
 ## Dependencies
 
@@ -218,7 +218,7 @@ web/                Wasm/TypeScript wrapper
     types.ts        Type definitions
     decode.ts       Binary result decoder
     wasm.ts         Low-level Wasm bindings
-mkfile              Build system (mk)
+cvfile              Build system (cv)
 ```
 
 ## Tests
