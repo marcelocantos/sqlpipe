@@ -746,7 +746,7 @@ static void sd_json(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 
 // ── Public registration ───────────────────────────────────────────���─
 
-int sqldeep_register_sqlite_xml(sqlite3 *db) {
+int sqldeep_register_sqlite(sqlite3 *db) {
     int rc;
     rc = sqlite3_create_function(db, "xml_element", -1, SQLITE_UTF8,
                                  0, sd_xml_element, 0, 0);

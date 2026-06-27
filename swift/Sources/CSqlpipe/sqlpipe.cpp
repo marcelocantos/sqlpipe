@@ -1418,8 +1418,8 @@ struct Master::Impl {
 
             enqueue_changeset(seq, cs);
 
-            std::vector<Message> msgs = {
-                Message{ChangesetMsg{seq, std::move(cs)}}};
+            std::vector<OutMessage> msgs = {
+                tagged(Message{ChangesetMsg{seq, std::move(cs)}})};
             config.on_flush(msgs);
         }
 
@@ -1484,11 +1484,11 @@ struct Master::Impl {
         return cs;
     }
 
-    std::vector<Message> handle_hello(const HelloMsg& hello) {
+    std::vector<OutMessage> handle_hello(const HelloMsg& hello) {
         if (hello.protocol_version != kProtocolVersion) {
-            return {Message{ErrorMsg{ErrorCode::ProtocolError,
+            return {tagged(Message{ErrorMsg{ErrorCode::ProtocolError,
                 "unsupported protocol version: " +
-                std::to_string(hello.protocol_version)}}};
+                std::to_string(hello.protocol_version)}})};
         }
 
         auto my_sv = detail::compute_schema_fingerprint(db, filter());
@@ -1507,12 +1507,12 @@ struct Master::Impl {
                 SQLPIPE_LOG(config.on_log, LogLevel::Info,
                             "schema mismatch (replica={}, master={})",
                             hello.schema_version, my_sv);
-                return {Message{ErrorMsg{ErrorCode::SchemaMismatch,
+                return {tagged(Message{ErrorMsg{ErrorCode::SchemaMismatch,
                     "schema mismatch: replica=" +
                     std::to_string(hello.schema_version) +
                     " master=" + std::to_string(my_sv),
                     my_sv,
-                    detail::get_schema_sql(db, filter())}}};
+                    detail::get_schema_sql(db, filter())}})};
             }
         }
 
@@ -1522,7 +1522,7 @@ struct Master::Impl {
             hs_state = HSState::Live;
             SQLPIPE_LOG(config.on_log, LogLevel::Info,
                         "hello ok, seq match ({}), skipping diff sync", seq);
-            return {Message{HelloMsg{kProtocolVersion, my_sv, {}, seq}}};
+            return {tagged(Message{HelloMsg{kProtocolVersion, my_sv, {}, seq}})};
         }
 
         // Queue replay: if replica's seq is behind but still within our
@@ -1533,14 +1533,14 @@ struct Master::Impl {
         if (hello.last_seq > 0 && !changeset_queue.empty() &&
             hello.last_seq >= changeset_queue.front().seq - 1) {
             // Find the first changeset after the replica's seq.
-            std::vector<Message> result;
-            result.push_back(Message{
-                HelloMsg{kProtocolVersion, my_sv, {}, hello.last_seq}});
+            std::vector<OutMessage> result;
+            result.push_back(tagged(Message{
+                HelloMsg{kProtocolVersion, my_sv, {}, hello.last_seq}}));
             std::size_t replayed = 0;
             for (const auto& qc : changeset_queue) {
                 if (qc.seq > hello.last_seq) {
-                    result.push_back(Message{
-                        ChangesetMsg{qc.seq, qc.data}});
+                    result.push_back(tagged(Message{
+                        ChangesetMsg{qc.seq, qc.data}}));
                     ++replayed;
                 }
             }
@@ -1555,10 +1555,10 @@ struct Master::Impl {
 
         hs_state = HSState::WaitBucketHashes;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "hello ok, waiting for bucket hashes");
-        return {Message{HelloMsg{kProtocolVersion, my_sv, {}, -1}}};
+        return {tagged(Message{HelloMsg{kProtocolVersion, my_sv, {}, -1}})};
     }
 
-    std::vector<Message> handle_bucket_hashes(const BucketHashesMsg& msg) {
+    std::vector<OutMessage> handle_bucket_hashes(const BucketHashesMsg& msg) {
         // Accept BucketHashes in any state — enables convergence loop
         // where the replica can initiate diff sync at any time, including
         // re-convergence checks while already Live.
@@ -1571,9 +1571,9 @@ struct Master::Impl {
         // Protocol version check (if provided).
         if (msg.protocol_version != 0 &&
             msg.protocol_version != kProtocolVersion) {
-            return {Message{ErrorMsg{ErrorCode::ProtocolError,
+            return {tagged(Message{ErrorMsg{ErrorCode::ProtocolError,
                 "unsupported protocol version: " +
-                std::to_string(msg.protocol_version)}}};
+                std::to_string(msg.protocol_version)}})};
         }
 
         // Schema check (if provided).
@@ -1591,12 +1591,12 @@ struct Master::Impl {
                     SQLPIPE_LOG(config.on_log, LogLevel::Info,
                                 "schema mismatch (replica={}, master={})",
                                 msg.schema_version, my_sv);
-                    return {Message{ErrorMsg{ErrorCode::SchemaMismatch,
+                    return {tagged(Message{ErrorMsg{ErrorCode::SchemaMismatch,
                         "schema mismatch: replica=" +
                         std::to_string(msg.schema_version) +
                         " master=" + std::to_string(my_sv),
                         my_sv,
-                        detail::get_schema_sql(db, filter())}}};
+                        detail::get_schema_sql(db, filter())}})};
                 }
             }
         }
@@ -1606,23 +1606,23 @@ struct Master::Impl {
         if (msg.last_seq > 0 && msg.last_seq < seq &&
             !changeset_queue.empty() &&
             msg.last_seq >= changeset_queue.front().seq - 1) {
-            std::vector<Message> result;
+            std::vector<OutMessage> result;
             std::size_t replayed = 0;
             for (const auto& qc : changeset_queue) {
                 if (qc.seq > msg.last_seq) {
-                    result.push_back(Message{
-                        ChangesetMsg{qc.seq, qc.data}});
+                    result.push_back(tagged(Message{
+                        ChangesetMsg{qc.seq, qc.data}}));
                     ++replayed;
                 }
             }
             if (replayed > 0) {
                 // Send an empty DiffReady first to transition the replica
                 // from DiffBuckets to Live, then the queued changesets.
-                std::vector<Message> out;
-                out.push_back(Message{
-                    NeedBucketsMsg{}});
-                out.push_back(Message{
-                    DiffReadyMsg{msg.last_seq, {}, {}}});
+                std::vector<OutMessage> out;
+                out.push_back(tagged(Message{
+                    NeedBucketsMsg{}}));
+                out.push_back(tagged(Message{
+                    DiffReadyMsg{msg.last_seq, {}, {}}}));
                 out.insert(out.end(), result.begin(), result.end());
                 hs_state = HSState::Live;
                 SQLPIPE_LOG(config.on_log, LogLevel::Info,
@@ -1717,23 +1717,23 @@ struct Master::Impl {
             // All buckets match. Skip row-hash exchange.
             hs_state = HSState::Live;
             SQLPIPE_LOG(config.on_log, LogLevel::Info, "all buckets match, entering live at seq={}", seq);
-            return {Message{NeedBucketsMsg{}},
-                    Message{DiffReadyMsg{seq, {}, {}}}};
+            return {tagged(Message{NeedBucketsMsg{}}),
+                    tagged(Message{DiffReadyMsg{seq, {}, {}}})};
         }
 
         pending_ranges = need.ranges;
         hs_state = HSState::WaitRowHashes;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "{} mismatched bucket ranges", need.ranges.size());
-        return {Message{std::move(need)}};
+        return {tagged(Message{std::move(need)})};
     }
 
-    std::vector<Message> handle_row_hashes(const RowHashesMsg& msg) {
+    std::vector<OutMessage> handle_row_hashes(const RowHashesMsg& msg) {
         // Accept RowHashes when we have pending ranges (from a prior
         // BucketHashes comparison). This enables convergence loop
         // without strict state gating.
         if (pending_ranges.empty()) {
-            return {Message{ErrorMsg{ErrorCode::InvalidState,
-                "RowHashesMsg without pending ranges"}}};
+            return {tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "RowHashesMsg without pending ranges"}})};
         }
 
         // Build map of replica's rows: table → (rowid → hash).
@@ -1841,7 +1841,7 @@ struct Master::Impl {
         pending_ranges.clear();
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "diff computed, entering live at seq={}", seq);
 
-        return {Message{DiffReadyMsg{seq, std::move(combined), std::move(deletes)}}};
+        return {tagged(Message{DiffReadyMsg{seq, std::move(combined), std::move(deletes)}})};
     }
 };
 
@@ -1869,7 +1869,7 @@ void Master::exec(const std::string& sql) {
     }
 }
 
-std::vector<Message> Master::flush() {
+std::vector<OutMessage> Master::flush() {
     // If DDL ran since last flush, the tracked table set may have changed.
     auto sv = detail::compute_schema_fingerprint(impl_->db, impl_->filter());
     if (sv != impl_->cached_sv) {
@@ -1890,11 +1890,11 @@ std::vector<Message> Master::flush() {
 
     impl_->enqueue_changeset(impl_->seq, cs);
 
-    return {Message{ChangesetMsg{impl_->seq, std::move(cs)}}};
+    return {tagged(Message{ChangesetMsg{impl_->seq, std::move(cs)}})};
 }
 
-std::vector<Message> Master::handle_message(const Message& msg) {
-    return std::visit([&](const auto& m) -> std::vector<Message> {
+std::vector<OutMessage> Master::handle_message(const Message& msg) {
+    return std::visit([&](const auto& m) -> std::vector<OutMessage> {
         using T = std::decay_t<decltype(m)>;
 
         if constexpr (std::is_same_v<T, HelloMsg>) {
@@ -1911,8 +1911,8 @@ std::vector<Message> Master::handle_message(const Message& msg) {
             return {};
         }
         else {
-            return {Message{ErrorMsg{ErrorCode::InvalidState,
-                "unexpected message from replica"}}};
+            return {tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "unexpected message from replica"}})};
         }
     }, msg);
 }
@@ -4403,8 +4403,9 @@ Database::Database(const std::string& path, const std::string& schema_ddl)
     // Register update hook to track dirty tables.
     sqlite3_update_hook(db, &Impl::update_hook, impl_.get());
 
-    // Register sqldeep XML runtime functions (xml_element, xml_attrs, xml_agg).
-    sqldeep_register_sqlite_xml(db);
+    // Register sqldeep SQLite runtime functions (xml_element, xml_attrs, xml_agg,
+    // sqldeep_json*).
+    sqldeep_register_sqlite(db);
 
     // Apply schema migration if DDL provided.
     if (!schema_ddl.empty()) {
@@ -4657,13 +4658,13 @@ struct Replica::Impl {
     HandleResult handle_hello_from_master(const HelloMsg& m) {
         if (state != Replica::State::Handshake) {
             state = Replica::State::Error;
-            return {{Message{ErrorMsg{ErrorCode::InvalidState,
-                "received HelloMsg in unexpected state"}}}, {}, {}};
+            return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "received HelloMsg in unexpected state"}})}, {}, {}};
         }
         if (m.protocol_version != kProtocolVersion) {
             state = Replica::State::Error;
-            return {{Message{ErrorMsg{ErrorCode::ProtocolError,
-                "unsupported protocol version"}}}, {}, {}};
+            return {{tagged(Message{ErrorMsg{ErrorCode::ProtocolError,
+                "unsupported protocol version"}})}, {}, {}};
         }
 
         // Fast reconnect: master confirmed seq match — skip to Live.
@@ -4671,7 +4672,7 @@ struct Replica::Impl {
             state = Replica::State::Live;
             SQLPIPE_LOG(config.on_log, LogLevel::Info,
                         "fast reconnect: seq match ({}), skipping diff sync", seq);
-            return {{Message{AckMsg{seq}}}, {}, {}};
+            return {{tagged(Message{AckMsg{seq}})}, {}, {}};
         }
 
         // Compute bucket hashes and send to master.
@@ -4683,9 +4684,9 @@ struct Replica::Impl {
                static_cast<std::int64_t>(buckets.size()));
         state = Replica::State::DiffBuckets;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "sending {} bucket hashes (seq={})", buckets.size(), seq);
-        return {{Message{BucketHashesMsg{
+        return {{tagged(Message{BucketHashesMsg{
             std::move(buckets), seq, kProtocolVersion,
-            detail::compute_schema_fingerprint(db, filter())}}}, {}, {}};
+            detail::compute_schema_fingerprint(db, filter())}})}, {}, {}};
     }
 
     HandleResult handle_need_buckets(const NeedBucketsMsg& m) {
@@ -4693,8 +4694,8 @@ struct Replica::Impl {
         if (state != Replica::State::DiffBuckets &&
             state != Replica::State::Live) {
             state = Replica::State::Error;
-            return {{Message{ErrorMsg{ErrorCode::InvalidState,
-                "received NeedBucketsMsg in unexpected state"}}}, {}, {}};
+            return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "received NeedBucketsMsg in unexpected state"}})}, {}, {}};
         }
 
         state = Replica::State::DiffRows;
@@ -4750,7 +4751,7 @@ struct Replica::Impl {
         }
 
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "sending row hashes for {} ranges", m.ranges.size());
-        return {{Message{std::move(rh)}}, {}, {}};
+        return {{tagged(Message{std::move(rh)})}, {}, {}};
     }
 
     HandleResult handle_diff_ready(const DiffReadyMsg& m) {
@@ -4759,8 +4760,8 @@ struct Replica::Impl {
             state != Replica::State::DiffBuckets &&
             state != Replica::State::Live) {
             state = Replica::State::Error;
-            return {{Message{ErrorMsg{ErrorCode::InvalidState,
-                "received DiffReadyMsg in unexpected state"}}}, {}, {}};
+            return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "received DiffReadyMsg in unexpected state"}})}, {}, {}};
         }
 
         std::vector<ChangeEvent> events;
@@ -4849,7 +4850,7 @@ struct Replica::Impl {
         state = Replica::State::Live;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "diff applied, entering live at seq={}", seq);
 
-        return {{Message{AckMsg{m.seq}}}, std::move(events), {}};
+        return {{tagged(Message{AckMsg{m.seq}})}, std::move(events), {}};
     }
 };
 
@@ -4864,16 +4865,16 @@ Replica::~Replica() = default;
 Replica::Replica(Replica&&) noexcept = default;
 Replica& Replica::operator=(Replica&&) noexcept = default;
 
-Message Replica::hello() const {
+OutMessage Replica::hello() const {
     impl_->state = State::Handshake;
     const auto* f = impl_->config.table_filter
         ? &*impl_->config.table_filter : nullptr;
-    return Message{HelloMsg{kProtocolVersion,
+    return tagged(Message{HelloMsg{kProtocolVersion,
                     detail::compute_schema_fingerprint(impl_->db, f), {},
-                    impl_->seq}};
+                    impl_->seq}});
 }
 
-std::vector<Message> Replica::converge() {
+std::vector<OutMessage> Replica::converge() {
     // Compute bucket hashes and transition to DiffBuckets, waiting for
     // the master's NeedBuckets response. Can be called in any state.
     const auto* f = impl_->config.table_filter
@@ -4892,8 +4893,8 @@ std::vector<Message> Replica::converge() {
     SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info,
                 "converge: sending {} bucket hashes (seq={})",
                 buckets.size(), impl_->seq);
-    return {Message{BucketHashesMsg{
-        std::move(buckets), impl_->seq, kProtocolVersion, sv}}};
+    return {tagged(Message{BucketHashesMsg{
+        std::move(buckets), impl_->seq, kProtocolVersion, sv}})};
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
@@ -4923,13 +4924,13 @@ HandleResult Replica::handle_message(const Message& msg) {
         else if constexpr (std::is_same_v<T, ChangesetMsg>) {
             if (impl_->state != State::Live) {
                 impl_->state = State::Error;
-                return {{Message{ErrorMsg{ErrorCode::InvalidState,
-                    "received ChangesetMsg in unexpected state"}}}, {}, {}};
+                return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                    "received ChangesetMsg in unexpected state"}})}, {}, {}};
             }
             changeset_data = &m.data;
             auto events = impl_->apply_changeset(m.data, m.seq);
             SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "applied changeset seq={}", m.seq);
-            return {{Message{AckMsg{m.seq}}}, std::move(events), {}};
+            return {{tagged(Message{AckMsg{m.seq}})}, std::move(events), {}};
         }
         else if constexpr (std::is_same_v<T, ErrorMsg>) {
             if (m.code == ErrorCode::SchemaMismatch) {
@@ -4961,8 +4962,8 @@ HandleResult Replica::handle_message(const Message& msg) {
             return {};
         }
         else {
-            return {{Message{ErrorMsg{ErrorCode::InvalidState,
-                "unexpected message type from master"}}}, {}, {}};
+            return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                "unexpected message type from master"}})}, {}, {}};
         }
     }, msg);
 
@@ -5020,12 +5021,12 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
             else if constexpr (std::is_same_v<T, ChangesetMsg>) {
                 if (impl_->state != State::Live) {
                     impl_->state = State::Error;
-                    return {{Message{ErrorMsg{ErrorCode::InvalidState,
-                        "received ChangesetMsg in unexpected state"}}}, {}, {}};
+                    return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                        "received ChangesetMsg in unexpected state"}})}, {}, {}};
                 }
                 auto events = impl_->apply_changeset(m.data, m.seq);
                 SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "applied changeset seq={}", m.seq);
-                return {{Message{AckMsg{m.seq}}}, std::move(events), {}};
+                return {{tagged(Message{AckMsg{m.seq}})}, std::move(events), {}};
             }
             else if constexpr (std::is_same_v<T, ErrorMsg>) {
                 if (m.code == ErrorCode::SchemaMismatch) {
@@ -5055,8 +5056,8 @@ HandleResult Replica::handle_messages(std::span<const Message> msgs) {
                 return {};
             }
             else {
-                return {{Message{ErrorMsg{ErrorCode::InvalidState,
-                    "unexpected message type from master"}}}, {}, {}};
+                return {{tagged(Message{ErrorMsg{ErrorCode::InvalidState,
+                    "unexpected message type from master"}})}, {}, {}};
             }
         }, msg);
 
@@ -5315,10 +5316,10 @@ struct Peer::Impl {
                 // Ownership negotiation.
                 if (hello->owned_tables.empty()) {
                     state = Peer::State::Error;
-                    result.messages.push_back(PeerMessage{
+                    result.messages.push_back(tagged(PeerMessage{
                         SenderRole::AsMaster,
                         ErrorMsg{ErrorCode::ProtocolError,
-                                 "peer hello must include owned_tables"}});
+                                 "peer hello must include owned_tables"}}));
                     return result;
                 }
 
@@ -5328,11 +5329,11 @@ struct Peer::Impl {
                         if (config.table_filter->find(t) ==
                                 config.table_filter->end()) {
                             state = Peer::State::Error;
-                            result.messages.push_back(PeerMessage{
+                            result.messages.push_back(tagged(PeerMessage{
                                 SenderRole::AsMaster,
                                 ErrorMsg{ErrorCode::OwnershipRejected,
                                     "table '" + t +
-                                    "' is not in table_filter"}});
+                                    "' is not in table_filter"}}));
                             return result;
                         }
                     }
@@ -5341,10 +5342,10 @@ struct Peer::Impl {
                 if (config.approve_ownership) {
                     if (!config.approve_ownership(hello->owned_tables)) {
                         state = Peer::State::Error;
-                        result.messages.push_back(PeerMessage{
+                        result.messages.push_back(tagged(PeerMessage{
                             SenderRole::AsMaster,
                             ErrorMsg{ErrorCode::OwnershipRejected,
-                                     "ownership request rejected"}});
+                                     "ownership request rejected"}}));
                         return result;
                     }
                 }
@@ -5366,20 +5367,22 @@ struct Peer::Impl {
 
                 auto master_resp = master->handle_message(patched);
                 for (auto& om : master_resp) {
-                    if (std::holds_alternative<DiffReadyMsg>(om)) {
+                    if (std::holds_alternative<DiffReadyMsg>(om.msg)) {
                         master_handshake_done = true;
                     }
-                    result.messages.push_back(PeerMessage{
-                        SenderRole::AsMaster, std::move(om)});
+                    result.messages.push_back(PeerOutMessage{
+                        PeerMessage{SenderRole::AsMaster, std::move(om.msg)},
+                        om.delivery});
                 }
 
                 // Also initiate our Replica's hello (to sync their tables).
                 auto our_hello = replica->hello();
-                auto& h = std::get<HelloMsg>(our_hello);
+                auto& h = std::get<HelloMsg>(our_hello.msg);
                 h.owned_tables = my_tables;
                 h.last_seq = -1;  // Peer directions use different seq keys
-                result.messages.push_back(PeerMessage{
-                    SenderRole::AsReplica, std::move(our_hello)});
+                result.messages.push_back(PeerOutMessage{
+                    PeerMessage{SenderRole::AsReplica, std::move(our_hello.msg)},
+                    our_hello.delivery});
 
                 check_live();
                 return result;
@@ -5388,20 +5391,21 @@ struct Peer::Impl {
 
         // Subsequent AsReplica messages → forward to Master.
         if (!master) {
-            result.messages.push_back(PeerMessage{
+            result.messages.push_back(tagged(PeerMessage{
                 SenderRole::AsMaster,
                 ErrorMsg{ErrorCode::InvalidState,
-                         "master not initialized"}});
+                         "master not initialized"}}));
             return result;
         }
 
         auto master_resp = master->handle_message(msg.payload);
         for (auto& om : master_resp) {
-            if (std::holds_alternative<DiffReadyMsg>(om)) {
+            if (std::holds_alternative<DiffReadyMsg>(om.msg)) {
                 master_handshake_done = true;
             }
-            result.messages.push_back(PeerMessage{
-                SenderRole::AsMaster, std::move(om)});
+            result.messages.push_back(PeerOutMessage{
+                PeerMessage{SenderRole::AsMaster, std::move(om.msg)},
+                om.delivery});
         }
 
         check_live();
@@ -5412,10 +5416,10 @@ struct Peer::Impl {
         PeerHandleResult result;
 
         if (!replica) {
-            result.messages.push_back(PeerMessage{
+            result.messages.push_back(tagged(PeerMessage{
                 SenderRole::AsReplica,
                 ErrorMsg{ErrorCode::InvalidState,
-                         "replica not initialized"}});
+                         "replica not initialized"}}));
             return result;
         }
 
@@ -5433,8 +5437,9 @@ struct Peer::Impl {
         auto hr = replica->handle_message(forwarded);
 
         for (auto& om : hr.messages) {
-            result.messages.push_back(PeerMessage{
-                SenderRole::AsReplica, std::move(om)});
+            result.messages.push_back(PeerOutMessage{
+                PeerMessage{SenderRole::AsReplica, std::move(om.msg)},
+                om.delivery});
         }
         result.changes = std::move(hr.changes);
         result.subscriptions = std::move(hr.subscriptions);
@@ -5464,7 +5469,7 @@ Peer::~Peer() = default;
 Peer::Peer(Peer&&) noexcept = default;
 Peer& Peer::operator=(Peer&&) noexcept = default;
 
-std::vector<PeerMessage> Peer::start() {
+std::vector<PeerOutMessage> Peer::start() {
     if (impl_->state != State::Init) {
         throw Error(ErrorCode::InvalidState, "start() already called");
     }
@@ -5485,23 +5490,26 @@ std::vector<PeerMessage> Peer::start() {
     impl_->create_replica();
 
     auto hello_out = impl_->replica->hello();
-    auto& h = std::get<HelloMsg>(hello_out);
+    auto& h = std::get<HelloMsg>(hello_out.msg);
     h.owned_tables = impl_->my_tables;
     h.last_seq = -1;  // Peer directions use different seq keys
 
-    return {PeerMessage{SenderRole::AsReplica, std::move(hello_out)}};
+    return {PeerOutMessage{
+        PeerMessage{SenderRole::AsReplica, std::move(hello_out.msg)},
+        hello_out.delivery}};
 }
 
-std::vector<PeerMessage> Peer::flush() {
+std::vector<PeerOutMessage> Peer::flush() {
     if (!impl_->master) return {};
     if (impl_->state != State::Live && impl_->state != State::Diffing) return {};
 
     auto msgs = impl_->master->flush();
-    std::vector<PeerMessage> result;
+    std::vector<PeerOutMessage> result;
     result.reserve(msgs.size());
     for (auto& om : msgs) {
-        result.push_back(PeerMessage{
-            SenderRole::AsMaster, std::move(om)});
+        result.push_back(PeerOutMessage{
+            PeerMessage{SenderRole::AsMaster, std::move(om.msg)},
+            om.delivery});
     }
     return result;
 }
@@ -5552,17 +5560,17 @@ const std::set<std::string>& Peer::remote_tables() const {
 // ── Convenience utilities ────────────────────────────────────────
 
 void sync_handshake(Master& master, Replica& replica) {
-    auto pending = master.handle_message(replica.hello());
+    auto pending = master.handle_message(replica.hello().msg);
     while (!pending.empty()) {
-        std::vector<Message> for_master;
+        std::vector<OutMessage> for_master;
         for (const auto& out : pending) {
-            auto hr = replica.handle_message(out);
+            auto hr = replica.handle_message(out.msg);
             for_master.insert(for_master.end(),
                               hr.messages.begin(), hr.messages.end());
         }
         pending.clear();
         for (const auto& out : for_master) {
-            auto resp = master.handle_message(out);
+            auto resp = master.handle_message(out.msg);
             pending.insert(pending.end(), resp.begin(), resp.end());
         }
     }
@@ -5627,17 +5635,17 @@ void Relay::remove_sink(std::size_t id) {
     impl_->sinks.erase(id);
 }
 
-Message Relay::hello() {
+OutMessage Relay::hello() {
     return impl_->replica.hello();
 }
 
-std::vector<Message> Relay::handle_upstream(const Message& msg) {
+std::vector<OutMessage> Relay::handle_upstream(const Message& msg) {
     auto hr = impl_->replica.handle_message(msg);
     impl_->broadcast();
     return std::move(hr.messages);
 }
 
-std::vector<Message> Relay::handle_downstream(const Message& msg) {
+std::vector<OutMessage> Relay::handle_downstream(const Message& msg) {
     return impl_->master.handle_message(msg);
 }
 
@@ -5660,15 +5668,15 @@ void sync_handshake(Peer& client, Peer& server) {
     while (!pending_for_server.empty() ||
            client.state() != Peer::State::Live ||
            server.state() != Peer::State::Live) {
-        std::vector<PeerMessage> pending_for_client;
+        std::vector<PeerOutMessage> pending_for_client;
         for (const auto& pout : pending_for_server) {
-            auto hr = server.handle_message(pout);
+            auto hr = server.handle_message(pout.msg);
             pending_for_client.insert(pending_for_client.end(),
                                       hr.messages.begin(), hr.messages.end());
         }
         pending_for_server.clear();
         for (const auto& pout : pending_for_client) {
-            auto hr = client.handle_message(pout);
+            auto hr = client.handle_message(pout.msg);
             pending_for_server.insert(pending_for_server.end(),
                                       hr.messages.begin(), hr.messages.end());
         }
@@ -5681,16 +5689,16 @@ void sync_handshake(Peer& client, Peer& server) {
 }
 
 void sync_handshake(Master& master, Relay& relay) {
-    auto pending = master.handle_message(relay.hello());
+    auto pending = master.handle_message(relay.hello().msg);
     while (!pending.empty()) {
-        std::vector<Message> for_master;
+        std::vector<OutMessage> for_master;
         for (const auto& out : pending) {
-            auto resp = relay.handle_upstream(out);
+            auto resp = relay.handle_upstream(out.msg);
             for_master.insert(for_master.end(), resp.begin(), resp.end());
         }
         pending.clear();
         for (const auto& out : for_master) {
-            auto resp = master.handle_message(out);
+            auto resp = master.handle_message(out.msg);
             pending.insert(pending.end(), resp.begin(), resp.end());
         }
     }
@@ -8472,40 +8480,55 @@ extern "C" sqlift_db* sqlift_db_wrap(sqlite3* handle) {
 
 // Copyright 2026 Marcelo Cantos
 // SPDX-License-Identifier: Apache-2.0
+//
+// sqldeep — JSON5-like SQL syntax transpiler.
+//
+// Implementation strategy: parse the input via deepparser (which knows
+// the sqldeep grammar), then walk the resulting AST and rewrite every
+// sqldeep-extension node in place into standard SQL nodes. Once the
+// AST contains only plain SQL kinds, deepparser's canonical unparser
+// emits the final SQL text. Sqldeep itself owns nothing about parsing
+// or printing — it is purely an AST-to-AST transformer plus the
+// outward-facing C API.
 
+
+extern "C" {
+#include "liteparser.h"
+#include "arena.h"
+}
+
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
-#include <memory>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
-#include <variant>
+#include <utility>
 #include <vector>
 
 namespace sqldeep {
 
-// ── Internal C++ types (not exposed in public C header) ─────────────
-
 struct ForeignKey {
-    std::string from_table;   // child table (has the FK column(s))
-    std::string to_table;     // parent/referenced table
-
+    std::string from_table;
+    std::string to_table;
     struct ColumnPair {
-        std::string from_column;  // FK column in child
-        std::string to_column;    // referenced column in parent
+        std::string from_column;
+        std::string to_column;
     };
-    std::vector<ColumnPair> columns;  // supports multi-column FKs
+    std::vector<ColumnPair> columns;
 };
 
-enum class Backend { sqlite, postgres };
+enum class Backend { sqlite, postgres, sqlite_vanilla };
 
 class Error : public std::runtime_error {
 public:
     Error(const std::string& msg, int line, int col)
         : std::runtime_error(msg), line_(line), col_(col) {}
     int line() const { return line_; }
-    int col() const { return col_; }
+    int col()  const { return col_; }
 private:
     int line_;
     int col_;
@@ -8513,1899 +8536,8 @@ private:
 
 namespace {
 
-static constexpr int kMaxNestingDepth = 200;
+// ── FK index ────────────────────────────────────────────────────────
 
-// ── Lexer ───────────────────────────────────────────────────────────
-
-enum class TokenType {
-    Ident,       // unquoted identifier or keyword
-    DqString,    // double-quoted string "..."
-    SqString,    // single-quoted string '...'
-    Number,      // numeric literal
-    LBrace,      // {
-    RBrace,      // }
-    LBracket,    // [
-    RBracket,    // ]
-    LParen,      // (
-    RParen,      // )
-    Comma,       // ,
-    Colon,       // :
-    Semicolon,   // ;
-    Other,       // any other character or operator
-    Eof,
-};
-
-struct Token {
-    TokenType type;
-    std::string text;
-    int line;
-    int col;
-    size_t src_begin; // offset in source where token text starts
-    size_t src_end;   // offset right after token text ends
-};
-
-struct LexerState {
-    size_t pos;
-    int line;
-    int col;
-};
-
-class Lexer {
-public:
-    explicit Lexer(const std::string& input)
-        : src_(input), pos_(0), line_(1), col_(1) {}
-
-    Token next() {
-        skip_whitespace_and_comments();
-        if (pos_ >= src_.size())
-            return {TokenType::Eof, "", line_, col_, pos_, pos_};
-
-        int tline = line_, tcol = col_;
-        size_t begin = pos_;
-        char c = src_[pos_];
-
-        switch (c) {
-        case '{': advance(); return {TokenType::LBrace,   "{", tline, tcol, begin, pos_};
-        case '}': advance(); return {TokenType::RBrace,   "}", tline, tcol, begin, pos_};
-        case '[': advance(); return {TokenType::LBracket, "[", tline, tcol, begin, pos_};
-        case ']': advance(); return {TokenType::RBracket, "]", tline, tcol, begin, pos_};
-        case '(': advance(); return {TokenType::LParen,   "(", tline, tcol, begin, pos_};
-        case ')': advance(); return {TokenType::RParen,   ")", tline, tcol, begin, pos_};
-        case ',': advance(); return {TokenType::Comma,    ",", tline, tcol, begin, pos_};
-        case ':': advance(); return {TokenType::Colon,    ":", tline, tcol, begin, pos_};
-        case ';': advance(); return {TokenType::Semicolon,";", tline, tcol, begin, pos_};
-        case '\'': return lex_string('\'', TokenType::SqString, tline, tcol, begin);
-        case '"':  return lex_string('"',  TokenType::DqString,  tline, tcol, begin);
-        default: break;
-        }
-
-        if (is_ident_start(c)) return lex_ident(tline, tcol, begin);
-        if (is_digit(c) || (c == '.' && pos_ + 1 < src_.size() && is_digit(src_[pos_ + 1])))
-            return lex_number(tline, tcol, begin);
-
-        // Operator or other character
-        std::string s(1, c);
-        advance();
-        if (pos_ < src_.size()) {
-            char n = src_[pos_];
-            if ((c == '<' && (n == '=' || n == '>' || n == '-')) ||
-                (c == '>' && n == '=') ||
-                (c == '!' && n == '=') ||
-                (c == '|' && n == '|') ||
-                (c == '<' && n == '<') ||
-                (c == '>' && n == '>') ||
-                (c == '-' && n == '>')) {
-                s += n;
-                advance();
-                // Extend -> to ->> when the > is touching (SQL JSON operator)
-                if (s == "->" && pos_ < src_.size() && src_[pos_] == '>') {
-                    s += '>';
-                    advance();
-                }
-            }
-        }
-        return {TokenType::Other, s, tline, tcol, begin, pos_};
-    }
-
-    Token peek() {
-        auto st = save();
-        Token t = next();
-        restore(st);
-        return t;
-    }
-
-    LexerState save() const { return {pos_, line_, col_}; }
-    void restore(const LexerState& st) { pos_ = st.pos; line_ = st.line; col_ = st.col; }
-
-    // Current position in source (right after last consumed token).
-    size_t offset() const { return pos_; }
-
-    const std::string& source() const { return src_; }
-
-    // Read raw source characters until '<' or '{', for XML body text.
-    // Returns the accumulated text. Lexer position advances past it.
-    std::string read_raw_until_xml_special() {
-        std::string text;
-        while (pos_ < src_.size() && src_[pos_] != '<' && src_[pos_] != '{') {
-            text += src_[pos_];
-            advance();
-        }
-        return text;
-    }
-
-    [[noreturn]] void error(const std::string& msg) {
-        throw Error(msg, line_, col_);
-    }
-
-    [[noreturn]] void error(const std::string& msg, int line, int col) {
-        throw Error(msg, line, col);
-    }
-
-private:
-    void advance() {
-        if (pos_ < src_.size()) {
-            if (src_[pos_] == '\n') { ++line_; col_ = 1; }
-            else { ++col_; }
-            ++pos_;
-        }
-    }
-
-    void skip_whitespace_and_comments() {
-        while (pos_ < src_.size()) {
-            if (std::isspace(static_cast<unsigned char>(src_[pos_]))) {
-                advance();
-            } else if (pos_ + 1 < src_.size() && src_[pos_] == '-' && src_[pos_ + 1] == '-') {
-                // SQL line comment: -- to end of line
-                advance(); advance();
-                while (pos_ < src_.size() && src_[pos_] != '\n') advance();
-            } else if (pos_ + 1 < src_.size() && src_[pos_] == '/' && src_[pos_ + 1] == '*') {
-                // SQL block comment: /* ... */ (flat, not nested)
-                int cline = line_, ccol = col_;
-                advance(); advance();
-                while (pos_ < src_.size()) {
-                    if (src_[pos_] == '*' && pos_ + 1 < src_.size() && src_[pos_ + 1] == '/') {
-                        advance(); advance();
-                        break;
-                    }
-                    advance();
-                }
-                if (pos_ >= src_.size() && (pos_ < 2 || src_[pos_ - 2] != '*' || src_[pos_ - 1] != '/'))
-                    error("unterminated block comment", cline, ccol);
-            } else {
-                break;
-            }
-        }
-    }
-
-    Token lex_string(char quote, TokenType type, int tline, int tcol, size_t begin) {
-        std::string s(1, quote);
-        advance(); // skip opening quote
-        while (pos_ < src_.size()) {
-            if (src_[pos_] == quote) {
-                // SQL doubled-quote escape: '' inside '...' or "" inside "..."
-                if (pos_ + 1 < src_.size() && src_[pos_ + 1] == quote) {
-                    s += quote; advance();
-                    s += quote; advance();
-                    continue;
-                }
-                break; // end of string
-            }
-            if (src_[pos_] == '\\' && pos_ + 1 < src_.size()) {
-                s += src_[pos_]; advance();
-                s += src_[pos_]; advance();
-            } else {
-                s += src_[pos_]; advance();
-            }
-        }
-        if (pos_ >= src_.size()) error("unterminated string literal", tline, tcol);
-        s += quote;
-        advance(); // skip closing quote
-        return {type, s, tline, tcol, begin, pos_};
-    }
-
-    Token lex_ident(int tline, int tcol, size_t begin) {
-        std::string s;
-        while (pos_ < src_.size() && is_ident_cont(src_[pos_])) {
-            s += src_[pos_]; advance();
-        }
-        return {TokenType::Ident, s, tline, tcol, begin, pos_};
-    }
-
-    Token lex_number(int tline, int tcol, size_t begin) {
-        std::string s;
-        while (pos_ < src_.size() && is_digit(src_[pos_])) {
-            s += src_[pos_]; advance();
-        }
-        if (pos_ < src_.size() && src_[pos_] == '.' &&
-            pos_ + 1 < src_.size() && is_digit(src_[pos_ + 1])) {
-            s += src_[pos_]; advance(); // '.'
-            while (pos_ < src_.size() && is_digit(src_[pos_])) {
-                s += src_[pos_]; advance();
-            }
-        }
-        if (pos_ < src_.size() && (src_[pos_] == 'e' || src_[pos_] == 'E')) {
-            s += src_[pos_]; advance();
-            if (pos_ < src_.size() && (src_[pos_] == '+' || src_[pos_] == '-')) {
-                s += src_[pos_]; advance();
-            }
-            while (pos_ < src_.size() && is_digit(src_[pos_])) {
-                s += src_[pos_]; advance();
-            }
-        }
-        return {TokenType::Number, s, tline, tcol, begin, pos_};
-    }
-
-    static bool is_ident_start(char c) {
-        return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
-    }
-    static bool is_ident_cont(char c) {
-        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-    }
-    static bool is_digit(char c) {
-        return std::isdigit(static_cast<unsigned char>(c));
-    }
-
-    const std::string& src_;
-    size_t pos_;
-    int line_;
-    int col_;
-};
-
-// ── AST ─────────────────────────────────────────────────────────────
-
-struct DeepSelect;
-struct ObjectLiteral;
-struct ArrayLiteral;
-struct JoinPath;
-struct RecursiveSelect;
-struct XmlElement;
-
-using SqlPart = std::variant<
-    std::string,
-    std::unique_ptr<DeepSelect>,
-    std::unique_ptr<ObjectLiteral>,
-    std::unique_ptr<ArrayLiteral>,
-    std::unique_ptr<JoinPath>,
-    std::unique_ptr<RecursiveSelect>,
-    std::unique_ptr<XmlElement>
->;
-using SqlParts = std::vector<SqlPart>;
-
-struct ObjectLiteral {
-    struct Field {
-        std::string key;
-        std::string qualified_value; // non-empty = qualified bare field (sm.repo)
-        SqlParts computed_key; // non-empty = (expr) computed key
-        SqlParts value; // empty = bare field (uses key or qualified_value)
-        bool aggregate = false; // SELECT expr (no FROM) → json_group_array(expr)
-        bool recursive = false; // * = recurse with same shape
-    };
-    std::vector<Field> fields;
-};
-
-struct ArrayLiteral {
-    std::vector<SqlParts> elements;
-};
-
-struct JoinPath {
-    struct Step {
-        bool forward;       // true = ->, false = <-
-        std::string table;
-        std::string alias;  // empty if none
-        // Explicit column pairs: {child_col, parent_col}.
-        // Empty = use convention/FK resolution.
-        std::vector<std::pair<std::string, std::string>> columns;
-    };
-    std::string start_alias;  // e.g. "c"
-    std::string start_table;  // e.g. "customers" (resolved from alias_map)
-    std::vector<Step> steps;
-};
-
-enum class XmlMode { Xml, Jsonml, Jsx };
-
-struct DeepSelect {
-    std::variant<ObjectLiteral, ArrayLiteral, SqlParts> projection;
-    SqlParts tail;
-    bool singular = false;      // SELECT/1: no json_group_array, add LIMIT 1
-    bool xml_context = false;   // true = use xml/jsonml/jsx agg
-    XmlMode xml_mode = XmlMode::Xml;
-};
-
-struct RecursiveSelect {
-    std::vector<ObjectLiteral::Field> fields; // non-recursive fields
-    std::string children_field;               // name of recursive field
-    std::string table;                        // table to recurse on
-    std::string fk_column;                    // self-referential FK column
-    std::string pk_column;                    // PK column (default: "id")
-    SqlParts root_condition;                  // WHERE condition (without WHERE keyword)
-    bool singular = false;                    // SELECT/1: single root
-};
-
-struct XmlElement {
-    std::string tag;  // e.g. "div", "ui:Table.Row"
-    struct Attr {
-        std::string name;
-        SqlParts value;    // rendered expression (static string or dynamic)
-        bool is_dynamic;   // true = {expr}, false = "static"
-    };
-    std::vector<Attr> attrs;
-    struct Child {
-        enum Kind { Text, Interpolation, Element };
-        Kind kind;
-        std::string text;                      // kind == Text: raw body text
-        SqlParts expr;                         // kind == Interpolation: {expr}
-        std::unique_ptr<XmlElement> element;   // kind == Element: nested <tag>
-    };
-    std::vector<Child> children;
-    bool self_closing = false;
-    XmlMode mode = XmlMode::Xml;
-};
-
-// ── XML dedent ─────────────────────────────────────────────────────
-//
-// Multi-line XML literals carry source indentation in their text
-// children.  xml_dedent strips the common leading-space prefix from
-// all lines that follow a newline, so the output reflects relative
-// indentation only.
-
-static int xml_min_indent(const XmlElement& el) {
-    int min_indent = INT_MAX;
-    for (const auto& child : el.children) {
-        if (child.kind == XmlElement::Child::Text) {
-            const std::string& t = child.text;
-            size_t i = 0;
-            while (i < t.size()) {
-                size_t nl = t.find('\n', i);
-                if (nl == std::string::npos) break;
-                size_t ls = nl + 1;
-                int sp = 0;
-                while (ls + sp < t.size() && t[ls + sp] == ' ') ++sp;
-                // Skip only lines that are blank between two newlines.
-                // Lines that end at the text boundary still carry
-                // meaningful indentation (before a child element or
-                // closing tag).
-                if (ls + sp < t.size() && t[ls + sp] == '\n') {
-                    i = ls;
-                    continue;  // blank interior line
-                }
-                min_indent = std::min(min_indent, sp);
-                i = ls;
-            }
-        } else if (child.kind == XmlElement::Child::Element) {
-            min_indent = std::min(min_indent, xml_min_indent(*child.element));
-        }
-    }
-    return min_indent;
-}
-
-static void xml_strip_indent(XmlElement& el, int n) {
-    for (auto& child : el.children) {
-        if (child.kind == XmlElement::Child::Text) {
-            std::string out;
-            size_t i = 0;
-            while (i < child.text.size()) {
-                size_t nl = child.text.find('\n', i);
-                if (nl == std::string::npos) {
-                    out.append(child.text, i, std::string::npos);
-                    break;
-                }
-                out.append(child.text, i, nl - i + 1); // include \n
-                size_t ls = nl + 1;
-                int stripped = 0;
-                while (stripped < n && ls + stripped < child.text.size() &&
-                       child.text[ls + stripped] == ' ')
-                    ++stripped;
-                i = ls + stripped;
-            }
-            child.text = std::move(out);
-        } else if (child.kind == XmlElement::Child::Element) {
-            xml_strip_indent(*child.element, n);
-        }
-    }
-}
-
-static void xml_dedent(XmlElement& el) {
-    int n = xml_min_indent(el);
-    if (n > 0 && n < INT_MAX) xml_strip_indent(el, n);
-}
-
-// In JSON/XML value contexts, wrap a standalone true/false token as
-// sqldeep_json('true')/sqldeep_json('false') so it is returned as a
-// BLOB carrying JSON boolean semantics rather than integer 1/0.
-static void wrap_json_bool(SqlParts& parts) {
-    if (parts.size() != 1) return;
-    auto* s = std::get_if<std::string>(&parts[0]);
-    if (!s || s->size() < 4 || s->size() > 5) return;
-    // Case-insensitive check
-    std::string lower;
-    lower.reserve(s->size());
-    for (char c : *s)
-        lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (lower == "true")       *s = "sqldeep_json('true')";
-    else if (lower == "false") *s = "sqldeep_json('false')";
-}
-
-// ── Parser ──────────────────────────────────────────────────────────
-
-static bool is_keyword(const Token& t, const char* kw) {
-    if (t.type != TokenType::Ident) return false;
-    const auto& s = t.text;
-    size_t len = std::strlen(kw);
-    if (s.size() != len) return false;
-    for (size_t i = 0; i < len; ++i) {
-        if (std::toupper(static_cast<unsigned char>(s[i])) !=
-            std::toupper(static_cast<unsigned char>(kw[i])))
-            return false;
-    }
-    return true;
-}
-
-static bool is_sql_keyword(const std::string& s) {
-    static const char* keywords[] = {
-        "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT",
-        "OUTER", "CROSS", "NATURAL", "ON", "ORDER", "GROUP", "HAVING",
-        "LIMIT", "UNION", "INTERSECT", "EXCEPT", "AS", "AND", "OR",
-        "NOT", "IN", "IS", "NULL", "LIKE", "BETWEEN", "EXISTS",
-        "CASE", "WHEN", "THEN", "ELSE", "END", "SET", "INTO",
-        "VALUES", "INSERT", "UPDATE", "DELETE", "DISTINCT", "ALL",
-        "ASC", "DESC", "BY", "OFFSET", "FETCH", "FOR", "WITH", "USING",
-        "RECURSE",
-    };
-    for (const char* kw : keywords) {
-        if (is_keyword({TokenType::Ident, s, 0, 0, 0, 0}, kw))
-            return true;
-    }
-    return false;
-}
-
-static bool is_from_or_join(const Token& t) {
-    return is_keyword(t, "FROM") || is_keyword(t, "JOIN");
-}
-
-// Parse ON/USING clause after a join path step.
-// If out is non-null, stores {child_col, parent_col} pairs.
-// If out is null (skip mode for prescan), just advances past the tokens.
-static void parse_on_using(Lexer& lex, bool forward,
-                           std::vector<std::pair<std::string,std::string>>* out) {
-    Token t = lex.peek();
-
-    if (is_keyword(t, "ON")) {
-        lex.next(); // consume ON
-        Token first = lex.peek();
-        if (first.type != TokenType::Ident)
-            lex.error("expected column name after ON", first.line, first.col);
-        lex.next(); // consume first ident
-
-        Token eq = lex.peek();
-        if (eq.type == TokenType::Other && eq.text == "=") {
-            // Explicit pair mode: left_col = right_col
-            lex.next(); // consume =
-            Token second = lex.peek();
-            if (second.type != TokenType::Ident)
-                lex.error("expected column name after '='",
-                          second.line, second.col);
-            lex.next(); // consume second ident
-
-            if (out) {
-                if (forward) {
-                    // child = right of arrow: {right_col, left_col}
-                    out->push_back({second.text, first.text});
-                } else {
-                    // child = left of arrow: {left_col, right_col}
-                    out->push_back({first.text, second.text});
-                }
-            }
-
-            // Loop: AND ident = ident (save/restore to avoid consuming
-            // outer SQL's AND when pattern doesn't match).
-            while (true) {
-                auto st = lex.save();
-                Token and_tok = lex.peek();
-                if (!is_keyword(and_tok, "AND")) break;
-                lex.next(); // tentatively consume AND
-                Token col1 = lex.peek();
-                if (col1.type != TokenType::Ident) { lex.restore(st); break; }
-                lex.next();
-                Token eq2 = lex.peek();
-                if (eq2.type != TokenType::Other || eq2.text != "=") {
-                    lex.restore(st); break;
-                }
-                lex.next();
-                Token col2 = lex.peek();
-                if (col2.type != TokenType::Ident) { lex.restore(st); break; }
-                lex.next();
-
-                if (out) {
-                    if (forward) {
-                        out->push_back({col2.text, col1.text});
-                    } else {
-                        out->push_back({col1.text, col2.text});
-                    }
-                }
-            }
-        } else {
-            // Shorthand mode: same column name in both tables
-            if (out) {
-                out->push_back({first.text, first.text});
-            }
-        }
-    } else if (is_keyword(t, "USING")) {
-        lex.next(); // consume USING
-        Token lparen = lex.peek();
-        if (lparen.type != TokenType::LParen)
-            lex.error("expected '(' after USING", lparen.line, lparen.col);
-        lex.next(); // consume (
-
-        Token check = lex.peek();
-        if (check.type == TokenType::RParen)
-            lex.error("empty USING clause", check.line, check.col);
-
-        while (true) {
-            Token col = lex.peek();
-            if (col.type != TokenType::Ident)
-                lex.error("expected column name in USING clause",
-                          col.line, col.col);
-            lex.next();
-
-            if (out) {
-                out->push_back({col.text, col.text});
-            }
-
-            Token next = lex.peek();
-            if (next.type == TokenType::Comma) {
-                lex.next();
-            } else if (next.type == TokenType::RParen) {
-                lex.next();
-                break;
-            } else {
-                lex.error("expected ',' or ')' in USING clause",
-                          next.line, next.col);
-            }
-        }
-    }
-}
-
-// Pre-scan input to build alias → table name map.
-static std::unordered_map<std::string, std::string>
-build_alias_map(const std::string& input) {
-    std::unordered_map<std::string, std::string> map;
-    Lexer lex(input);
-    int paren_depth = 0;
-
-    while (true) {
-        Token t = lex.next();
-        if (t.type == TokenType::Eof) break;
-
-        if (t.type == TokenType::LParen) { ++paren_depth; continue; }
-        if (t.type == TokenType::RParen) {
-            if (paren_depth > 0) --paren_depth;
-            continue;
-        }
-
-        // Only look for aliases at paren depth 0.
-        if (paren_depth > 0) continue;
-
-        if (!is_from_or_join(t)) continue;
-
-        // After FROM/JOIN, expect table name or alias->child pattern.
-        Token first = lex.peek();
-        if (first.type != TokenType::Ident) continue;
-        lex.next(); // consume first ident
-
-        Token second = lex.peek();
-
-        // Pattern: ident (-> | <-) table [alias] [(-> | <-) table [alias] ...]
-        if (second.type == TokenType::Other &&
-            (second.text == "->" || second.text == "<-")) {
-            while (true) {
-                Token arrow = lex.peek();
-                if (arrow.type != TokenType::Other ||
-                    (arrow.text != "->" && arrow.text != "<-"))
-                    break;
-                lex.next(); // consume arrow
-                Token table = lex.peek();
-                if (table.type != TokenType::Ident) break;
-                lex.next(); // consume table
-                Token alias = lex.peek();
-                if (alias.type == TokenType::Ident && !is_sql_keyword(alias.text)) {
-                    lex.next();
-                    map[alias.text] = table.text;
-                }
-                parse_on_using(lex, true, nullptr); // skip past ON/USING
-            }
-            continue;
-        }
-
-        // Pattern: ident AS ident
-        if (is_keyword(second, "AS")) {
-            lex.next(); // consume AS
-            Token alias = lex.peek();
-            if (alias.type == TokenType::Ident) {
-                lex.next();
-                map[alias.text] = first.text;
-            }
-            continue;
-        }
-
-        // Pattern: ident ident (table alias)
-        if (second.type == TokenType::Ident && !is_sql_keyword(second.text)) {
-            lex.next();
-            map[second.text] = first.text;
-            continue;
-        }
-    }
-
-    return map;
-}
-
-class Parser {
-public:
-    Parser(Lexer& lex, std::unordered_map<std::string, std::string> alias_map,
-           Backend backend = Backend::sqlite)
-        : lex_(lex), alias_map_(std::move(alias_map)), backend_(backend) {}
-
-    SqlParts parse_document() {
-        return parse_sql_parts(/*stop_comma=*/false,
-                               /*stop_rbrace=*/false,
-                               /*stop_rbracket=*/false,
-                               /*stop_rparen=*/false,
-                               /*depth=*/0);
-    }
-
-private:
-    void check_depth(int depth, int line, int col) {
-        if (depth > kMaxNestingDepth)
-            lex_.error("maximum nesting depth exceeded", line, col);
-    }
-
-    // Try to consume /1 after SELECT. Returns true if consumed.
-    bool try_consume_singular() {
-        auto st = lex_.save();
-        Token slash = lex_.peek();
-        if (slash.type == TokenType::Other && slash.text == "/") {
-            lex_.next();
-            Token one = lex_.peek();
-            if (one.type == TokenType::Number && one.text == "1") {
-                lex_.next();
-                return true;
-            }
-        }
-        lex_.restore(st);
-        return false;
-    }
-
-    // Lookahead: is the current position the start of a FROM-first deep
-    // select?  Scans forward (tracking nesting depth) looking for
-    // SELECT {/[ at depth 0.  Restores lexer state before returning.
-    bool is_from_first(bool stop_comma, bool stop_rbrace,
-                       bool stop_rbracket, bool stop_rparen) {
-        auto st = lex_.save();
-        int pd = 0, bd = 0, bkd = 0;
-        while (true) {
-            Token t = lex_.next();
-            if (t.type == TokenType::Eof) break;
-
-            if (pd == 0 && bd == 0 && bkd == 0) {
-                if (stop_comma && t.type == TokenType::Comma) break;
-                if (stop_rbrace && t.type == TokenType::RBrace) break;
-                if (stop_rbracket && t.type == TokenType::RBracket) break;
-                if (stop_rparen && t.type == TokenType::RParen) break;
-                if (t.type == TokenType::Semicolon) break;
-
-                if (is_keyword(t, "SELECT")) {
-                    lex_.restore(st);
-                    return true;
-                }
-            }
-
-            if (t.type == TokenType::LParen) ++pd;
-            if (t.type == TokenType::RParen && pd > 0) --pd;
-            if (t.type == TokenType::LBrace) ++bd;
-            if (t.type == TokenType::RBrace && bd > 0) --bd;
-            if (t.type == TokenType::LBracket) ++bkd;
-            if (t.type == TokenType::RBracket && bkd > 0) --bkd;
-        }
-        lex_.restore(st);
-        return false;
-    }
-
-    // Parse FROM-first select: FROM ... SELECT ...
-    // Current position is before FROM.
-    std::unique_ptr<DeepSelect> parse_from_first_select(
-            bool stop_comma, bool stop_rbrace,
-            bool stop_rbracket, bool stop_rparen,
-            int depth) {
-        Token from_tok = lex_.peek();
-        check_depth(depth, from_tok.line, from_tok.col);
-
-        // Parse body (FROM ... WHERE ... etc.) until SELECT
-        auto body = parse_sql_parts(stop_comma, stop_rbrace,
-                                    stop_rbracket, stop_rparen,
-                                    depth, /*stop_at_select=*/true);
-
-        // Consume SELECT [/1]
-        Token select_tok = lex_.next();
-        if (!is_keyword(select_tok, "SELECT"))
-            lex_.error("expected SELECT after FROM clause",
-                       select_tok.line, select_tok.col);
-        bool singular = try_consume_singular();
-
-        // Parse projection
-        auto ds = std::make_unique<DeepSelect>();
-        ds->singular = singular;
-        Token t = lex_.peek();
-        if (t.type == TokenType::LBrace) {
-            ds->projection = std::move(*parse_object_literal(depth));
-        } else if (t.type == TokenType::LBracket) {
-            ds->projection = std::move(*parse_array_literal(depth));
-        } else {
-            // Plain SELECT — just rearrange, no JSON wrapping
-            ds->projection = parse_sql_parts(stop_comma, stop_rbrace,
-                                             stop_rbracket, stop_rparen,
-                                             depth);
-        }
-
-        ds->tail = std::move(body);
-        return ds;
-    }
-
-    // Parse a sequence of SQL fragments interleaved with deep constructs.
-    SqlParts parse_sql_parts(bool stop_comma,
-                             bool stop_rbrace,
-                             bool stop_rbracket,
-                             bool stop_rparen,
-                             int depth,
-                             bool stop_at_select = false) {
-        SqlParts parts;
-        std::string accum;
-        size_t last_end = 0; // src position after last consumed raw token
-        bool has_raw = false;
-        std::vector<size_t> accum_paren_starts; // stack of '(' positions in accum
-
-        auto flush = [&]() {
-            if (!accum.empty()) {
-                parts.push_back(std::move(accum));
-                accum.clear();
-                // Invalidate paren-start positions that referred into the
-                // flushed accum — they're no longer meaningful.
-                for (auto& ps : accum_paren_starts)
-                    ps = SIZE_MAX;
-            }
-            has_raw = false;
-        };
-
-        // Flush accumulated raw SQL, preserving spacing before the
-        // deep construct whose first source token is next_tok.
-        auto flush_before = [&](const Token& next_tok) {
-            if (has_raw && last_end < next_tok.src_begin)
-                accum += " ";
-            flush();
-        };
-
-        bool need_space = false; // space needed after a non-string AST part
-        bool in_from_context = false; // true after FROM/JOIN in current scope
-        std::vector<bool> from_context_stack; // saved per paren scope
-
-        auto accum_token = [&](const Token& tok) {
-            if (has_raw) {
-                // Add space only if there was whitespace/comments in source
-                if (last_end < tok.src_begin) accum += " ";
-            } else if (need_space && last_end < tok.src_begin) {
-                accum += " ";
-            }
-            accum += tok.text;
-            last_end = tok.src_end;
-            has_raw = true;
-            need_space = false;
-        };
-
-        int paren_depth = 0;
-
-        while (true) {
-            Token t = lex_.peek();
-
-            if (t.type == TokenType::Eof) break;
-
-            // Stop conditions at paren depth 0
-            if (paren_depth == 0) {
-                if (stop_comma && t.type == TokenType::Comma) break;
-                if (stop_rbrace && t.type == TokenType::RBrace) break;
-                if (stop_rbracket && t.type == TokenType::RBracket) break;
-                if (stop_rparen && t.type == TokenType::RParen) break;
-            }
-
-            // Semicolons at depth 0 pass through at top level, stop otherwise
-            if (t.type == TokenType::Semicolon && paren_depth == 0) {
-                if (!stop_comma && !stop_rbrace && !stop_rbracket && !stop_rparen) {
-                    Token tok = lex_.next();
-                    accum_token(tok);
-                    continue;
-                }
-                break;
-            }
-
-            // Check for (SELECT {/[) or (FROM ... SELECT {/[) pattern
-            if (t.type == TokenType::LParen) {
-                auto st = lex_.save();
-                lex_.next(); // consume (
-                Token t2 = lex_.peek();
-                if (is_keyword(t2, "SELECT")) {
-                    lex_.next(); // consume SELECT
-                    bool singular = try_consume_singular();
-                    Token t3 = lex_.peek();
-                    if (t3.type == TokenType::LBrace || t3.type == TokenType::LBracket) {
-                        // Found (SELECT[/1] {/[)
-                        flush_before(t);
-                        auto part = parse_deep_or_recursive_select(
-                            t2, singular,
-                            /*stop_comma=*/false, /*stop_rbrace=*/false,
-                            /*stop_rbracket=*/false, /*stop_rparen=*/true,
-                            depth + 1);
-                        Token rp = lex_.next(); // consume )
-                        if (rp.type != TokenType::RParen)
-                            lex_.error("expected ')' after subquery", rp.line, rp.col);
-                        // At paren_depth > 0, we consumed explicit (...)
-                        // so emit parens — the renderer won't add them
-                        // because the part is at the top of a SqlParts.
-                        if (paren_depth > 0) parts.push_back(std::string("("));
-                        parts.push_back(std::move(part));
-                        if (paren_depth > 0) parts.push_back(std::string(")"));
-                        last_end = rp.src_end;
-                        need_space = true;
-                        continue;
-                    }
-                }
-                // Not (SELECT {/[) — try (FROM ... SELECT ...)
-                lex_.restore(st);
-                lex_.next(); // re-consume (
-                t2 = lex_.peek();
-                if (is_keyword(t2, "FROM") &&
-                    is_from_first(false, false, false, /*stop_rparen=*/true)) {
-                    flush_before(t);
-                    auto ds = parse_from_first_select(
-                        /*stop_comma=*/false, /*stop_rbrace=*/false,
-                        /*stop_rbracket=*/false, /*stop_rparen=*/true,
-                        depth + 1);
-                    Token rp = lex_.next(); // consume )
-                    if (rp.type != TokenType::RParen)
-                        lex_.error("expected ')' after subquery",
-                                   rp.line, rp.col);
-                    // Plain projection: inline with explicit parens
-                    // (deep projections use DeepSelect whose renderer
-                    // adds parens when nested)
-                    if (std::holds_alternative<SqlParts>(ds->projection)) {
-                        parts.push_back(std::string("(SELECT "));
-                        for (auto& p : std::get<SqlParts>(ds->projection))
-                            parts.push_back(std::move(p));
-                        if (!ds->tail.empty()) {
-                            parts.push_back(std::string(" "));
-                            for (auto& p : ds->tail)
-                                parts.push_back(std::move(p));
-                        }
-                        parts.push_back(std::string(")"));
-                    } else {
-                        if (paren_depth > 0) parts.push_back(std::string("("));
-                        parts.push_back(std::move(ds));
-                        if (paren_depth > 0) parts.push_back(std::string(")"));
-                    }
-                    last_end = rp.src_end;
-                    need_space = true;
-                    continue;
-                }
-
-                // Not a deep subquery pattern, restore to before (
-                lex_.restore(st);
-            }
-
-            // Check for SELECT[/1] {/[/xml at any depth
-            if (is_keyword(t, "SELECT") && !stop_at_select) {
-                auto st = lex_.save();
-                lex_.next(); // consume SELECT
-                bool singular = try_consume_singular();
-                Token t2 = lex_.peek();
-                if (t2.type == TokenType::LBrace || t2.type == TokenType::LBracket) {
-                    flush_before(t);
-                    Token sel = {TokenType::Ident, "SELECT", t.line, t.col,
-                                 t.src_begin, t.src_end};
-                    auto part = parse_deep_or_recursive_select(
-                                                sel, singular,
-                                                stop_comma, stop_rbrace,
-                                                stop_rbracket, stop_rparen,
-                                                depth + 1);
-                    parts.push_back(std::move(part));
-                    last_end = lex_.offset();
-                    need_space = true;
-                    continue;
-                }
-                if (singular) {
-                    // SELECT/1 without {/[ — parse rest as plain SELECT
-                    // with LIMIT 1. Emit "SELECT" as raw SQL and let
-                    // the expression (XML, wrapper, etc.) be parsed by
-                    // subsequent handlers; append LIMIT 1 at the end.
-                    flush_before(t);
-                    auto rest = parse_sql_parts(stop_comma, stop_rbrace,
-                                                stop_rbracket, stop_rparen,
-                                                depth);
-                    parts.push_back(std::string("SELECT "));
-                    for (auto& p : rest)
-                        parts.push_back(std::move(p));
-                    parts.push_back(std::string(" LIMIT 1"));
-                    last_end = lex_.offset();
-                    need_space = true;
-                    continue;
-                }
-                // Not deep, not singular — restore and accumulate
-                lex_.restore(st);
-            }
-
-            // stop_at_select: break when SELECT at depth 0
-            if (stop_at_select && is_keyword(t, "SELECT") &&
-                paren_depth == 0) {
-                break;
-            }
-
-            // Check for FROM-first: FROM ... SELECT {/[
-            if (is_keyword(t, "FROM") && !stop_at_select) {
-                if (is_from_first(stop_comma, stop_rbrace,
-                                  stop_rbracket, stop_rparen)) {
-                    flush_before(t);
-                    auto ds = parse_from_first_select(
-                        stop_comma, stop_rbrace,
-                        stop_rbracket, stop_rparen,
-                        depth + 1);
-                    parts.push_back(std::move(ds));
-                    last_end = lex_.offset();
-                    need_space = true;
-                    continue;
-                }
-            }
-
-            // Check for inline { or [ (object/array literals).
-            // Valid at any paren depth — e.g. json_group_array({name, value}).
-            if (t.type == TokenType::LBrace) {
-                flush_before(t);
-                auto obj = parse_object_literal(depth + 1);
-                parts.push_back(std::move(obj));
-                last_end = lex_.offset();
-                need_space = true;
-                continue;
-            }
-
-            if (t.type == TokenType::LBracket) {
-                flush_before(t);
-                auto arr = parse_array_literal(depth + 1);
-                parts.push_back(std::move(arr));
-                last_end = lex_.offset();
-                need_space = true;
-                continue;
-            }
-
-            // Check for jsx(<...>), jsonml(<...>)
-            if (t.type == TokenType::Ident &&
-                (t.text == "jsx" || t.text == "jsonml")) {
-                XmlMode wrapper_mode = (t.text == "jsx") ? XmlMode::Jsx : XmlMode::Jsonml;
-                auto st = lex_.save();
-                lex_.next(); // consume wrapper name
-                Token t2 = lex_.peek();
-                if (t2.type == TokenType::LParen) {
-                    lex_.next(); // consume (
-                    Token t3 = lex_.peek();
-                    if (t3.type == TokenType::Other && t3.text == "<") {
-                        auto st2 = lex_.save();
-                        lex_.next(); // consume <
-                        Token t4 = lex_.peek();
-                        if (t4.type == TokenType::Ident) {
-                            lex_.restore(st2); // put back < ident
-                            flush_before(t);
-                            auto el = parse_xml_element(depth + 1,
-                                                        wrapper_mode);
-                            xml_dedent(*el);
-                            Token close = lex_.peek();
-                            if (close.type != TokenType::RParen)
-                                lex_.error("expected ')' after XML wrapper",
-                                           close.line, close.col);
-                            lex_.next(); // consume )
-                            parts.push_back(std::move(el));
-                            last_end = lex_.offset();
-                            need_space = true;
-                            continue;
-                        }
-                        lex_.restore(st2);
-                    }
-                }
-                lex_.restore(st);
-            }
-
-            // Check for XML element: < followed by ident (tag name).
-            // Unambiguous at any depth — < cannot start a SQL expression.
-            if (t.type == TokenType::Other && t.text == "<") {
-                auto st = lex_.save();
-                lex_.next(); // consume <
-                Token t2 = lex_.peek();
-                if (t2.type == TokenType::Ident) {
-                    lex_.restore(st);
-                    flush_before(t);
-                    auto el = parse_xml_element(depth + 1);
-                    xml_dedent(*el);
-                    parts.push_back(std::move(el));
-                    last_end = lex_.offset();
-                    need_space = true;
-                    continue;
-                }
-                lex_.restore(st);
-            }
-
-            // Track paren depth with per-scope FROM context
-            if (t.type == TokenType::LParen) {
-                ++paren_depth;
-                from_context_stack.push_back(in_from_context);
-                in_from_context = false; // new scope starts outside FROM
-            }
-            if (t.type == TokenType::RParen) {
-                if (paren_depth == 0)
-                    lex_.error("unmatched ')'", t.line, t.col);
-                --paren_depth;
-                if (!from_context_stack.empty()) {
-                    in_from_context = from_context_stack.back();
-                    from_context_stack.pop_back();
-                }
-            }
-
-            // Track FROM context for join path detection.
-            // -> and <- are only join operators after FROM/JOIN.
-            if (t.type == TokenType::Ident) {
-                if (is_from_or_join(t)) {
-                    in_from_context = true;
-                } else if (is_keyword(t, "SELECT") || is_keyword(t, "WHERE") ||
-                           is_keyword(t, "GROUP") || is_keyword(t, "ORDER") ||
-                           is_keyword(t, "HAVING") || is_keyword(t, "LIMIT") ||
-                           is_keyword(t, "UNION") || is_keyword(t, "INTERSECT") ||
-                           is_keyword(t, "EXCEPT") || is_keyword(t, "SET")) {
-                    in_from_context = false;
-                }
-            }
-
-            // Check for ident (-> | <-) ... (join path) — only in FROM context
-            if (t.type == TokenType::Ident && in_from_context) {
-                auto st = lex_.save();
-                Token alias_tok = lex_.next(); // consume ident
-                Token arrow = lex_.peek();
-                if (arrow.type == TokenType::Other &&
-                    (arrow.text == "->" || arrow.text == "<-")) {
-                    auto it = alias_map_.find(alias_tok.text);
-                    if (it == alias_map_.end())
-                        lex_.error("unknown table alias '" +
-                                   alias_tok.text + "'",
-                                   alias_tok.line, alias_tok.col);
-                    auto jp = std::make_unique<JoinPath>();
-                    jp->start_alias = alias_tok.text;
-                    jp->start_table = it->second;
-                    while (true) {
-                        Token arr = lex_.peek();
-                        if (arr.type != TokenType::Other ||
-                            (arr.text != "->" && arr.text != "<-"))
-                            break;
-                        lex_.next(); // consume arrow
-                        bool forward = (arr.text == "->");
-                        Token table_tok = lex_.peek();
-                        if (table_tok.type != TokenType::Ident)
-                            lex_.error("expected table name after '" +
-                                       arr.text + "'",
-                                       arr.line, arr.col);
-                        lex_.next(); // consume table
-                        std::string alias;
-                        Token next = lex_.peek();
-                        if (next.type == TokenType::Ident &&
-                            !is_sql_keyword(next.text)) {
-                            lex_.next(); // consume alias
-                            alias = next.text;
-                        }
-                        std::vector<std::pair<std::string,std::string>> columns;
-                        parse_on_using(lex_, forward, &columns);
-                        jp->steps.push_back({forward, table_tok.text, alias,
-                                             std::move(columns)});
-                    }
-                    flush_before(alias_tok);
-                    parts.push_back(std::move(jp));
-                    last_end = lex_.offset();
-                    need_space = true;
-                    continue;
-                }
-                lex_.restore(st);
-            }
-
-            // Accumulate raw SQL token, with JSON path detection on ')'
-            if (t.type == TokenType::LParen) {
-                Token tok = lex_.next();
-                // Record position in accum where '(' will be appended
-                size_t pos = accum.size();
-                if (has_raw && last_end < tok.src_begin) ++pos; // space will be added
-                else if (need_space && last_end < tok.src_begin) ++pos;
-                accum_paren_starts.push_back(pos);
-                accum_token(tok);
-            } else if (t.type == TokenType::RParen) {
-                Token tok = lex_.next();
-                accum_token(tok);
-                if (!accum_paren_starts.empty()) {
-                    size_t start = accum_paren_starts.back();
-                    accum_paren_starts.pop_back();
-                    if (start != SIZE_MAX &&
-                        try_transform_json_path(accum, start))
-                        last_end = lex_.offset();
-                }
-            } else {
-                Token tok = lex_.next();
-                accum_token(tok);
-            }
-        }
-
-        flush();
-        return parts;
-    }
-
-    // Parse RECURSE ON (fk [= pk]) [WHERE ...]
-    // Called after parsing object literal with a recursive field.
-    std::unique_ptr<RecursiveSelect> parse_recursive_select(
-            ObjectLiteral obj, bool singular,
-            bool stop_comma, bool stop_rbrace,
-            bool stop_rbracket, bool stop_rparen,
-            int depth) {
-        auto rs = std::make_unique<RecursiveSelect>();
-        rs->singular = singular;
-
-        // Separate recursive field from non-recursive fields
-        for (auto& f : obj.fields) {
-            if (f.recursive) {
-                rs->children_field = f.key;
-            } else {
-                rs->fields.push_back(std::move(f));
-            }
-        }
-
-        // Expect FROM table
-        Token from_tok = lex_.peek();
-        if (!is_keyword(from_tok, "FROM"))
-            lex_.error("expected FROM after recursive object literal",
-                       from_tok.line, from_tok.col);
-        lex_.next(); // consume FROM
-        Token table_tok = lex_.peek();
-        if (table_tok.type != TokenType::Ident)
-            lex_.error("expected table name after FROM",
-                       table_tok.line, table_tok.col);
-        lex_.next();
-        rs->table = table_tok.text;
-
-        // Expect RECURSE ON (fk [= pk])
-        Token recurse_tok = lex_.peek();
-        if (!is_keyword(recurse_tok, "RECURSE"))
-            lex_.error("expected RECURSE after table name",
-                       recurse_tok.line, recurse_tok.col);
-        lex_.next();
-        Token on_tok = lex_.peek();
-        if (!is_keyword(on_tok, "ON"))
-            lex_.error("expected ON after RECURSE",
-                       on_tok.line, on_tok.col);
-        lex_.next();
-        Token lparen = lex_.peek();
-        if (lparen.type != TokenType::LParen)
-            lex_.error("expected '(' after RECURSE ON",
-                       lparen.line, lparen.col);
-        lex_.next();
-        Token fk_tok = lex_.peek();
-        if (fk_tok.type != TokenType::Ident)
-            lex_.error("expected FK column name",
-                       fk_tok.line, fk_tok.col);
-        lex_.next();
-        rs->fk_column = fk_tok.text;
-        rs->pk_column = "id"; // default
-
-        Token eq_or_rp = lex_.peek();
-        if (eq_or_rp.type == TokenType::Other && eq_or_rp.text == "=") {
-            lex_.next(); // consume =
-            Token pk_tok = lex_.peek();
-            if (pk_tok.type != TokenType::Ident)
-                lex_.error("expected PK column name after '='",
-                           pk_tok.line, pk_tok.col);
-            lex_.next();
-            rs->pk_column = pk_tok.text;
-            eq_or_rp = lex_.peek();
-        }
-        if (eq_or_rp.type != TokenType::RParen)
-            lex_.error("expected ')' after RECURSE ON clause",
-                       eq_or_rp.line, eq_or_rp.col);
-        lex_.next(); // consume )
-
-        // Optional WHERE condition
-        Token where_tok = lex_.peek();
-        if (is_keyword(where_tok, "WHERE")) {
-            lex_.next(); // consume WHERE
-            rs->root_condition = parse_sql_parts(stop_comma, stop_rbrace,
-                                                  stop_rbracket, stop_rparen,
-                                                  depth);
-        }
-
-        return rs;
-    }
-
-    // Parse deep select — SELECT keyword has already been consumed.
-    // singular: true if /1 was already consumed after SELECT.
-    // Returns either a DeepSelect or a RecursiveSelect (via SqlPart).
-    SqlPart parse_deep_or_recursive_select(
-            const Token& select_tok,
-            bool singular,
-            bool stop_comma, bool stop_rbrace,
-            bool stop_rbracket, bool stop_rparen,
-            int depth) {
-        check_depth(depth, select_tok.line, select_tok.col);
-
-        Token t = lex_.peek();
-        if (t.type == TokenType::LBrace) {
-            auto obj = parse_object_literal(depth);
-
-            // Check if any field is recursive
-            for (const auto& f : obj->fields) {
-                if (f.recursive) {
-                    return parse_recursive_select(
-                        std::move(*obj), singular,
-                        stop_comma, stop_rbrace,
-                        stop_rbracket, stop_rparen, depth);
-                }
-            }
-
-            // Normal deep select
-            auto ds = std::make_unique<DeepSelect>();
-            ds->singular = singular;
-            ds->projection = std::move(*obj);
-            ds->tail = parse_sql_parts(stop_comma, stop_rbrace,
-                                       stop_rbracket, stop_rparen, depth);
-            return ds;
-        } else if (t.type == TokenType::LBracket) {
-            auto ds = std::make_unique<DeepSelect>();
-            ds->singular = singular;
-            ds->projection = std::move(*parse_array_literal(depth));
-            ds->tail = parse_sql_parts(stop_comma, stop_rbrace,
-                                       stop_rbracket, stop_rparen, depth);
-            return ds;
-        } else {
-            lex_.error("expected '{' or '[' after SELECT",
-                       select_tok.line, select_tok.col);
-        }
-    }
-
-    std::unique_ptr<ObjectLiteral> parse_object_literal(int depth) {
-        Token lbrace = lex_.next();
-        if (lbrace.type != TokenType::LBrace)
-            lex_.error("expected '{'", lbrace.line, lbrace.col);
-        check_depth(depth, lbrace.line, lbrace.col);
-
-        auto obj = std::make_unique<ObjectLiteral>();
-
-        while (true) {
-            Token t = lex_.peek();
-            if (t.type == TokenType::RBrace) { lex_.next(); break; }
-            if (t.type == TokenType::Eof)
-                lex_.error("unterminated '{'", lbrace.line, lbrace.col);
-
-            obj->fields.push_back(parse_field(depth));
-
-            t = lex_.peek();
-            if (t.type == TokenType::Comma) {
-                lex_.next();
-            } else if (t.type != TokenType::RBrace) {
-                lex_.error("expected ',' or '}' in object literal");
-            }
-        }
-
-        return obj;
-    }
-
-    ObjectLiteral::Field parse_field(int depth) {
-        ObjectLiteral::Field field;
-
-        Token key = lex_.peek();
-        if (key.type == TokenType::LParen) {
-            // Computed key: (expr): value
-            lex_.next(); // consume '('
-            field.computed_key = parse_sql_parts(/*stop_comma=*/false,
-                                                 /*stop_rbrace=*/false,
-                                                 /*stop_rbracket=*/false,
-                                                 /*stop_rparen=*/true,
-                                                 depth);
-            if (field.computed_key.empty())
-                lex_.error("expected expression in computed key", key.line, key.col);
-            Token rparen = lex_.peek();
-            if (rparen.type != TokenType::RParen)
-                lex_.error("expected ')' after computed key", rparen.line, rparen.col);
-            lex_.next(); // consume ')'
-        } else {
-            key = lex_.next();
-            if (key.type == TokenType::Ident) {
-                field.key = key.text;
-                // Qualified bare field: sm.repo → key="repo", value="sm.repo"
-                // Look ahead for .ident chains before the colon check.
-                std::string qualified;
-                while (true) {
-                    Token dot = lex_.peek();
-                    if (dot.type != TokenType::Other || dot.text != ".") break;
-                    auto st = lex_.save();
-                    lex_.next(); // consume .
-                    Token next = lex_.peek();
-                    if (next.type != TokenType::Ident) {
-                        lex_.restore(st);
-                        break;
-                    }
-                    lex_.next(); // consume ident
-                    if (qualified.empty()) {
-                        qualified = field.key + "." + next.text;
-                    } else {
-                        qualified += "." + next.text;
-                    }
-                    field.key = next.text; // key is always the last component
-                }
-                if (!qualified.empty()) {
-                    // Stash the full qualified name as the value
-                    field.qualified_value = qualified;
-                }
-            } else if (key.type == TokenType::DqString) {
-                // Strip outer quotes and unescape \" → " and \\ → \.
-                auto raw = key.text.substr(1, key.text.size() - 2);
-                field.key.reserve(raw.size());
-                for (size_t i = 0; i < raw.size(); ++i) {
-                    if (raw[i] == '\\' && i + 1 < raw.size() &&
-                        (raw[i + 1] == '"' || raw[i + 1] == '\\')) {
-                        field.key += raw[++i];
-                    } else if (raw[i] == '"' && i + 1 < raw.size() && raw[i + 1] == '"') {
-                        field.key += '"';
-                        ++i; // skip doubled quote
-                    } else {
-                        field.key += raw[i];
-                    }
-                }
-            } else {
-                lex_.error("expected field name (identifier, double-quoted string, or computed key)",
-                           key.line, key.col);
-            }
-        }
-
-        Token t = lex_.peek();
-        if (!field.computed_key.empty() && t.type != TokenType::Colon)
-            lex_.error("expected ':' after computed key", t.line, t.col);
-        if (t.type == TokenType::Colon) {
-            lex_.next();
-
-            // Check for * → recursive field
-            Token t2 = lex_.peek();
-            if (t2.type == TokenType::Other && t2.text == "*") {
-                lex_.next(); // consume *
-                field.recursive = true;
-                return field;
-            }
-
-            // Check for SELECT expr (no FROM) → aggregate field
-            t2 = lex_.peek();
-            if (is_keyword(t2, "SELECT")) {
-                auto st = lex_.save();
-                lex_.next(); // consume SELECT
-                bool singular = try_consume_singular();
-                Token t3 = lex_.peek();
-                if (t3.type != TokenType::LBrace && t3.type != TokenType::LBracket) {
-                    // SELECT expr (no { or [) — aggregate over current group
-                    field.aggregate = !singular;
-                    field.value = parse_sql_parts(/*stop_comma=*/true,
-                                                  /*stop_rbrace=*/true,
-                                                  /*stop_rbracket=*/false,
-                                                  /*stop_rparen=*/false,
-                                                  depth);
-                    if (field.value.empty())
-                        lex_.error("expected expression after 'SELECT'",
-                                   t2.line, t2.col);
-                    wrap_json_bool(field.value);
-                    return field;
-                }
-                // SELECT {/[ — restore and fall through to normal parsing
-                lex_.restore(st);
-            }
-
-            field.value = parse_sql_parts(/*stop_comma=*/true,
-                                          /*stop_rbrace=*/true,
-                                          /*stop_rbracket=*/false,
-                                          /*stop_rparen=*/false,
-                                          depth);
-            if (field.value.empty())
-                lex_.error("expected expression after ':'", t.line, t.col);
-            wrap_json_bool(field.value);
-        }
-
-        return field;
-    }
-
-    std::unique_ptr<ArrayLiteral> parse_array_literal(int depth) {
-        Token lbracket = lex_.next();
-        if (lbracket.type != TokenType::LBracket)
-            lex_.error("expected '['", lbracket.line, lbracket.col);
-        check_depth(depth, lbracket.line, lbracket.col);
-
-        auto arr = std::make_unique<ArrayLiteral>();
-
-        while (true) {
-            Token t = lex_.peek();
-            if (t.type == TokenType::RBracket) { lex_.next(); break; }
-            if (t.type == TokenType::Eof)
-                lex_.error("unterminated '['", lbracket.line, lbracket.col);
-
-            auto elem = parse_sql_parts(/*stop_comma=*/true,
-                                        /*stop_rbrace=*/false,
-                                        /*stop_rbracket=*/true,
-                                        /*stop_rparen=*/false,
-                                        depth);
-            if (elem.empty())
-                lex_.error("expected expression in array literal");
-            wrap_json_bool(elem);
-            arr->elements.push_back(std::move(elem));
-
-            t = lex_.peek();
-            if (t.type == TokenType::Comma) {
-                lex_.next();
-            } else if (t.type != TokenType::RBracket) {
-                lex_.error("expected ',' or ']' in array literal");
-            }
-        }
-
-        return arr;
-    }
-
-    // Parse XML tag name, allowing dots and colons for namespaced tags
-    // (e.g. "ui:Table.Row").
-    std::string parse_xml_tag_name() {
-        Token t = lex_.next();
-        if (t.type != TokenType::Ident)
-            lex_.error("expected tag name", t.line, t.col);
-        std::string name = t.text;
-        while (true) {
-            Token next = lex_.peek();
-            if (next.type == TokenType::Colon ||
-                (next.type == TokenType::Other && next.text == ".")) {
-                lex_.next();
-                name += next.text;
-                Token part = lex_.next();
-                if (part.type != TokenType::Ident)
-                    lex_.error("expected identifier after '" + next.text +
-                               "' in tag name", part.line, part.col);
-                name += part.text;
-            } else {
-                break;
-            }
-        }
-        return name;
-    }
-
-    std::unique_ptr<XmlElement> parse_xml_element(int depth,
-                                                     XmlMode xml_mode = XmlMode::Xml) {
-        Token lt = lex_.next(); // consume <
-        if (lt.type != TokenType::Other || lt.text != "<")
-            lex_.error("expected '<'", lt.line, lt.col);
-        check_depth(depth, lt.line, lt.col);
-
-        auto el = std::make_unique<XmlElement>();
-        el->mode = xml_mode;
-        el->tag = parse_xml_tag_name();
-
-        // Parse attributes until > or />
-        while (true) {
-            Token t = lex_.peek();
-
-            // Self-closing />
-            if (t.type == TokenType::Other && t.text == "/") {
-                lex_.next();
-                Token gt = lex_.next();
-                if (gt.type != TokenType::Other || gt.text != ">")
-                    lex_.error("expected '>' after '/'", gt.line, gt.col);
-                el->self_closing = true;
-                return el;
-            }
-
-            // End of open tag
-            if (t.type == TokenType::Other && t.text == ">") {
-                lex_.next();
-                break;
-            }
-
-            if (t.type == TokenType::Eof)
-                lex_.error("unterminated XML element", lt.line, lt.col);
-
-            // Attribute: name [ = value ]
-            if (t.type != TokenType::Ident)
-                lex_.error("expected attribute name or '>'", t.line, t.col);
-            lex_.next();
-            std::string attr_name = t.text;
-
-            Token eq = lex_.peek();
-            if (eq.type != TokenType::Other || eq.text != "=") {
-                // Boolean attribute: emit sqldeep_json('true') so xml_attrs renders bare name
-                SqlParts val;
-                val.push_back(std::string("sqldeep_json('true')"));
-                el->attrs.push_back({attr_name, std::move(val), false});
-                continue;
-            }
-            lex_.next(); // consume =
-
-            Token val = lex_.peek();
-            if (val.type == TokenType::DqString) {
-                // Static attribute: name="value"
-                lex_.next();
-                SqlParts sval;
-                // Convert "..." to '...' for SQL
-                std::string content = val.text.substr(1, val.text.size() - 2);
-                sval.push_back(std::string("'") + content + "'");
-                el->attrs.push_back({attr_name, std::move(sval), false});
-            } else if (val.type == TokenType::LBrace) {
-                // Dynamic attribute: name={expr}
-                lex_.next(); // consume {
-                auto expr = parse_sql_parts(/*stop_comma=*/false,
-                                            /*stop_rbrace=*/true,
-                                            /*stop_rbracket=*/false,
-                                            /*stop_rparen=*/false,
-                                            depth);
-                Token rb = lex_.next();
-                if (rb.type != TokenType::RBrace)
-                    lex_.error("expected '}' after attribute expression",
-                               rb.line, rb.col);
-                wrap_json_bool(expr);
-                el->attrs.push_back({attr_name, std::move(expr), true});
-            } else {
-                lex_.error("expected '\"...' or '{...}' after '='",
-                           val.line, val.col);
-            }
-        }
-
-        // Parse children until </tag>
-        while (true) {
-            // Read raw text until < or {
-            std::string text = lex_.read_raw_until_xml_special();
-            if (!text.empty()) {
-                XmlElement::Child child;
-                child.kind = XmlElement::Child::Text;
-                child.text = std::move(text);
-                el->children.push_back(std::move(child));
-            }
-
-            // Check what stopped us
-            Token t = lex_.peek();
-            if (t.type == TokenType::Eof)
-                lex_.error("unterminated XML element '<" + el->tag + ">'",
-                           lt.line, lt.col);
-
-            if (t.type == TokenType::Other && t.text == "<") {
-                // Peek further: < followed by / = closing tag,
-                // < followed by ident = child element
-                auto st = lex_.save();
-                lex_.next(); // consume <
-                Token t2 = lex_.peek();
-
-                if (t2.type == TokenType::Other && t2.text == "/") {
-                    // Closing tag </tag>
-                    lex_.next(); // consume /
-                    std::string close_tag = parse_xml_tag_name();
-                    if (close_tag != el->tag)
-                        lex_.error("mismatched closing tag: expected '</" +
-                                   el->tag + ">' but found '</" +
-                                   close_tag + ">'", t.line, t.col);
-                    Token gt = lex_.next();
-                    if (gt.type != TokenType::Other || gt.text != ">")
-                        lex_.error("expected '>' in closing tag",
-                                   gt.line, gt.col);
-                    break;
-                }
-
-                if (t2.type == TokenType::Ident) {
-                    // Child element — restore to before < and recurse
-                    lex_.restore(st);
-                    XmlElement::Child child;
-                    child.kind = XmlElement::Child::Element;
-                    child.element = parse_xml_element(depth + 1, xml_mode);
-                    el->children.push_back(std::move(child));
-                    continue;
-                }
-
-                // Bare < in content is an error
-                lex_.error("unexpected '<' in XML content", t.line, t.col);
-            }
-
-            if (t.type == TokenType::LBrace) {
-                lex_.next(); // consume {
-
-                // Check for {{ — JSON object inside interpolation
-                Token t2 = lex_.peek();
-                if (t2.type == TokenType::LBrace) {
-                    auto obj = parse_object_literal(depth + 1);
-                    Token rb = lex_.next();
-                    if (rb.type != TokenType::RBrace)
-                        lex_.error("expected '}' after interpolated object",
-                                   rb.line, rb.col);
-                    XmlElement::Child child;
-                    child.kind = XmlElement::Child::Interpolation;
-                    child.expr.push_back(std::move(obj));
-                    el->children.push_back(std::move(child));
-                    continue;
-                }
-
-                // {SELECT ...} — subquery inside XML
-                if (is_keyword(t2, "SELECT")) {
-                    lex_.next(); // consume SELECT
-                    bool singular = try_consume_singular();
-                    Token t3 = lex_.peek();
-
-                    // SELECT followed by XML element: wrap in DeepSelect
-                    if (t3.type == TokenType::Other && t3.text == "<") {
-                        auto st2 = lex_.save();
-                        lex_.next(); // consume <
-                        Token t4 = lex_.peek();
-                        lex_.restore(st2);
-                        if (t4.type == TokenType::Ident) {
-                            auto xml_el = parse_xml_element(depth + 1, xml_mode);
-                            SqlParts proj;
-                            proj.push_back(std::move(xml_el));
-
-                            auto tail = parse_sql_parts(
-                                /*stop_comma=*/false,
-                                /*stop_rbrace=*/true,
-                                /*stop_rbracket=*/false,
-                                /*stop_rparen=*/false,
-                                depth + 1);
-
-                            auto ds = std::make_unique<DeepSelect>();
-                            ds->projection = std::move(proj);
-                            ds->tail = std::move(tail);
-                            ds->singular = singular;
-                            ds->xml_context = true;
-                            ds->xml_mode = xml_mode;
-
-                            Token rb = lex_.next();
-                            if (rb.type != TokenType::RBrace)
-                                lex_.error("expected '}' after XML subquery",
-                                           rb.line, rb.col);
-                            XmlElement::Child child;
-                            child.kind = XmlElement::Child::Interpolation;
-                            child.expr.push_back(std::move(ds));
-                            el->children.push_back(std::move(child));
-                            continue;
-                        }
-                    }
-
-                    // SELECT followed by { or [ — existing deep select
-                    if (t3.type == TokenType::LBrace ||
-                        t3.type == TokenType::LBracket) {
-                        auto part = parse_deep_or_recursive_select(
-                            t2, singular,
-                            /*stop_comma=*/false,
-                            /*stop_rbrace=*/true,
-                            /*stop_rbracket=*/false,
-                            /*stop_rparen=*/false,
-                            depth + 1);
-                        Token rb = lex_.next();
-                        if (rb.type != TokenType::RBrace)
-                            lex_.error("expected '}' after subquery",
-                                       rb.line, rb.col);
-                        XmlElement::Child child;
-                        child.kind = XmlElement::Child::Interpolation;
-                        child.expr.push_back(std::move(part));
-                        el->children.push_back(std::move(child));
-                        continue;
-                    }
-
-                    // SELECT followed by plain expression — restore and
-                    // fall through to generic expression parsing
-                    // We need to un-consume SELECT, but we already consumed it.
-                    // Simplest: build a DeepSelect with SqlParts projection.
-                    auto proj = parse_sql_parts(
-                        /*stop_comma=*/false,
-                        /*stop_rbrace=*/true,
-                        /*stop_rbracket=*/false,
-                        /*stop_rparen=*/false,
-                        depth + 1,
-                        /*stop_at_select=*/false);
-                    // Split projection from tail at FROM keyword
-                    // Actually, just wrap in DeepSelect with plain projection
-                    auto ds = std::make_unique<DeepSelect>();
-                    ds->projection = std::move(proj);
-                    ds->singular = singular;
-                    ds->xml_context = true;
-                    ds->xml_mode = xml_mode;
-
-                    Token rb = lex_.next();
-                    if (rb.type != TokenType::RBrace)
-                        lex_.error("expected '}' after subquery",
-                                   rb.line, rb.col);
-                    XmlElement::Child child;
-                    child.kind = XmlElement::Child::Interpolation;
-                    child.expr.push_back(std::move(ds));
-                    el->children.push_back(std::move(child));
-                    continue;
-                }
-
-                // {FROM ... SELECT ...} — FROM-first subquery inside XML
-                if (is_keyword(t2, "FROM") &&
-                    is_from_first(false, true, false, false)) {
-                    auto ds = parse_from_first_select(
-                        /*stop_comma=*/false, /*stop_rbrace=*/true,
-                        /*stop_rbracket=*/false, /*stop_rparen=*/false,
-                        depth + 1);
-                    ds->xml_context = true;
-                    ds->xml_mode = xml_mode;
-                    Token rb = lex_.next();
-                    if (rb.type != TokenType::RBrace)
-                        lex_.error("expected '}' after FROM-first subquery",
-                                   rb.line, rb.col);
-                    XmlElement::Child child;
-                    child.kind = XmlElement::Child::Interpolation;
-                    child.expr.push_back(std::move(ds));
-                    el->children.push_back(std::move(child));
-                    continue;
-                }
-
-                // {expr} — plain interpolation
-                auto expr = parse_sql_parts(/*stop_comma=*/false,
-                                            /*stop_rbrace=*/true,
-                                            /*stop_rbracket=*/false,
-                                            /*stop_rparen=*/false,
-                                            depth + 1);
-                Token rb = lex_.next();
-                if (rb.type != TokenType::RBrace)
-                    lex_.error("expected '}' after interpolation",
-                               rb.line, rb.col);
-                wrap_json_bool(expr);
-                XmlElement::Child child;
-                child.kind = XmlElement::Child::Interpolation;
-                child.expr = std::move(expr);
-                el->children.push_back(std::move(child));
-                continue;
-            }
-        }
-
-        return el;
-    }
-
-    // Check if '(' at position start in accum is a JSON path base
-    // (not a function call). A function call has an identifier (not a SQL
-    // keyword) immediately before '('. SQL keywords like WHERE, AND, SELECT
-    // can precede parenthesized JSON path bases.
-    static bool can_be_json_path_base(const std::string& accum, size_t start) {
-        if (start == 0) return true;
-        size_t i = start;
-        // Skip trailing spaces
-        while (i > 0 && accum[i - 1] == ' ') --i;
-        if (i == 0) return true;
-        char c = accum[i - 1];
-        if (c == ')') return false; // nested parens = function-like
-        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_'))
-            return true; // operator, comma, etc. — not a function call
-        // Extract the preceding word
-        size_t end = i;
-        while (i > 0 && (std::isalnum(static_cast<unsigned char>(accum[i - 1])) ||
-                         accum[i - 1] == '_'))
-            --i;
-        std::string word = accum.substr(i, end - i);
-        // SQL keywords can precede a path base; bare identifiers are function calls
-        return is_sql_keyword(word);
-    }
-
-    // After accumulating ')' at the end of accum, check if the paren group
-    // starting at `start` is followed by .ident or [number] path segments.
-    // If so, transform it into json_extract() / jsonb_extract_path() in place.
-    // Returns true if a transformation was applied (tokens consumed from lexer).
-    bool try_transform_json_path(std::string& accum, size_t start) {
-        if (!can_be_json_path_base(accum, start)) return false;
-
-        // Peek ahead for .ident or [
-        Token next = lex_.peek();
-        bool has_dot = (next.type == TokenType::Other && next.text == ".");
-        bool has_bracket = (next.type == TokenType::LBracket);
-        if (!has_dot && !has_bracket) return false;
-
-        // If dot, check it's followed by an ident (not a number or operator)
-        if (has_dot) {
-            auto st = lex_.save();
-            lex_.next(); // consume .
-            Token after_dot = lex_.peek();
-            lex_.restore(st);
-            if (after_dot.type != TokenType::Ident) return false;
-        }
-
-        // Extract base expression (everything inside parens, excluding parens)
-        std::string base = accum.substr(start + 1, accum.size() - start - 2);
-        accum.resize(start);
-
-        // Parse path segments
-        struct PathSeg {
-            bool is_field; // true = .ident, false = [number]
-            std::string value;
-        };
-        std::vector<PathSeg> segs;
-
-        while (true) {
-            Token t = lex_.peek();
-            if (t.type == TokenType::Other && t.text == ".") {
-                auto st = lex_.save();
-                lex_.next(); // consume .
-                Token ident = lex_.peek();
-                if (ident.type != TokenType::Ident) {
-                    lex_.restore(st);
-                    break;
-                }
-                lex_.next(); // consume ident
-                segs.push_back({true, ident.text});
-            } else if (t.type == TokenType::LBracket) {
-                lex_.next(); // consume [
-                Token idx = lex_.peek();
-                if (idx.type != TokenType::Number)
-                    lex_.error("expected array index", idx.line, idx.col);
-                lex_.next(); // consume number
-                Token rb = lex_.peek();
-                if (rb.type != TokenType::RBracket)
-                    lex_.error("expected ']'", rb.line, rb.col);
-                lex_.next(); // consume ]
-                segs.push_back({false, idx.text});
-            } else {
-                break;
-            }
-        }
-
-        if (segs.empty()) {
-            // No segments parsed — restore the parens
-            accum += "(";
-            accum += base;
-            accum += ")";
-            return false;
-        }
-
-        // Render json_extract / jsonb_extract_path
-        if (backend_ == Backend::postgres) {
-            accum += "jsonb_extract_path(";
-            accum += base;
-            for (const auto& seg : segs) {
-                accum += ", '";
-                accum += seg.value;
-                accum += "'";
-            }
-            accum += ")";
-        } else {
-            accum += "json_extract(CAST((";
-            accum += base;
-            accum += ") AS TEXT), '$";
-            for (const auto& seg : segs) {
-                if (seg.is_field) {
-                    accum += ".";
-                    accum += seg.value;
-                } else {
-                    accum += "[";
-                    accum += seg.value;
-                    accum += "]";
-                }
-            }
-            accum += "')";
-        }
-        return true;
-    }
-
-    Lexer& lex_;
-    std::unordered_map<std::string, std::string> alias_map_;
-    Backend backend_;
-};
-
-// ── Renderer ────────────────────────────────────────────────────────
-
-// Escape single-quote characters for use inside a SQL string literal.
-static std::string sql_escape_key(const std::string& s) {
-    std::string r;
-    r.reserve(s.size());
-    for (char c : s) {
-        if (c == '\'') r += "''";
-        else r += c;
-    }
-    return r;
-}
-
-// FK index: maps (from_table, to_table) → list of FKs between them.
 using FkIndex = std::map<std::pair<std::string,std::string>,
                          std::vector<const ForeignKey*>>;
 
@@ -10417,15 +8549,12 @@ FkIndex build_fk_index(const std::vector<ForeignKey>& fks) {
     return idx;
 }
 
-// Resolve column pairs for a join between child_table and parent_table.
-// In convention mode (fk_index == nullptr), returns {(parent+"_id", parent+"_id")}.
-// In FK mode, looks up the index and errors if 0 or 2+ matches.
+// Convention mode (fk_index == nullptr): child has FK '<parent>_id'.
 std::vector<std::pair<std::string,std::string>>
 resolve_fk_columns(const std::string& child_table,
                    const std::string& parent_table,
                    const FkIndex* fk_index) {
     if (!fk_index) {
-        // Convention mode
         std::string col = parent_table + "_id";
         return {{col, col}};
     }
@@ -10439,460 +8568,1613 @@ resolve_fk_columns(const std::string& child_table,
                     parent_table + "' (" + std::to_string(it->second.size()) +
                     " candidates)", 0, 0);
     }
-    const auto& fk = *it->second[0];
     std::vector<std::pair<std::string,std::string>> cols;
-    cols.reserve(fk.columns.size());
-    for (const auto& cp : fk.columns) {
+    cols.reserve(it->second[0]->columns.size());
+    for (const auto& cp : it->second[0]->columns)
         cols.emplace_back(cp.from_column, cp.to_column);
-    }
     return cols;
 }
 
-class Renderer {
-public:
-    explicit Renderer(const FkIndex* fk_index = nullptr,
-                      Backend backend = Backend::sqlite)
-        : fk_index_(fk_index), backend_(backend) {
-        switch (backend) {
-        case Backend::postgres:
-            fn_object_      = "jsonb_build_object";
-            fn_array_       = "jsonb_build_array";
-            fn_group_array_ = "jsonb_agg";
-            break;
-        default:
-            fn_object_      = "sqldeep_json_object";
-            fn_array_       = "sqldeep_json_array";
-            fn_group_array_ = "sqldeep_json_group_array";
-            break;
+// ── AST construction helpers ─────────────────────────────────────────
+//
+// Sqldeep mutates the deepparser AST in place and also constructs new
+// LpNode objects for replacement subtrees. The helpers below build the
+// standard-SQL node kinds we emit; they parallel deepparser's
+// grammar-action factories but live outside the parser since we're not
+// parsing — we have nothing but an arena to allocate into.
+
+LpNode *new_node(arena_t *arena, LpNodeKind kind) {
+    auto *n = static_cast<LpNode*>(arena_zeroalloc(arena, sizeof(LpNode)));
+    if (n) n->kind = kind;
+    return n;
+}
+
+char *arena_str(arena_t *arena, const std::string& s) {
+    return arena_strdup(arena, s.c_str());
+}
+
+void list_append(arena_t *arena, LpNodeList *list, LpNode *item) {
+    if (list->count >= list->capacity) {
+        int cap = list->capacity ? list->capacity * 2 : 4;
+        auto **items = static_cast<LpNode**>(
+            arena_alloc(arena, sizeof(LpNode*) * cap));
+        if (!items) return;
+        if (list->items)
+            std::memcpy(items, list->items, sizeof(LpNode*) * list->count);
+        list->items = items;
+        list->capacity = cap;
+    }
+    list->items[list->count++] = item;
+}
+
+LpNode *make_string_lit(arena_t *arena, const std::string& value) {
+    auto *n = new_node(arena, LP_EXPR_LITERAL_STRING);
+    if (n) n->u.literal.value = arena_str(arena, value);
+    return n;
+}
+
+LpNode *make_int_lit(arena_t *arena, const std::string& digits) {
+    auto *n = new_node(arena, LP_EXPR_LITERAL_INT);
+    if (n) n->u.literal.value = arena_str(arena, digits);
+    return n;
+}
+
+LpNode *make_column_ref(arena_t *arena, const std::string& column) {
+    auto *n = new_node(arena, LP_EXPR_COLUMN_REF);
+    if (n) n->u.column_ref.column = arena_str(arena, column);
+    return n;
+}
+
+LpNode *make_column_ref2(arena_t *arena, const std::string& table,
+                          const std::string& column) {
+    auto *n = new_node(arena, LP_EXPR_COLUMN_REF);
+    if (!n) return nullptr;
+    n->u.column_ref.table  = arena_str(arena, table);
+    n->u.column_ref.column = arena_str(arena, column);
+    return n;
+}
+
+LpNode *make_binop(arena_t *arena, LpBinOp op, LpNode *left, LpNode *right) {
+    auto *n = new_node(arena, LP_EXPR_BINARY_OP);
+    if (!n) return nullptr;
+    n->u.binary.op    = op;
+    n->u.binary.left  = left;
+    n->u.binary.right = right;
+    return n;
+}
+
+// AND together a chain of expressions, left-associative.
+LpNode *and_chain(arena_t *arena, const std::vector<LpNode*>& parts) {
+    if (parts.empty()) return nullptr;
+    LpNode *acc = parts[0];
+    for (size_t i = 1; i < parts.size(); i++)
+        acc = make_binop(arena, LP_OP_AND, acc, parts[i]);
+    return acc;
+}
+
+LpNode *make_from_table(arena_t *arena, const std::string& name,
+                         const std::string& alias) {
+    auto *n = new_node(arena, LP_FROM_TABLE);
+    if (!n) return nullptr;
+    n->u.from_table.name  = arena_str(arena, name);
+    if (!alias.empty()) n->u.from_table.alias = arena_str(arena, alias);
+    return n;
+}
+
+LpNode *make_join(arena_t *arena, LpNode *left, LpNode *right,
+                   LpNode *on_expr) {
+    auto *n = new_node(arena, LP_JOIN_CLAUSE);
+    if (!n) return nullptr;
+    n->u.join.left    = left;
+    n->u.join.right   = right;
+    n->u.join.on_expr = on_expr;
+    /* join_type=0 → INNER JOIN; matches sqldeep's existing emission. */
+    return n;
+}
+
+LpNode *make_function(arena_t *arena, const std::string& name,
+                       std::vector<LpNode*> args) {
+    auto *n = new_node(arena, LP_EXPR_FUNCTION);
+    if (!n) return nullptr;
+    n->u.function.name = arena_str(arena, name);
+    for (auto *a : args) list_append(arena, &n->u.function.args, a);
+    return n;
+}
+
+LpNode *make_cast(arena_t *arena, LpNode *expr, const std::string& type_name) {
+    auto *n = new_node(arena, LP_EXPR_CAST);
+    if (!n) return nullptr;
+    n->u.cast.expr = expr;
+    n->u.cast.type_name = arena_str(arena, type_name);
+    return n;
+}
+
+LpNode *make_limit(arena_t *arena, int count) {
+    auto *n = new_node(arena, LP_LIMIT);
+    if (!n) return nullptr;
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%d", count);
+    n->u.limit.count = make_int_lit(arena, buf);
+    return n;
+}
+
+// ── Positional-parameter order preservation ─────────────────────────
+//
+// Anonymous positional parameters ("?") are order-sensitive: SQLite and
+// PostgreSQL number them by left-to-right textual position, so the Nth
+// "?" in the caller's input must remain the Nth "?" in the transpiled
+// output, or the caller's bound values silently land on the wrong
+// placeholders. Sqldeep's rewrites can move expressions around (most
+// obviously the FROM-first SELECT, whose projection is authored last but
+// emitted first), so we must guarantee the order survives — or refuse.
+//
+// Rather than reason about which rewrite reorders what, we verify it
+// empirically: before transforming, every "?" is renamed to a unique
+// sentinel named parameter (":__sqldeep_param_<N>__") in source order.
+// Transforms move AST nodes by kind and structure, never by variable
+// name, so each sentinel lands exactly where its "?" would have. After
+// unparsing we read the sentinels back out of the output; if they don't
+// appear exactly once each, in ascending order, a rewrite reordered
+// (or dropped/duplicated) the parameters and we raise an error.
+// Otherwise the sentinels are substituted back to "?".
+//
+// Numbered ("?N") and named (":x" / "@x" / "$x") parameters bind by
+// explicit index or name, so their position is irrelevant; they are left
+// untouched and pass through unharmed.
+constexpr const char *kPosParamPrefix = ":__sqldeep_param_";
+constexpr const char *kPosParamSuffix = "__";
+
+// Collect every anonymous "?" variable node in a statement.
+void collect_anon_params(LpNode *root, std::vector<LpNode*>& out) {
+    struct Ctx { LpVisitor v; std::vector<LpNode*> *out; } ctx{};
+    ctx.v.user_data = &ctx;
+    ctx.out = &out;
+    ctx.v.enter = [](LpVisitor *v, LpNode *nd) -> int {
+        if (nd->kind == LP_EXPR_VARIABLE && nd->u.variable.name
+            && std::strcmp(nd->u.variable.name, "?") == 0) {
+            static_cast<Ctx*>(v->user_data)->out->push_back(nd);
+        }
+        return 0;
+    };
+    ctx.v.leave = nullptr;
+    lp_ast_walk(root, &ctx.v);
+}
+
+// Rename every "?" across all statements to a sentinel named parameter
+// numbered 1..N in source (byte-offset) order. Returns N.
+int mark_positional_params(LpNodeList *stmts, arena_t *arena) {
+    std::vector<LpNode*> params;
+    for (int i = 0; i < stmts->count; i++)
+        collect_anon_params(stmts->items[i], params);
+    std::sort(params.begin(), params.end(), [](LpNode *a, LpNode *b) {
+        return a->pos.offset < b->pos.offset;
+    });
+    for (size_t i = 0; i < params.size(); i++) {
+        std::string name = kPosParamPrefix + std::to_string(i + 1)
+                         + kPosParamSuffix;
+        params[i]->u.variable.name = arena_str(arena, name);
+    }
+    return static_cast<int>(params.size());
+}
+
+// Verify the N sentinels appear exactly once each, in ascending order,
+// in the transpiled output; throw if a rewrite reordered them. On
+// success, substitute each sentinel back to "?".
+void restore_positional_params(std::string& sql, int count) {
+    if (count == 0) return;
+    const std::string prefix = kPosParamPrefix;
+    std::vector<int> order;
+    for (size_t pos = 0; (pos = sql.find(prefix, pos)) != std::string::npos;) {
+        size_t num = pos + prefix.size();
+        size_t end = num;
+        while (end < sql.size() && sql[end] >= '0' && sql[end] <= '9') end++;
+        order.push_back(std::atoi(sql.substr(num, end - num).c_str()));
+        pos = end;
+    }
+    bool ok = (static_cast<int>(order.size()) == count);
+    for (int i = 0; ok && i < count; i++) ok = (order[i] == i + 1);
+    if (!ok) {
+        throw Error("cannot preserve positional parameter (?) order: a "
+                    "rewrite reordered the '?' placeholders, which would "
+                    "misbind the caller's values. Use named (:name) or "
+                    "numbered (?1) parameters instead.", 0, 0);
+    }
+    for (int n = 1; n <= count; n++) {
+        std::string marker = prefix + std::to_string(n) + kPosParamSuffix;
+        for (size_t pos = 0;
+             (pos = sql.find(marker, pos)) != std::string::npos;) {
+            sql.replace(pos, marker.size(), "?");
+            pos += 1;
         }
     }
+}
 
-    std::string render_document(const SqlParts& parts) {
-        std::string out;
-        render_parts(parts, out, /*nested=*/false);
-        return out;
+// ── Transformer ─────────────────────────────────────────────────────
+
+constexpr int kMaxNestingDepth = 200;
+
+// XML emission flavour. JSX and JSONML are sqldeep transpiler macros
+// — `jsx(<el/>)` / `jsonml(<el/>)` — that select alternative XML
+// helper function names (xml_element_jsx, xml_attrs_jsx, jsx_agg vs.
+// the plain xml_* family).
+enum class XmlMode { Xml, Jsx, Jsonml };
+
+class Transformer {
+public:
+    Transformer(arena_t *arena, Backend backend, const FkIndex *fk_index)
+        : arena_(arena), backend_(backend), fk_index_(fk_index) {}
+
+    // Mutate the AST in place. Returns the (possibly new) root node.
+    LpNode *transform(LpNode *node) {
+        build_alias_map(node);
+        return walk(node, /*depth=*/0, XmlMode::Xml);
     }
 
 private:
-    void render_parts(const SqlParts& parts, std::string& out, bool nested) {
-        for (const auto& part : parts) {
-            std::visit([&](const auto& v) {
-                using T = std::decay_t<decltype(v)>;
-                if constexpr (std::is_same_v<T, std::string>) {
-                    out += v;
-                } else if constexpr (std::is_same_v<T, std::unique_ptr<DeepSelect>>) {
-                    render_deep_select(*v, out, nested);
-                } else if constexpr (std::is_same_v<T, std::unique_ptr<ObjectLiteral>>) {
-                    render_object(*v, out);
-                } else if constexpr (std::is_same_v<T, std::unique_ptr<ArrayLiteral>>) {
-                    render_array(*v, out);
-                } else if constexpr (std::is_same_v<T, std::unique_ptr<JoinPath>>) {
-                    render_join_path(*v, out);
-                } else if constexpr (std::is_same_v<T, std::unique_ptr<RecursiveSelect>>) {
-                    render_recursive_select(*v, out);
-                } else if constexpr (std::is_same_v<T, std::unique_ptr<XmlElement>>) {
-                    render_xml_element(*v, out);
+    arena_t      *arena_;
+    Backend       backend_;
+    const FkIndex *fk_index_;
+
+    // alias → underlying table name, collected by a pre-pass over the
+    // entire AST so a sqldeep join path like `c->orders o` can resolve
+    // the leftmost name `c` (an alias from an enclosing FROM clause)
+    // to its real table when building the start-correlation.
+    std::map<std::string, std::string> alias_map_;
+
+    // ── Alias-map prepass ─────────────────────────────────────────
+
+    void build_alias_map(LpNode *node) {
+        if (!node) return;
+        switch (node->kind) {
+            case LP_FROM_TABLE:
+                if (node->u.from_table.name) {
+                    /* Use alias if given, else map the table to itself
+                     * so unqualified table names also resolve. */
+                    const char *key = node->u.from_table.alias
+                                       ? node->u.from_table.alias
+                                       : node->u.from_table.name;
+                    alias_map_[key] = node->u.from_table.name;
                 }
-            }, part);
-        }
-    }
-
-    void render_deep_select(const DeepSelect& ds, std::string& out, bool nested) {
-        // SqlParts projection: plain rearrangement or XML subquery
-        if (std::holds_alternative<SqlParts>(ds.projection)) {
-            if (nested) out += "(";
-            out += "SELECT ";
-            if (ds.xml_context && !ds.singular) {
-                switch (ds.xml_mode) {
-                case XmlMode::Jsx:    out += "jsx_agg(";    break;
-                case XmlMode::Jsonml: out += "jsonml_agg("; break;
-                default:              out += "xml_agg(";    break;
+                break;
+            case LP_SQLDEEP_JOIN_PATH:
+                for (int i = 0; i < node->u.sqldeep_join_path.steps.count; i++) {
+                    LpNode *s = node->u.sqldeep_join_path.steps.items[i];
+                    if (!s) continue;
+                    const auto& ss = s->u.sqldeep_join_step;
+                    if (ss.table) {
+                        const char *key = ss.alias ? ss.alias : ss.table;
+                        alias_map_[key] = ss.table;
+                    }
                 }
-                render_parts(std::get<SqlParts>(ds.projection), out, true);
-                out += ")";
-            } else {
-                render_parts(std::get<SqlParts>(ds.projection), out, true);
-            }
-            if (!ds.tail.empty()) {
-                out += " ";
-                render_parts(ds.tail, out, true);
-            }
-            if (ds.singular) out += " LIMIT 1";
-            if (nested) out += ")";
-            return;
+                build_alias_map(node->u.sqldeep_join_path.prefix);
+                break;
+            default:
+                break;
         }
-
-        if (nested) out += "(";
-        out += "SELECT ";
-
-        bool is_object = std::holds_alternative<ObjectLiteral>(ds.projection);
-        bool use_group = nested && !ds.singular;
-
-        if (use_group) { out += fn_group_array_; out += "("; }
-
-        if (is_object) {
-            render_object(std::get<ObjectLiteral>(ds.projection), out);
-        } else {
-            const auto& arr = std::get<ArrayLiteral>(ds.projection);
-            if (arr.elements.size() == 1) {
-                if (!nested && !ds.singular) { out += fn_group_array_; out += "("; }
-                render_parts(arr.elements[0], out, /*nested=*/true);
-                if (!nested && !ds.singular) out += ")";
-            } else {
-                if (!nested && !ds.singular) { out += fn_group_array_; out += "("; }
-                render_array(arr, out);
-                if (!nested && !ds.singular) out += ")";
-            }
-        }
-
-        if (use_group) out += ")";
-
-        if (!ds.tail.empty()) {
-            out += " ";
-            render_parts(ds.tail, out, /*nested=*/true);
-        }
-
-        if (ds.singular) out += " LIMIT 1";
-
-        if (nested) out += ")";
+        // Recurse into all child slots that can contain FROM clauses
+        // or further sub-selects.
+        walk_for_aliases(node);
     }
 
-    void render_object(const ObjectLiteral& obj, std::string& out) {
-        out += fn_object_;
-        out += "(";
-        for (size_t i = 0; i < obj.fields.size(); ++i) {
-            if (i > 0) out += ", ";
-            const auto& f = obj.fields[i];
-            if (!f.computed_key.empty()) {
-                render_parts(f.computed_key, out, /*nested=*/true);
-            } else {
-                out += "'";
-                out += sql_escape_key(f.key);
-                out += "'";
-            }
-            out += ", ";
-            if (f.value.empty()) {
-                out += f.qualified_value.empty() ? f.key : f.qualified_value;
-            } else if (f.aggregate) {
-                out += fn_group_array_;
-                out += "(";
-                // No CAST inside custom JSON functions — they handle
-                // BLOBs natively (SQLite) or N/A (PostgreSQL).
-                render_parts(f.value, out, /*nested=*/true);
-                out += ")";
-            } else {
-                render_parts(f.value, out, /*nested=*/true);
-            }
-        }
-        out += ")";
-    }
-
-    void render_array(const ArrayLiteral& arr, std::string& out) {
-        out += fn_array_;
-        out += "(";
-        for (size_t i = 0; i < arr.elements.size(); ++i) {
-            if (i > 0) out += ", ";
-            render_parts(arr.elements[i], out, /*nested=*/true);
-        }
-        out += ")";
-    }
-
-    // Emit "lhs.col1 = rhs.col1 [AND lhs.col2 = rhs.col2 ...]"
-    static void emit_join_condition(
-            const std::vector<std::pair<std::string,std::string>>& cols,
-            const std::string& child_ref,
-            const std::string& parent_ref,
-            std::string& out) {
-        for (size_t i = 0; i < cols.size(); ++i) {
-            if (i > 0) out += " AND ";
-            out += child_ref + "." + cols[i].first + " = " +
-                   parent_ref + "." + cols[i].second;
+    void walk_for_aliases(LpNode *node) {
+        switch (node->kind) {
+            case LP_STMT_SELECT:
+                build_alias_map(node->u.select.from);
+                for (int i = 0; i < node->u.select.result_columns.count; i++)
+                    build_alias_map(node->u.select.result_columns.items[i]);
+                for (int i = 0; i < node->u.select.group_by.count; i++)
+                    build_alias_map(node->u.select.group_by.items[i]);
+                build_alias_map(node->u.select.where);
+                build_alias_map(node->u.select.having);
+                for (int i = 0; i < node->u.select.order_by.count; i++)
+                    build_alias_map(node->u.select.order_by.items[i]);
+                build_alias_map(node->u.select.limit);
+                build_alias_map(node->u.select.with);
+                break;
+            case LP_COMPOUND_SELECT:
+                build_alias_map(node->u.compound.left);
+                build_alias_map(node->u.compound.right);
+                break;
+            case LP_RESULT_COLUMN:
+                build_alias_map(node->u.result_column.expr);
+                break;
+            case LP_JOIN_CLAUSE:
+                build_alias_map(node->u.join.left);
+                build_alias_map(node->u.join.right);
+                build_alias_map(node->u.join.on_expr);
+                break;
+            case LP_FROM_SUBQUERY:
+                build_alias_map(node->u.from_subquery.select);
+                break;
+            case LP_EXPR_SUBQUERY:
+                build_alias_map(node->u.subquery.select);
+                break;
+            case LP_EXPR_FUNCTION:
+                for (int i = 0; i < node->u.function.args.count; i++)
+                    build_alias_map(node->u.function.args.items[i]);
+                break;
+            case LP_EXPR_SQLDEEP_OBJECT:
+                for (int i = 0; i < node->u.sqldeep_object.fields.count; i++)
+                    build_alias_map(node->u.sqldeep_object.fields.items[i]);
+                break;
+            case LP_SQLDEEP_FIELD:
+                build_alias_map(node->u.sqldeep_field.value);
+                break;
+            case LP_EXPR_SQLDEEP_ARRAY:
+                for (int i = 0; i < node->u.sqldeep_array.elements.count; i++)
+                    build_alias_map(node->u.sqldeep_array.elements.items[i]);
+                break;
+            case LP_EXPR_SQLDEEP_XML:
+                for (int i = 0; i < node->u.sqldeep_xml.children.count; i++)
+                    build_alias_map(node->u.sqldeep_xml.children.items[i]);
+                for (int i = 0; i < node->u.sqldeep_xml.attrs.count; i++) {
+                    LpNode *a = node->u.sqldeep_xml.attrs.items[i];
+                    if (a) build_alias_map(a->u.sqldeep_xml_attr.value);
+                }
+                break;
+            case LP_WITH:
+                for (int i = 0; i < node->u.with.ctes.count; i++)
+                    build_alias_map(node->u.with.ctes.items[i]);
+                break;
+            case LP_CTE:
+                build_alias_map(node->u.cte.select);
+                break;
+            case LP_STMT_CREATE_VIEW:
+                build_alias_map(node->u.create_view.select);
+                break;
+            default:
+                break;
         }
     }
 
-    void render_join_path(const JoinPath& jp, std::string& out) {
-        // Step 1: FROM target
-        const auto& s1 = jp.steps[0];
-        out += s1.table;
-        const auto& s1_ref = s1.alias.empty() ? s1.table : s1.alias;
-        if (!s1.alias.empty()) {
-            out += " ";
-            out += s1.alias;
-        }
+    const std::string& resolve_alias(const std::string& alias) {
+        auto it = alias_map_.find(alias);
+        return (it != alias_map_.end()) ? it->second : alias;
+    }
 
-        // Steps 2+: JOINs
-        std::string prev_table = s1.table;
-        std::string prev_ref = s1_ref;
-        for (size_t i = 1; i < jp.steps.size(); ++i) {
-            const auto& step = jp.steps[i];
-            const auto& step_ref = step.alias.empty() ? step.table : step.alias;
-            out += " JOIN ";
-            out += step.table;
-            if (!step.alias.empty()) {
-                out += " ";
-                out += step.alias;
-            }
-            out += " ON ";
-            if (step.forward) {
-                // curr is child of prev
-                auto cols = step.columns.empty()
-                    ? resolve_fk_columns(step.table, prev_table, fk_index_)
-                    : step.columns;
-                emit_join_condition(cols, step_ref, prev_ref, out);
-            } else {
-                // prev is child of curr
-                auto cols = step.columns.empty()
-                    ? resolve_fk_columns(prev_table, step.table, fk_index_)
-                    : step.columns;
-                emit_join_condition(cols, prev_ref, step_ref, out);
-            }
-            prev_table = step.table;
-            prev_ref = step_ref;
-        }
+    // Dialect function names ----------------------------------------
 
-        // WHERE: correlate step 1 to start alias
-        out += " WHERE ";
-        if (s1.forward) {
-            auto cols = s1.columns.empty()
-                ? resolve_fk_columns(s1.table, jp.start_table, fk_index_)
-                : s1.columns;
-            emit_join_condition(cols, s1_ref, jp.start_alias, out);
-        } else {
-            auto cols = s1.columns.empty()
-                ? resolve_fk_columns(jp.start_table, s1.table, fk_index_)
-                : s1.columns;
-            emit_join_condition(cols, jp.start_alias, s1_ref, out);
+    const char *fn_object() const {
+        switch (backend_) {
+            case Backend::postgres:       return "jsonb_build_object";
+            case Backend::sqlite_vanilla: return "json_object";
+            default:                      return "sqldeep_json_object";
+        }
+    }
+    const char *fn_array() const {
+        switch (backend_) {
+            case Backend::postgres:       return "jsonb_build_array";
+            case Backend::sqlite_vanilla: return "json_array";
+            default:                      return "sqldeep_json_array";
+        }
+    }
+    const char *fn_group_array() const {
+        switch (backend_) {
+            case Backend::postgres:       return "jsonb_agg";
+            case Backend::sqlite_vanilla: return "json_group_array";
+            default:                      return "sqldeep_json_group_array";
+        }
+    }
+    // BLOB-protocol wrapper used to inject a typed JSON value into a
+    // JSON-building call so booleans (and only booleans, currently)
+    // round-trip as `true` / `false` rather than `1` / `0`. Postgres
+    // jsonb already has a native bool, so no wrapper is needed there.
+    const char *fn_json_blob() const {
+        switch (backend_) {
+            case Backend::postgres:       return nullptr;
+            case Backend::sqlite_vanilla: return "json";
+            default:                      return "sqldeep_json";
         }
     }
 
-    void render_recursive_select(const RecursiveSelect& rs, std::string& out) {
+    // Detect a bare `true` / `false` literal used as a value. SQLite's
+    // grammar doesn't have boolean keywords — `true`/`false` parse as
+    // identifier column refs (with no table qualifier). Returns the
+    // canonical lower-case form, or NULL if `expr` isn't one of those.
+    static const char *bool_literal_text(LpNode *expr) {
+        if (!expr) return nullptr;
+        const char *name = nullptr;
+        if (expr->kind == LP_EXPR_LITERAL_BOOL) {
+            name = expr->u.literal.value;
+        } else if (expr->kind == LP_EXPR_COLUMN_REF
+                && !expr->u.column_ref.schema
+                && !expr->u.column_ref.table) {
+            name = expr->u.column_ref.column;
+        }
+        if (!name) return nullptr;
+        if ((name[0] == 't' || name[0] == 'T')
+            && (name[1] == 'r' || name[1] == 'R')
+            && (name[2] == 'u' || name[2] == 'U')
+            && (name[3] == 'e' || name[3] == 'E')
+            && name[4] == '\0')
+            return "true";
+        if ((name[0] == 'f' || name[0] == 'F')
+            && (name[1] == 'a' || name[1] == 'A')
+            && (name[2] == 'l' || name[2] == 'L')
+            && (name[3] == 's' || name[3] == 'S')
+            && (name[4] == 'e' || name[4] == 'E')
+            && name[5] == '\0')
+            return "false";
+        return nullptr;
+    }
+
+    // Wrap a bare `true` / `false` literal in fn_json('true') /
+    // fn_json('false') when it appears in a JSON value slot — object
+    // field value, array element, or (later) XML attribute value.
+    // No wrap in Postgres mode (jsonb has native bool).
+    LpNode *wrap_json_bool(LpNode *expr) {
+        const char *lit = bool_literal_text(expr);
+        if (!lit) return expr;
+        const char *fn = fn_json_blob();
+        if (!fn) return expr;
+        return make_function(arena_, fn, {make_string_lit(arena_, lit)});
+    }
+
+    // ── Walker ────────────────────────────────────────────────────
+    //
+    // Visit every node in post-order: children first, then the node
+    // itself. By the time we rewrite a sqldeep node, its children are
+    // already plain-SQL AST.
+
+    LpNode *walk(LpNode *node, int depth, XmlMode mode) {
+        if (!node) return nullptr;
+        if (depth > kMaxNestingDepth)
+            throw Error("maximum nesting depth exceeded", 0, 0);
+
+        // Recursive SELECT (sqldeep_recurse) is handled pre-order:
+        // the whole statement is rewritten into a WITH RECURSIVE
+        // 3-CTE construction so we don't want the post-order walk
+        // to start rewriting the object literal projection (its
+        // recursive-children marker still needs reading).
+        if (node->kind == LP_STMT_SELECT && node->u.select.sqldeep_recurse) {
+            return rewrite_recursive_select(node);
+        }
+
+        // jsx(<el/>) / jsonml(<el/>) transpiler-macro wrapper: absorb
+        // the outer function call and switch the inner XML element's
+        // emission mode. Detected pre-recursion so the mode propagates
+        // down through nested XML children.
+        if (node->kind == LP_EXPR_FUNCTION
+            && node->u.function.name
+            && node->u.function.args.count == 1
+            && node->u.function.args.items[0]
+            && node->u.function.args.items[0]->kind == LP_EXPR_SQLDEEP_XML) {
+            XmlMode m = XmlMode::Xml;
+            const char *fn = node->u.function.name;
+            if (std::strcmp(fn, "jsx") == 0)        m = XmlMode::Jsx;
+            else if (std::strcmp(fn, "jsonml") == 0) m = XmlMode::Jsonml;
+            if (m != XmlMode::Xml) {
+                LpNode *xml = node->u.function.args.items[0];
+                walk_xml_children(xml, depth + 1, m);
+                return rewrite_xml(xml, m);
+            }
+        }
+
+        walk_children(node, depth + 1, mode);
+
+        switch (node->kind) {
+            case LP_EXPR_SQLDEEP_OBJECT:    return rewrite_object(node);
+            case LP_EXPR_SQLDEEP_ARRAY:     return rewrite_array(node);
+            case LP_EXPR_SQLDEEP_JSON_PATH: return rewrite_json_path(node);
+            case LP_EXPR_SQLDEEP_XML:       return rewrite_xml(node, mode);
+            case LP_STMT_SELECT:            return rewrite_select(node);
+            default:                        return node;
+        }
+    }
+
+    // Recurse into every child slot that can contain an LpNode or an
+    // LpNodeList. This is the bulk of the walker — every node kind
+    // that can contain an expression or statement child must list
+    // those children here. Anything that's a leaf (literals, naked
+    // column refs, identifiers) has nothing to do.
+
+    void walk_children(LpNode *node, int depth, XmlMode mode) {
+        switch (node->kind) {
+            case LP_STMT_SELECT:
+                walk_list(&node->u.select.result_columns, depth, mode);
+                node->u.select.from   = walk(node->u.select.from, depth, mode);
+                node->u.select.where  = walk(node->u.select.where, depth, mode);
+                walk_list(&node->u.select.group_by, depth, mode);
+                node->u.select.having = walk(node->u.select.having, depth, mode);
+                walk_list(&node->u.select.order_by, depth, mode);
+                node->u.select.limit  = walk(node->u.select.limit, depth, mode);
+                walk_list(&node->u.select.window_defs, depth, mode);
+                node->u.select.with   = walk(node->u.select.with, depth, mode);
+                break;
+            case LP_COMPOUND_SELECT:
+                node->u.compound.left  = walk(node->u.compound.left, depth, mode);
+                node->u.compound.right = walk(node->u.compound.right, depth, mode);
+                break;
+            case LP_RESULT_COLUMN:
+                node->u.result_column.expr =
+                    walk(node->u.result_column.expr, depth, mode);
+                break;
+            case LP_EXPR_BINARY_OP:
+                node->u.binary.left  = walk(node->u.binary.left, depth, mode);
+                node->u.binary.right = walk(node->u.binary.right, depth, mode);
+                break;
+            case LP_EXPR_UNARY_OP:
+                node->u.unary.operand = walk(node->u.unary.operand, depth, mode);
+                break;
+            case LP_EXPR_FUNCTION:
+                walk_list(&node->u.function.args, depth, mode);
+                walk_list(&node->u.function.order_by, depth, mode);
+                node->u.function.filter = walk(node->u.function.filter, depth, mode);
+                node->u.function.over   = walk(node->u.function.over, depth, mode);
+                break;
+            case LP_EXPR_CAST:
+                node->u.cast.expr = walk(node->u.cast.expr, depth, mode);
+                break;
+            case LP_EXPR_COLLATE:
+                node->u.collate.expr = walk(node->u.collate.expr, depth, mode);
+                break;
+            case LP_EXPR_BETWEEN:
+                node->u.between.expr = walk(node->u.between.expr, depth, mode);
+                node->u.between.low  = walk(node->u.between.low, depth, mode);
+                node->u.between.high = walk(node->u.between.high, depth, mode);
+                break;
+            case LP_EXPR_IN:
+                node->u.in.expr   = walk(node->u.in.expr, depth, mode);
+                node->u.in.select = walk(node->u.in.select, depth, mode);
+                walk_list(&node->u.in.values, depth, mode);
+                break;
+            case LP_EXPR_EXISTS:
+                node->u.exists.select = walk(node->u.exists.select, depth, mode);
+                break;
+            case LP_EXPR_SUBQUERY:
+                node->u.subquery.select = walk(node->u.subquery.select, depth, mode);
+                break;
+            case LP_EXPR_CASE:
+                node->u.case_.operand = walk(node->u.case_.operand, depth, mode);
+                walk_list(&node->u.case_.when_exprs, depth, mode);
+                node->u.case_.else_expr = walk(node->u.case_.else_expr, depth, mode);
+                break;
+            case LP_FROM_SUBQUERY:
+                node->u.from_subquery.select =
+                    walk(node->u.from_subquery.select, depth, mode);
+                break;
+            case LP_JOIN_CLAUSE:
+                node->u.join.left    = walk(node->u.join.left, depth, mode);
+                node->u.join.right   = walk(node->u.join.right, depth, mode);
+                node->u.join.on_expr = walk(node->u.join.on_expr, depth, mode);
+                break;
+            case LP_ORDER_TERM:
+                node->u.order_term.expr =
+                    walk(node->u.order_term.expr, depth, mode);
+                break;
+            case LP_LIMIT:
+                node->u.limit.count  = walk(node->u.limit.count, depth, mode);
+                node->u.limit.offset = walk(node->u.limit.offset, depth, mode);
+                break;
+            case LP_EXPR_SQLDEEP_OBJECT:
+                walk_list(&node->u.sqldeep_object.fields, depth, mode);
+                break;
+            case LP_SQLDEEP_FIELD:
+                node->u.sqldeep_field.key_expr =
+                    walk(node->u.sqldeep_field.key_expr, depth, mode);
+                node->u.sqldeep_field.value =
+                    walk(node->u.sqldeep_field.value, depth, mode);
+                break;
+            case LP_EXPR_SQLDEEP_ARRAY:
+                walk_list(&node->u.sqldeep_array.elements, depth, mode);
+                break;
+            case LP_EXPR_SQLDEEP_JSON_PATH:
+                node->u.sqldeep_json_path.base =
+                    walk(node->u.sqldeep_json_path.base, depth, mode);
+                break;
+            case LP_EXPR_SQLDEEP_XML:
+                walk_xml_children(node, depth, mode);
+                break;
+            case LP_STMT_CREATE_VIEW:
+                node->u.create_view.select =
+                    walk(node->u.create_view.select, depth, mode);
+                break;
+            case LP_STMT_INSERT:
+                node->u.insert.source = walk(node->u.insert.source, depth, mode);
+                node->u.insert.upsert = walk(node->u.insert.upsert, depth, mode);
+                walk_list(&node->u.insert.returning, depth, mode);
+                break;
+            case LP_STMT_UPDATE:
+                walk_list(&node->u.update.set_clauses, depth, mode);
+                node->u.update.from   = walk(node->u.update.from, depth, mode);
+                node->u.update.where  = walk(node->u.update.where, depth, mode);
+                walk_list(&node->u.update.order_by, depth, mode);
+                node->u.update.limit  = walk(node->u.update.limit, depth, mode);
+                walk_list(&node->u.update.returning, depth, mode);
+                break;
+            case LP_STMT_DELETE:
+                node->u.del.where = walk(node->u.del.where, depth, mode);
+                walk_list(&node->u.del.order_by, depth, mode);
+                node->u.del.limit = walk(node->u.del.limit, depth, mode);
+                walk_list(&node->u.del.returning, depth, mode);
+                break;
+            case LP_WITH:
+                walk_list(&node->u.with.ctes, depth, mode);
+                break;
+            case LP_CTE:
+                node->u.cte.select = walk(node->u.cte.select, depth, mode);
+                break;
+            default:
+                break;  // leaves and not-yet-handled cases
+        }
+    }
+
+    void walk_list(LpNodeList *list, int depth, XmlMode mode) {
+        if (!list) return;
+        for (int i = 0; i < list->count; i++)
+            list->items[i] = walk(list->items[i], depth, mode);
+    }
+
+    // XML elements propagate the active mode through nested attributes
+    // and children so jsx(<ul><li/></ul>) emits xml_element_jsx for
+    // both the outer ul and the inner li.
+    void walk_xml_children(LpNode *node, int depth, XmlMode mode) {
+        auto& x = node->u.sqldeep_xml;
+        for (int i = 0; i < x.attrs.count; i++) {
+            LpNode *a = x.attrs.items[i];
+            if (!a) continue;
+            a->u.sqldeep_xml_attr.value =
+                walk(a->u.sqldeep_xml_attr.value, depth, mode);
+        }
+        for (int i = 0; i < x.children.count; i++)
+            x.children.items[i] = walk(x.children.items[i], depth, mode);
+    }
+
+    // ── Rewrites ─────────────────────────────────────────────────
+
+    // Detect the "aggregate field" form: a sqldeep field whose value
+    // is a SELECT with no FROM clause, exactly one result column, and
+    // no other clauses. In sqldeep, `{field: SELECT expr}` (no FROM)
+    // means "aggregate `expr` over the current GROUP BY scope" and
+    // becomes 'field', fn_group_array(expr) — or just 'field', expr
+    // when singular (SELECT/1).
+    //
+    // The grammar wraps the bare SELECT in LP_EXPR_SUBQUERY; we unwrap
+    // it back to the right expression here.
+    LpNode *maybe_aggregate_field_value(LpNode *v) {
+        if (!v || v->kind != LP_EXPR_SUBQUERY) return v;
+        LpNode *sel = v->u.subquery.select;
+        if (!sel || sel->kind != LP_STMT_SELECT) return v;
+        const auto& s = sel->u.select;
+        if (s.from || s.where || s.having || s.with) return v;
+        if (s.group_by.count || s.order_by.count || s.window_defs.count) return v;
+        if (s.result_columns.count != 1) return v;
+        LpNode *rc = s.result_columns.items[0];
+        LpNode *expr = (rc && rc->kind == LP_RESULT_COLUMN)
+                          ? rc->u.result_column.expr : rc;
+        if (!expr) return v;
+        // LIMIT 1 (from SELECT/1) → just the bare expr.
+        if (s.limit) return expr;
+        return make_function(arena_, fn_group_array(), {expr});
+    }
+
+    // { a, key: expr, "k": v, (e): v, a.b } →
+    //   fn_object('a', a, 'key', expr, 'k', v, e, v, 'b', a.b)
+    // Literal `true` / `false` values are wrapped via sqldeep_json('...')
+    // so they serialize as JSON bools rather than integers (sqlite/vanilla).
+    // Aggregate field form `field: SELECT expr` collapses to
+    // 'field', fn_group_array(expr).
+    LpNode *rewrite_object(LpNode *node) {
+        std::vector<LpNode*> args;
+        const auto& fields = node->u.sqldeep_object.fields;
+        for (int i = 0; i < fields.count; i++) {
+            LpNode *f = fields.items[i];
+            if (!f) continue;
+            const auto& sf = f->u.sqldeep_field;
+            switch (sf.key_form) {
+                case 0: { // bare
+                    args.push_back(make_string_lit(arena_, sf.key_text));
+                    args.push_back(make_column_ref(arena_, sf.key_text));
+                    break;
+                }
+                case 1:  // named id : expr
+                case 2:  // "string" : expr
+                case 5: { // qualified  a.b
+                    LpNode *v = maybe_aggregate_field_value(sf.value);
+                    args.push_back(make_string_lit(arena_, sf.key_text));
+                    args.push_back(wrap_json_bool(v));
+                    break;
+                }
+                case 3: {  // (expr) : val
+                    LpNode *v = maybe_aggregate_field_value(sf.value);
+                    args.push_back(sf.key_expr);
+                    args.push_back(wrap_json_bool(v));
+                    break;
+                }
+                case 4:  // recursive children
+                    // `children: *` only has meaning inside a SELECT
+                    // that has a RECURSE clause — when we get here in
+                    // the post-order walk, the recursive-SELECT
+                    // pre-handler already short-circuited that case.
+                    // Reaching this branch means the recursive field
+                    // appeared without RECURSE; surface as an error.
+                    throw Error("`*` recursive child field requires "
+                                "a RECURSE clause on the SELECT", 0, 0);
+                default:
+                    break;
+            }
+        }
+        node->kind = LP_EXPR_FUNCTION;
+        std::memset(&node->u, 0, sizeof(node->u));
+        node->u.function.name = arena_strdup(arena_, fn_object());
+        for (auto *a : args) list_append(arena_, &node->u.function.args, a);
+        return node;
+    }
+
+    // [ e1, e2, ... ] → fn_array(e1, e2, ...) with bool wrapping.
+    LpNode *rewrite_array(LpNode *node) {
+        LpNodeList elements = node->u.sqldeep_array.elements;
+        node->kind = LP_EXPR_FUNCTION;
+        std::memset(&node->u, 0, sizeof(node->u));
+        node->u.function.name = arena_strdup(arena_, fn_array());
+        for (int i = 0; i < elements.count; i++)
+            list_append(arena_, &node->u.function.args,
+                        wrap_json_bool(elements.items[i]));
+        return node;
+    }
+
+    // (base).a.b[0] →
+    //   SQLite/Vanilla: json_extract(CAST((base) AS TEXT), '$.a.b[0]')
+    //   Postgres:       jsonb_extract_path(base, 'a', 'b', '0')
+    LpNode *rewrite_json_path(LpNode *node) {
+        LpNode *base = node->u.sqldeep_json_path.base;
+        LpNodeList segs = node->u.sqldeep_json_path.segments;
+
+        if (backend_ == Backend::postgres) {
+            std::vector<LpNode*> args;
+            args.push_back(base);
+            for (int i = 0; i < segs.count; i++) {
+                LpNode *seg = segs.items[i];
+                if (!seg) continue;
+                args.push_back(make_string_lit(arena_,
+                    seg->u.literal.value ? seg->u.literal.value : ""));
+            }
+            node->kind = LP_EXPR_FUNCTION;
+            std::memset(&node->u, 0, sizeof(node->u));
+            node->u.function.name = arena_strdup(arena_, "jsonb_extract_path");
+            for (auto *a : args) list_append(arena_, &node->u.function.args, a);
+            return node;
+        }
+
+        // Build "$.a.b[0]" path string.
+        std::string path = "$";
+        for (int i = 0; i < segs.count; i++) {
+            LpNode *seg = segs.items[i];
+            if (!seg) continue;
+            const char *v = seg->u.literal.value ? seg->u.literal.value : "";
+            if (seg->kind == LP_EXPR_LITERAL_INT) {
+                path += "[";
+                path += v;
+                path += "]";
+            } else {
+                path += ".";
+                path += v;
+            }
+        }
+
+        // Wrap base in a 1-element vector so the canonical unparser
+        // emits `(base)`. The parens preserve the visual disambiguation
+        // (matches sqldeep's pre-existing renderer) and avoid any
+        // operator-precedence surprises inside the CAST argument.
+        LpNode *parens = new_node(arena_, LP_EXPR_VECTOR);
+        list_append(arena_, &parens->u.vector.values, base);
+        LpNode *cast = make_cast(arena_, parens, "TEXT");
+        LpNode *path_lit = make_string_lit(arena_, path);
+
+        node->kind = LP_EXPR_FUNCTION;
+        std::memset(&node->u, 0, sizeof(node->u));
+        node->u.function.name = arena_strdup(arena_, "json_extract");
+        list_append(arena_, &node->u.function.args, cast);
+        list_append(arena_, &node->u.function.args, path_lit);
+        return node;
+    }
+
+    // Multi-line XML text dedent: scan immediate text children for
+    // the common leading-whitespace prefix on each line after a '\n'.
+    // Blank-interior lines (only whitespace between two newlines) are
+    // skipped from the indent calculation but still trimmed on output.
+    int xml_min_indent(LpNode *node) {
+        int min_indent = INT_MAX;
+        const auto& x = node->u.sqldeep_xml;
+        for (int j = 0; j < x.children.count; j++) {
+            LpNode *c = x.children.items[j];
+            if (!c || c->kind != LP_SQLDEEP_XML_TEXT) continue;
+            const char *text = c->u.sqldeep_xml_text.text;
+            if (!text) continue;
+            size_t i = 0, n = std::strlen(text);
+            while (i < n) {
+                const char *nl = (const char *)std::memchr(text + i, '\n', n - i);
+                if (!nl) break;
+                size_t ls = (nl - text) + 1;
+                int sp = 0;
+                while (ls + sp < n && text[ls + sp] == ' ') ++sp;
+                // Skip only fully-blank interior lines (whitespace
+                // between two newlines). Lines whose only "content"
+                // is whitespace before a child element or closing tag
+                // (the text-end case) still carry meaningful indent.
+                if (ls + sp < n && text[ls + sp] == '\n') {
+                    i = ls; continue;
+                }
+                if (sp < min_indent) min_indent = sp;
+                i = ls + sp + 1;
+            }
+        }
+        return min_indent == INT_MAX ? 0 : min_indent;
+    }
+
+    // Apply dedent: drop `indent` spaces immediately after every '\n'
+    // in `text`. Returns a new arena-owned string.
+    char *xml_dedent_text(const char *text, int indent) {
+        if (!text || indent <= 0)
+            return arena_strdup(arena_, text ? text : "");
+        size_t n = std::strlen(text);
+        std::string out;
+        out.reserve(n);
+        for (size_t i = 0; i < n; ) {
+            char c = text[i++];
+            out += c;
+            if (c == '\n') {
+                int dropped = 0;
+                while (dropped < indent && i < n && text[i] == ' ') {
+                    i++; dropped++;
+                }
+            }
+        }
+        return arena_strdup(arena_, out.c_str());
+    }
+
+    // <tag attrs>body</tag> →
+    //   xml_element('tag', xml_attrs(...), child1, child2, ...)
+    // Self-closing <tag/> uses 'tag/' as the literal string so the
+    // runtime function knows to emit the void-element form.
+    // Mode (XML / Jsonml / Jsx) selects the function family.
+    LpNode *rewrite_xml(LpNode *node, XmlMode mode) {
+        const auto& x = node->u.sqldeep_xml;
+        const char *fn_el, *fn_attrs;
+        switch (mode) {
+            case XmlMode::Jsx:
+                fn_el = "xml_element_jsx";
+                fn_attrs = "xml_attrs_jsx";
+                break;
+            case XmlMode::Jsonml:
+                fn_el = "xml_element_jsonml";
+                fn_attrs = "xml_attrs_jsonml";
+                break;
+            default:
+                fn_el = "xml_element";
+                fn_attrs = "xml_attrs";
+                break;
+        }
+
+        std::vector<LpNode*> args;
+
+        // tag: bare for non-self-closing, with trailing "/" marker
+        // for self-closing so the runtime emits <tag/> form.
+        std::string tag = x.tag ? x.tag : "";
+        if (x.self_closing) tag += "/";
+        args.push_back(make_string_lit(arena_, tag));
+
+        // attrs: xml_attrs('name', value, ...). Boolean attributes
+        // (no `=value`) become sqldeep_json('true') wrappers via the
+        // BLOB protocol so the runtime distinguishes them from
+        // attr="1" / attr="true" string values.
+        if (x.attrs.count > 0) {
+            std::vector<LpNode*> attr_args;
+            for (int i = 0; i < x.attrs.count; i++) {
+                LpNode *a = x.attrs.items[i];
+                if (!a) continue;
+                const auto& av = a->u.sqldeep_xml_attr;
+                attr_args.push_back(make_string_lit(arena_, av.name));
+                if (av.value) {
+                    if (av.dynamic) {
+                        attr_args.push_back(wrap_json_bool(av.value));
+                    } else {
+                        attr_args.push_back(av.value);
+                    }
+                } else {
+                    // Boolean attribute: <input disabled/>
+                    const char *fn = fn_json_blob();
+                    if (fn) {
+                        attr_args.push_back(make_function(
+                            arena_, fn,
+                            {make_string_lit(arena_, "true")}));
+                    } else {
+                        attr_args.push_back(make_string_lit(arena_, "true"));
+                    }
+                }
+            }
+            args.push_back(make_function(arena_, fn_attrs, attr_args));
+        }
+
+        // Multi-line dedent: scan all direct-text children for the
+        // common leading-whitespace indent, then strip that indent
+        // from each line's start. Source indentation produces the
+        // relative indentation in the rendered output.
+        int indent = xml_min_indent(node);
+
+        // children: text → string literal (dedented); nested element
+        // → recurse (already rewritten in post-order); anything else
+        // is an interpolation expression, with bool wrap applied.
+        for (int i = 0; i < x.children.count; i++) {
+            LpNode *c = x.children.items[i];
+            if (!c) continue;
+            if (c->kind == LP_SQLDEEP_XML_TEXT) {
+                const char *raw = c->u.sqldeep_xml_text.text;
+                char *dedented = xml_dedent_text(raw, indent);
+                args.push_back(make_string_lit(arena_,
+                    dedented ? std::string(dedented) : std::string("")));
+            } else {
+                args.push_back(wrap_json_bool(c));
+            }
+        }
+
+        node->kind = LP_EXPR_FUNCTION;
+        std::memset(&node->u, 0, sizeof(node->u));
+        node->u.function.name = arena_strdup(arena_, fn_el);
+        for (auto *a : args) list_append(arena_, &node->u.function.args, a);
+        return node;
+    }
+
+    // ── Recursive SELECT rewrite ──────────────────────────────────
+    //
+    // Expands
+    //   SELECT { id, name, children: * } FROM t RECURSE ON (fk [= pk]) WHERE ...
+    // into the 3-CTE bracket-injection template documented in
+    // sqldeep's CLAUDE.md (DFS traversal, per-node JSON object, then
+    // event fragments concatenated to form one nested JSON string).
+    //
+    // Because the WITH RECURSIVE shape is large and well-defined, we
+    // build it as SQL text and re-parse via deepparser to obtain the
+    // standard SQL AST. The transformer then returns the new AST in
+    // place of the original SELECT.
+
+    LpNode *rewrite_recursive_select(LpNode *node) {
+        const auto& sel = node->u.select;
+        LpNode *recurse = sel.sqldeep_recurse;
+        if (!recurse) return node;
+
+        std::string fk_col = recurse->u.sqldeep_recurse.fk_col
+                                ? recurse->u.sqldeep_recurse.fk_col : "";
+        std::string pk_col = recurse->u.sqldeep_recurse.pk_col
+                                ? recurse->u.sqldeep_recurse.pk_col : "id";
+
+        // The FROM target must be a plain LP_FROM_TABLE.
+        if (!sel.from || sel.from->kind != LP_FROM_TABLE) {
+            throw Error("RECURSE requires a single FROM table", 0, 0);
+        }
+        std::string table = sel.from->u.from_table.name
+                              ? sel.from->u.from_table.name : "";
+
+        // Projection must be a sqldeep object literal with a recursive
+        // children field. Extract field info.
+        if (sel.result_columns.count != 1) {
+            throw Error("RECURSE requires a single object projection", 0, 0);
+        }
+        LpNode *rc = sel.result_columns.items[0];
+        LpNode *proj = (rc && rc->kind == LP_RESULT_COLUMN)
+                          ? rc->u.result_column.expr : rc;
+        if (!proj || proj->kind != LP_EXPR_SQLDEEP_OBJECT) {
+            throw Error("RECURSE requires a sqldeep object projection",
+                        0, 0);
+        }
+
+        std::string children_field;
+        std::vector<std::string> field_keys;   // column-name used in CTE
+        std::vector<std::string> obj_pairs;    // "'key', expr" for json_object
+        for (int i = 0; i < proj->u.sqldeep_object.fields.count; i++) {
+            LpNode *f = proj->u.sqldeep_object.fields.items[i];
+            if (!f) continue;
+            const auto& sf = f->u.sqldeep_field;
+            if (sf.key_form == 4) {           // recursive children marker
+                children_field = sf.key_text ? sf.key_text : "children";
+                continue;
+            }
+            // Only bare and qualified-bare are supported here — those
+            // are the forms that map cleanly to "include this column
+            // in the DFS CTE column list".
+            std::string col = sf.key_text ? sf.key_text : "";
+            field_keys.push_back(col);
+            obj_pairs.push_back("'" + sql_escape_lit(col) + "', " + col);
+        }
+        if (children_field.empty()) {
+            throw Error("RECURSE requires a `children: *` field in the "
+                        "projection", 0, 0);
+        }
+
+        // Root condition (the SELECT's WHERE clause); we emit it back
+        // into the anchor leg of the recursive CTE. The canonical
+        // unparser produces the SQL text.
+        std::string root_where;
+        if (sel.where) {
+            char *w = lp_ast_to_sql(sel.where, transient_arena());
+            if (w) root_where = w;
+        }
+
+        bool singular = !!sel.sqldeep_singular;
         bool is_pg = (backend_ == Backend::postgres);
 
-        // Build json_object(...) argument list for non-recursive fields
-        std::string obj_args;
-        std::string col_list;    // column names for CTE
-        std::string col_select;  // column references with c. prefix for recursive step
-        for (size_t i = 0; i < rs.fields.size(); ++i) {
-            const auto& f = rs.fields[i];
-            std::string col = f.value.empty() ? f.key : f.key; // column name
-            std::string expr;
-            if (f.value.empty()) {
-                expr = f.qualified_value.empty() ? f.key : f.qualified_value;
-            } else {
-                // For renamed fields, the value is the SQL expression
-                std::string val_str;
-                // Render the value parts to a string
-                Renderer tmp(fk_index_, backend_);
-                val_str = tmp.render_document(f.value);
-                expr = val_str;
-                col = val_str; // use the expression as the column name
-            }
+        // Build column list. The CTE always includes fk_col; pk_col
+        // is added separately when it differs from fk_col and isn't
+        // already in the field list.
+        std::string col_list;
+        std::string col_select;  // "c.col1, c.col2, ..." for recursive step
+        for (size_t i = 0; i < field_keys.size(); i++) {
             if (i > 0) { col_list += ", "; col_select += ", "; }
-            col_list += col;
-            col_select += "c." + col;
-
-            if (i > 0) obj_args += ", ";
-            obj_args += "'";
-            obj_args += sql_escape_key(f.key);
-            obj_args += "', ";
-            obj_args += col;
+            col_list += field_keys[i];
+            col_select += "c." + field_keys[i];
+        }
+        if (!field_keys.empty()) { col_list += ", "; col_select += ", "; }
+        col_list += fk_col;
+        col_select += "c." + fk_col;
+        bool pk_in_fields = false;
+        for (const auto& f : field_keys)
+            if (f == pk_col) { pk_in_fields = true; break; }
+        if (pk_col != fk_col && !pk_in_fields) {
+            col_list += ", " + pk_col;
+            col_select += ", c." + pk_col;
         }
 
-        // Add FK and PK columns to CTE column list
-        col_list += ", " + rs.fk_column;
-        col_select += ", c." + rs.fk_column;
-        if (rs.pk_column != rs.fk_column) {
-            // PK might already be in the field list
-            bool pk_in_fields = false;
-            for (const auto& f : rs.fields) {
-                std::string col = f.value.empty() ? f.key : f.key;
-                if (f.value.empty() && f.key == rs.pk_column) { pk_in_fields = true; break; }
-            }
-            if (!pk_in_fields) {
-                col_list += ", " + rs.pk_column;
-                col_select += ", c." + rs.pk_column;
-            }
-        }
-
-        std::string pad_fn = is_pg
-            ? "lpad(CAST(" + rs.pk_column + " AS text), 10, '0')"
-            : "printf('%010d', " + rs.pk_column + ")";
-        std::string c_pad_fn = is_pg
-            ? "lpad(CAST(c." + rs.pk_column + " AS text), 10, '0')"
-            : "printf('%010d', c." + rs.pk_column + ")";
-        std::string high_char = is_pg ? "chr(127)" : "char(127)";
-        std::string concat_fn_open = is_pg
+        std::string pad   = is_pg
+            ? "lpad(CAST(" + pk_col + " AS text), 10, '0')"
+            : "printf('%010d', " + pk_col + ")";
+        std::string c_pad = is_pg
+            ? "lpad(CAST(c." + pk_col + " AS text), 10, '0')"
+            : "printf('%010d', c." + pk_col + ")";
+        std::string concat_fn = is_pg
             ? "string_agg(_fragment, '' ORDER BY _sort_key)"
             : "group_concat(_fragment, '')";
+        std::string high_char = is_pg ? "chr(127)" : "char(127)";
 
-        // Emit the 3-CTE bracket-injection template
+        // Build the obj_args for fn_object call.
+        std::string obj_args;
+        for (size_t i = 0; i < obj_pairs.size(); i++) {
+            if (i > 0) obj_args += ", ";
+            obj_args += obj_pairs[i];
+        }
+
+        std::string out;
         out += "WITH RECURSIVE _sdq_dfs(";
         out += col_list;
         out += ", _depth, _path) AS (SELECT ";
         out += col_list;
         out += ", 0, ";
-        out += pad_fn;
+        out += pad;
         out += " FROM ";
-        out += rs.table;
-        if (!rs.root_condition.empty()) {
+        out += table;
+        if (!root_where.empty()) {
             out += " WHERE ";
-            render_parts(rs.root_condition, out, /*nested=*/false);
+            out += root_where;
         }
         out += " UNION ALL SELECT ";
         out += col_select;
         out += ", d._depth + 1, d._path || '/' || ";
-        out += c_pad_fn;
+        out += c_pad;
         out += " FROM ";
-        out += rs.table;
+        out += table;
         out += " c JOIN _sdq_dfs d ON c.";
-        out += rs.fk_column;
+        out += fk_col;
         out += " = d.";
-        out += rs.pk_column;
+        out += pk_col;
         out += "), _sdq_ranked AS (SELECT *, ";
-        out += fn_object_;
+        out += fn_object();
         out += "(";
         out += obj_args;
         out += ") AS _obj, ROW_NUMBER() OVER (PARTITION BY ";
-        out += rs.fk_column;
+        out += fk_col;
         out += " ORDER BY ";
-        out += rs.pk_column;
+        out += pk_col;
         out += ") AS _child_rank FROM _sdq_dfs), ";
         out += "_sdq_events(_sort_key, _fragment) AS (SELECT _path, ";
         out += "CASE WHEN _child_rank > 1 THEN ',' ELSE '' END || ";
         out += "substr(_obj, 1, length(_obj) - 1) || ',\"";
-        out += sql_escape_key(rs.children_field);
+        out += sql_escape_lit(children_field);
         out += "\":[' FROM _sdq_ranked UNION ALL SELECT _path || ";
         out += high_char;
         out += ", ']}' FROM _sdq_ranked) SELECT ";
-
-        if (!rs.singular) {
-            out += "'[' || ";
-        }
-        if (is_pg) {
-            out += concat_fn_open;
-        } else {
-            out += "group_concat(_fragment, '')";
-        }
-        if (!rs.singular) {
-            out += " || ']'";
-        }
+        if (!singular) out += "'[' || ";
+        out += concat_fn;
+        if (!singular) out += " || ']'";
         out += " FROM (SELECT _fragment FROM _sdq_events ORDER BY _sort_key)";
+
+        // Re-parse the constructed SQL via deepparser so we hand back
+        // a standard SQL AST. (Re-using deepparser this way costs one
+        // extra parse but spares us building a multi-CTE AST by hand.)
+        const char *err = nullptr;
+        LpNode *new_ast = lp_parse(out.c_str(), arena_, &err);
+        if (!new_ast) {
+            std::string msg = err ? err : "internal: recursive expansion failed";
+            throw Error(msg, 0, 0);
+        }
+        return new_ast;
     }
 
-    void render_xml_element(const XmlElement& el, std::string& out,
-                             XmlMode mode_override = XmlMode::Xml) {
-        XmlMode mode = (el.mode != XmlMode::Xml) ? el.mode : mode_override;
-        const char* fn_element;
-        const char* fn_attrs;
-        switch (mode) {
-        case XmlMode::Jsx:
-            fn_element = "xml_element_jsx('";
-            fn_attrs = ", xml_attrs_jsx(";
-            break;
-        case XmlMode::Jsonml:
-            fn_element = "xml_element_jsonml('";
-            fn_attrs = ", xml_attrs_jsonml(";
-            break;
-        default:
-            fn_element = "xml_element('";
-            fn_attrs = ", xml_attrs(";
-            break;
+    // Helper: escape single quotes in a string for a SQL string literal.
+    static std::string sql_escape_lit(const std::string& s) {
+        std::string out;
+        for (char c : s) {
+            if (c == '\'') out += "''";
+            else out += c;
+        }
+        return out;
+    }
+
+    // The recursive-SELECT rewrite needs to emit the existing WHERE
+    // clause as SQL text. The transient arena is just the regular
+    // arena — it owns those strings for the lifetime of the parse.
+    arena_t *transient_arena() { return arena_; }
+
+    // ── Join path rewrite ─────────────────────────────────────────
+    //
+    // FROM c->orders o ON|USING ... -> ... AST representation:
+    //   LP_SQLDEEP_JOIN_PATH { prefix, start_alias, steps[] }
+    //
+    // becomes:
+    //   FROM step1.table [alias] JOIN step2.table [alias] ON ... ...
+    //   WHERE step1 ↔ start  (added to the enclosing SELECT)
+
+    struct JoinColumnPair {
+        std::string child_col;
+        std::string parent_col;
+    };
+
+    // Convention-based resolution: child has FK `<parent>_id`,
+    // parent's PK is the same name. FK-guided mode looks up via
+    // fk_index_; ambiguous or missing entries throw.
+    std::vector<JoinColumnPair>
+    resolve_columns(const std::string& child_table,
+                     const std::string& parent_table) {
+        if (!fk_index_) {
+            return {{parent_table + "_id", parent_table + "_id"}};
+        }
+        auto it = fk_index_->find({child_table, parent_table});
+        if (it == fk_index_->end() || it->second.empty()) {
+            throw Error("no foreign key from '" + child_table + "' to '"
+                        + parent_table + "'", 0, 0);
+        }
+        if (it->second.size() > 1) {
+            throw Error("ambiguous foreign key from '" + child_table +
+                        "' to '" + parent_table + "' (" +
+                        std::to_string(it->second.size()) +
+                        " candidates)", 0, 0);
+        }
+        std::vector<JoinColumnPair> out;
+        for (const auto& cp : it->second[0]->columns)
+            out.push_back({cp.from_column, cp.to_column});
+        return out;
+    }
+
+    // Build a chain of LP_FROM_TABLE / LP_JOIN_CLAUSE for the path
+    // and emit the start-correlation WHERE clause into *where_out.
+    // Returns the from-chain node.
+    LpNode *rewrite_join_path(LpNode *jp, LpNode **where_out) {
+        const auto& path = jp->u.sqldeep_join_path;
+        if (path.steps.count == 0) {
+            *where_out = nullptr;
+            return jp;
         }
 
-        out += fn_element;
-        out += el.tag;
-        if (el.self_closing) out += "/";
-        out += "'";
+        std::string start_alias = path.start_alias ? path.start_alias : "";
+        // The leftmost name must refer to a table or alias already in
+        // scope (from an outer FROM clause or another step). Unknown
+        // names are sqldeep errors — there's no implicit "anything
+        // goes" auto-join base.
+        auto it = alias_map_.find(start_alias);
+        if (it == alias_map_.end()) {
+            throw Error("unknown join alias '" + start_alias + "'", 0, 0);
+        }
+        std::string start_table = it->second;
 
-        // Attributes
-        if (!el.attrs.empty()) {
-            out += fn_attrs;
-            for (size_t i = 0; i < el.attrs.size(); ++i) {
-                if (i > 0) out += ", ";
-                out += "'";
-                out += el.attrs[i].name;
-                out += "', ";
-                render_parts(el.attrs[i].value, out, /*nested=*/true);
+        // First step.
+        LpNode *step1 = path.steps.items[0];
+        const auto& s1 = step1->u.sqldeep_join_step;
+        std::string s1_table = s1.table ? s1.table : "";
+        std::string s1_alias = s1.alias ? s1.alias : "";
+        std::string s1_ref   = s1_alias.empty() ? s1_table : s1_alias;
+
+        // FROM target for the chain.
+        LpNode *chain = make_from_table(arena_, s1_table, s1_alias);
+
+        // WHERE correlation: step1 ↔ start.
+        *where_out = build_join_condition(step1, start_alias, start_table,
+                                           s1_ref, s1_table);
+
+        std::string prev_ref   = s1_ref;
+        std::string prev_table = s1_table;
+
+        // Subsequent steps become JOIN ... ON ....
+        for (int i = 1; i < path.steps.count; i++) {
+            LpNode *step = path.steps.items[i];
+            const auto& s = step->u.sqldeep_join_step;
+            std::string s_table = s.table ? s.table : "";
+            std::string s_alias = s.alias ? s.alias : "";
+            std::string s_ref   = s_alias.empty() ? s_table : s_alias;
+
+            LpNode *table_node = make_from_table(arena_, s_table, s_alias);
+            LpNode *on_expr =
+                build_join_condition(step, prev_ref, prev_table,
+                                      s_ref, s_table);
+            chain = make_join(arena_, chain, table_node, on_expr);
+
+            prev_ref   = s_ref;
+            prev_table = s_table;
+        }
+
+        return chain;
+    }
+
+    // Build the boolean expression connecting two endpoints of a
+    // join-arrow step. `prev` is the left side of the arrow; `curr`
+    // is the right side. forward (`->`) means curr is the child of
+    // prev; reverse (`<-`) means prev is the child of curr.
+    LpNode *build_join_condition(LpNode *step,
+                                  const std::string& prev_ref,
+                                  const std::string& prev_table,
+                                  const std::string& curr_ref,
+                                  const std::string& curr_table) {
+        const auto& s = step->u.sqldeep_join_step;
+
+        // Inline USING (cols): each col → curr.col = prev.col.
+        if (s.using_cols.count > 0) {
+            std::vector<LpNode*> parts;
+            for (int i = 0; i < s.using_cols.count; i++) {
+                LpNode *c = s.using_cols.items[i];
+                if (!c) continue;
+                const char *col = (c->kind == LP_EXPR_COLUMN_REF)
+                                    ? c->u.column_ref.column
+                                    : nullptr;
+                if (!col) continue;
+                parts.push_back(make_binop(arena_, LP_OP_EQ,
+                    make_column_ref2(arena_, curr_ref, col),
+                    make_column_ref2(arena_, prev_ref, col)));
             }
-            out += ")";
+            return and_chain(arena_, parts);
         }
 
-        // Children
-        for (const auto& child : el.children) {
-            out += ", ";
-            switch (child.kind) {
-            case XmlElement::Child::Text: {
-                out += "'";
-                // Escape single quotes for SQL string literal
-                for (char c : child.text) {
-                    if (c == '\'') out += "''";
-                    else out += c;
+        // Inline ON expression.
+        if (s.on_expr) {
+            return rewrite_on_expr(s.on_expr, s.forward,
+                                    prev_ref, curr_ref);
+        }
+
+        // Convention / FK-guided.
+        std::string child_table  = s.forward ? curr_table : prev_table;
+        std::string parent_table = s.forward ? prev_table : curr_table;
+        auto cols = resolve_columns(child_table, parent_table);
+        std::vector<LpNode*> parts;
+        for (const auto& cp : cols) {
+            if (s.forward) {
+                // curr.child = prev.parent
+                parts.push_back(make_binop(arena_, LP_OP_EQ,
+                    make_column_ref2(arena_, curr_ref, cp.child_col),
+                    make_column_ref2(arena_, prev_ref, cp.parent_col)));
+            } else {
+                // prev.child = curr.parent
+                parts.push_back(make_binop(arena_, LP_OP_EQ,
+                    make_column_ref2(arena_, prev_ref, cp.child_col),
+                    make_column_ref2(arena_, curr_ref, cp.parent_col)));
+            }
+        }
+        return and_chain(arena_, parts);
+    }
+
+    // Re-qualify the bare column refs in an inline ON expression
+    // with the appropriate aliases. Handles:
+    //   - single column ref → "curr.col = prev.col"
+    //   - binary EQ "L = R" → emit "curr.R = prev.L" (forward) or
+    //     "prev.R = curr.L" (reverse). Left side names the parent
+    //     column, right side names the child column.
+    //   - AND of EQs → recurse left/right, combine with AND.
+    LpNode *rewrite_on_expr(LpNode *expr, int forward,
+                             const std::string& prev_ref,
+                             const std::string& curr_ref) {
+        if (!expr) return nullptr;
+
+        if (expr->kind == LP_EXPR_COLUMN_REF) {
+            // Shorthand: same column name in both tables.
+            const char *col = expr->u.column_ref.column;
+            if (!col) return expr;
+            // For forward (curr is child): curr.col = prev.col
+            // For reverse (prev is child): prev.col = curr.col
+            if (forward)
+                return make_binop(arena_, LP_OP_EQ,
+                    make_column_ref2(arena_, curr_ref, col),
+                    make_column_ref2(arena_, prev_ref, col));
+            else
+                return make_binop(arena_, LP_OP_EQ,
+                    make_column_ref2(arena_, prev_ref, col),
+                    make_column_ref2(arena_, curr_ref, col));
+        }
+
+        if (expr->kind == LP_EXPR_BINARY_OP
+            && expr->u.binary.op == LP_OP_AND) {
+            LpNode *l = rewrite_on_expr(expr->u.binary.left, forward,
+                                         prev_ref, curr_ref);
+            LpNode *r = rewrite_on_expr(expr->u.binary.right, forward,
+                                         prev_ref, curr_ref);
+            return make_binop(arena_, LP_OP_AND, l, r);
+        }
+
+        if (expr->kind == LP_EXPR_BINARY_OP
+            && expr->u.binary.op == LP_OP_EQ) {
+            // ON L = R: L names the column on the LEFT side of the
+            // arrow; R names the column on the RIGHT side. The arrow
+            // direction (forward / reverse) determines which side is
+            // the child and which is the parent, but the L→left,
+            // R→right mapping is invariant.
+            //   Forward  (c -> orders): prev=c=left, curr=orders=right
+            //                           emit curr.R = prev.L
+            //   Reverse  (o <- vendors): prev=o=left, curr=vendors=right
+            //                            emit prev.L = curr.R
+            LpNode *L = expr->u.binary.left;
+            LpNode *R = expr->u.binary.right;
+            const char *Lcol = (L && L->kind == LP_EXPR_COLUMN_REF)
+                                  ? L->u.column_ref.column : nullptr;
+            const char *Rcol = (R && R->kind == LP_EXPR_COLUMN_REF)
+                                  ? R->u.column_ref.column : nullptr;
+            if (Lcol && Rcol) {
+                if (forward)
+                    return make_binop(arena_, LP_OP_EQ,
+                        make_column_ref2(arena_, curr_ref, Rcol),
+                        make_column_ref2(arena_, prev_ref, Lcol));
+                else
+                    return make_binop(arena_, LP_OP_EQ,
+                        make_column_ref2(arena_, prev_ref, Lcol),
+                        make_column_ref2(arena_, curr_ref, Rcol));
+            }
+        }
+
+        return expr;  // fallback: leave as-is
+    }
+
+    // SELECT-level handling: join path expansion, singular → LIMIT 1,
+    // deep projection wrapping. The from_first flag is also cleared
+    // here because canonical unparser emits standard SELECT-FROM order.
+    LpNode *rewrite_select(LpNode *node) {
+        node->u.select.sqldeep_from_first = 0;
+
+        // Expand a sqldeep join path in the FROM clause into a
+        // standard FROM_TABLE / JOIN_CLAUSE chain plus an AND-ed
+        // start-correlation predicate added to the WHERE clause.
+        if (node->u.select.from
+            && node->u.select.from->kind == LP_SQLDEEP_JOIN_PATH) {
+            LpNode *jp = node->u.select.from;
+            LpNode *extra_where = nullptr;
+            LpNode *chain = rewrite_join_path(jp, &extra_where);
+            node->u.select.from = chain;
+            if (extra_where) {
+                node->u.select.where = node->u.select.where
+                    ? make_binop(arena_, LP_OP_AND,
+                                  extra_where, node->u.select.where)
+                    : extra_where;
+            }
+        }
+
+        bool was_singular = node->u.select.sqldeep_singular;
+
+        // SELECT/1 → LIMIT 1 (unless a LIMIT is already specified).
+        if (was_singular) {
+            node->u.select.sqldeep_singular = 0;
+            if (!node->u.select.limit) {
+                node->u.select.limit = make_limit(arena_, 1);
+            }
+        }
+
+        // SELECT/1 [single_elem] FROM t → SELECT single_elem FROM t LIMIT 1.
+        // The single-element array literal already became fn_array(elem) in
+        // the post-order walk; unwrap it back to bare `elem` when singular.
+        if (was_singular
+            && node->u.select.result_columns.count == 1) {
+            LpNode *rc = node->u.select.result_columns.items[0];
+            LpNode *proj = (rc && rc->kind == LP_RESULT_COLUMN)
+                              ? rc->u.result_column.expr : rc;
+            if (proj && proj->kind == LP_EXPR_FUNCTION
+                && proj->u.function.name
+                && std::strcmp(proj->u.function.name, fn_array()) == 0
+                && proj->u.function.args.count == 1) {
+                LpNode *elem = proj->u.function.args.items[0];
+                if (rc && rc->kind == LP_RESULT_COLUMN)
+                    rc->u.result_column.expr = elem;
+                else
+                    node->u.select.result_columns.items[0] = elem;
+            }
+        }
+
+        // Deep-projection wrapping. The rules (mirroring sqldeep):
+        //
+        //   Array projection [...] — ALWAYS wraps in fn_group_array,
+        //   regardless of nesting. Single-element arrays unwrap to
+        //   the bare element first; multi-element wrap the whole
+        //   fn_array(...) call.
+        //
+        //   Object projection {...} — wraps only when the SELECT is a
+        //   value subquery in an "aggregating" context: parent is
+        //   LP_EXPR_SUBQUERY whose parent is LP_SQLDEEP_FIELD or
+        //   LP_EXPR_SQLDEEP_ARRAY or LP_EXPR_IN.
+        //
+        //   Singular (/1) — never wrap, no group_array. The singular
+        //   array-element unwrap already happened above.
+        //
+        // Scalar-subquery contexts (function args, WHERE comparisons,
+        // arithmetic, EXISTS, etc.) do NOT wrap.
+
+        if (node->u.select.limit) return node;  // singular / explicit LIMIT
+        if (node->u.select.result_columns.count != 1) return node;
+
+        LpNode *rc = node->u.select.result_columns.items[0];
+        LpNode *proj = (rc && rc->kind == LP_RESULT_COLUMN)
+                          ? rc->u.result_column.expr : rc;
+        if (!proj || proj->kind != LP_EXPR_FUNCTION) return node;
+        const char *pname = proj->u.function.name;
+        if (!pname) return node;
+
+        bool is_obj = std::strcmp(pname, fn_object()) == 0;
+        bool is_arr = std::strcmp(pname, fn_array()) == 0;
+        bool is_xml = std::strcmp(pname, "xml_element") == 0
+                    || std::strcmp(pname, "xml_element_jsx") == 0
+                    || std::strcmp(pname, "xml_element_jsonml") == 0;
+        if (!is_obj && !is_arr && !is_xml) return node;
+
+        // Helper: set the projection back.
+        auto replace_projection = [&](LpNode *new_expr) {
+            if (rc && rc->kind == LP_RESULT_COLUMN)
+                rc->u.result_column.expr = new_expr;
+            else
+                node->u.select.result_columns.items[0] = new_expr;
+        };
+
+        // XML projection in a value-subquery whose grandparent is an
+        // XML element (i.e. <ul>{SELECT <li/> FROM t}</ul>) gets
+        // wrapped in the corresponding {xml,jsx,jsonml}_agg helper so
+        // rows aggregate into one XML fragment.
+        if (is_xml) {
+            LpNode *parent = node->parent;
+            if (!parent || parent->kind != LP_EXPR_SUBQUERY) return node;
+            LpNode *gp = parent->parent;
+            if (!gp || gp->kind != LP_EXPR_SQLDEEP_XML) return node;
+            const char *agg = "xml_agg";
+            if (std::strcmp(pname, "xml_element_jsx") == 0)    agg = "jsx_agg";
+            if (std::strcmp(pname, "xml_element_jsonml") == 0) agg = "jsonml_agg";
+            replace_projection(make_function(arena_, agg, {proj}));
+            return node;
+        }
+
+        if (is_obj) {
+            // Object wrap fires when the SELECT is a value-subquery in
+            // an aggregating sqldeep context (object field value, array
+            // element, IN-list value). LP_EXPR_IN holds its inner
+            // select directly without an LP_EXPR_SUBQUERY wrapper, so
+            // both paths are checked.
+            LpNode *parent = node->parent;
+            if (!parent) return node;
+            bool wrap = false;
+            if (parent->kind == LP_EXPR_IN) {
+                wrap = true;
+            } else if (parent->kind == LP_EXPR_SUBQUERY) {
+                LpNode *gp = parent->parent;
+                if (gp && (gp->kind == LP_SQLDEEP_FIELD
+                        || gp->kind == LP_EXPR_SQLDEEP_ARRAY
+                        || gp->kind == LP_EXPR_IN)) {
+                    wrap = true;
                 }
-                out += "'";
-                break;
             }
-            case XmlElement::Child::Interpolation:
-                render_parts(child.expr, out, /*nested=*/true);
-                break;
-            case XmlElement::Child::Element:
-                render_xml_element(*child.element, out, mode);
-                break;
-            }
+            if (!wrap) return node;
+            replace_projection(make_function(arena_, fn_group_array(), {proj}));
+            return node;
         }
 
-        out += ")";
+        // Array projection: unwrap single-element; wrap in group_array.
+        LpNode *inner = (proj->u.function.args.count == 1)
+                          ? proj->u.function.args.items[0] : proj;
+        replace_projection(make_function(arena_, fn_group_array(), {inner}));
+        return node;
     }
-
-    const FkIndex* fk_index_;
-    Backend backend_;
-    const char* fn_object_;
-    const char* fn_array_;
-    const char* fn_group_array_;
 };
 
-} // anonymous namespace
+// ── End-to-end pipeline ──────────────────────────────────────────────
 
-// ── Public API ──────────────────────────────────────────────────────
+std::string transpile_impl(const std::string& input,
+                            const std::vector<ForeignKey>* fks,
+                            Backend backend) {
+    arena_t *arena = arena_create(64 * 1024);
+    if (!arena) throw Error("out of memory", 0, 0);
+
+    // Try to parse as a sequence of statements. If that fails, the
+    // input may be a bare expression — sqldeep historically accepted
+    // those (e.g. `<div/>`, `{a, b}`) directly. Wrap it as a one-
+    // column SELECT, transform, then strip the SELECT framing so the
+    // caller still sees just the expression.
+    const char *parse_err = nullptr;
+    LpNodeList *stmts = lp_parse_all(input.c_str(), arena, &parse_err);
+    bool bare_expr = false;
+    if (!stmts) {
+        std::string wrapped = "SELECT " + input;
+        const char *err2 = nullptr;
+        stmts = lp_parse_all(wrapped.c_str(), arena, &err2);
+        if (!stmts) {
+            std::string msg = parse_err ? parse_err
+                              : (err2 ? err2 : "parse error");
+            // Deepparser formats errors as "LINE:COL: message"; parse
+            // out the position so callers can highlight the source.
+            int line = 0, col = 0;
+            (void)std::sscanf(msg.c_str(), "%d:%d", &line, &col);
+            arena_destroy(arena);
+            throw Error(msg, line, col);
+        }
+        bare_expr = true;
+    }
+
+    // Rename "?" placeholders to ordered sentinels so we can verify the
+    // transform preserves their order before handing SQL back (restored
+    // to "?" after the check). See mark_positional_params.
+    int pos_param_count = mark_positional_params(stmts, arena);
+
+    FkIndex fk_index;
+    if (fks) fk_index = build_fk_index(*fks);
+
+    try {
+        Transformer t(arena, backend, fks ? &fk_index : nullptr);
+        for (int i = 0; i < stmts->count; i++) {
+            stmts->items[i] = t.transform(stmts->items[i]);
+            if (stmts->items[i]) lp_fix_parents(stmts->items[i]);
+        }
+    } catch (...) {
+        arena_destroy(arena);
+        throw;
+    }
+
+    std::string out;
+    if (bare_expr && stmts->count == 1) {
+        // Extract just the single result-column expression so the
+        // caller sees the bare transformed form.
+        LpNode *sel = stmts->items[0];
+        if (sel && sel->kind == LP_STMT_SELECT
+            && sel->u.select.result_columns.count == 1) {
+            LpNode *rc = sel->u.select.result_columns.items[0];
+            LpNode *expr = (rc && rc->kind == LP_RESULT_COLUMN)
+                              ? rc->u.result_column.expr : rc;
+            if (expr) {
+                char *sql = lp_ast_to_sql(expr, arena);
+                if (sql) out = sql;
+            }
+        }
+    } else {
+        for (int i = 0; i < stmts->count; i++) {
+            if (i > 0) out += "; ";
+            char *sql = lp_ast_to_sql(stmts->items[i], arena);
+            if (sql) out += sql;
+        }
+    }
+
+    arena_destroy(arena);
+
+    // Verify "?" order survived the rewrite and restore the placeholders
+    // (throws if a rewrite reordered them). The arena is already gone;
+    // this works purely on the output string.
+    restore_positional_params(out, pos_param_count);
+    return out;
+}
+
+} // namespace
+
+// ── Public C++ API ──────────────────────────────────────────────────
 
 std::string transpile(const std::string& input) {
-    auto alias_map = build_alias_map(input);
-    Lexer lex(input);
-    Parser parser(lex, std::move(alias_map));
-    SqlParts doc = parser.parse_document();
-    Renderer renderer;
-    return renderer.render_document(doc);
+    return transpile_impl(input, nullptr, Backend::sqlite);
 }
 
 std::string transpile(const std::string& input,
-                      const std::vector<ForeignKey>& foreign_keys) {
-    auto alias_map = build_alias_map(input);
-    Lexer lex(input);
-    Parser parser(lex, std::move(alias_map));
-    SqlParts doc = parser.parse_document();
-    auto fk_idx = build_fk_index(foreign_keys);
-    Renderer renderer(&fk_idx);
-    return renderer.render_document(doc);
+                       const std::vector<ForeignKey>& fks) {
+    return transpile_impl(input, &fks, Backend::sqlite);
 }
 
 std::string transpile(const std::string& input, Backend backend) {
-    auto alias_map = build_alias_map(input);
-    Lexer lex(input);
-    Parser parser(lex, std::move(alias_map), backend);
-    SqlParts doc = parser.parse_document();
-    Renderer renderer(nullptr, backend);
-    return renderer.render_document(doc);
+    return transpile_impl(input, nullptr, backend);
 }
 
 std::string transpile(const std::string& input,
-                      const std::vector<ForeignKey>& foreign_keys,
-                      Backend backend) {
-    auto alias_map = build_alias_map(input);
-    Lexer lex(input);
-    Parser parser(lex, std::move(alias_map), backend);
-    SqlParts doc = parser.parse_document();
-    auto fk_idx = build_fk_index(foreign_keys);
-    Renderer renderer(&fk_idx, backend);
-    return renderer.render_document(doc);
+                       const std::vector<ForeignKey>& fks,
+                       Backend backend) {
+    return transpile_impl(input, &fks, backend);
 }
 
 } // namespace sqldeep
@@ -10901,14 +10183,12 @@ std::string transpile(const std::string& input,
 
 namespace {
 
-// Duplicate a std::string to a malloc'd C string (caller frees with sqldeep_free).
-char* sqldeep_dup_str(const std::string& s) {
-    char* p = static_cast<char*>(std::malloc(s.size() + 1));
+char *sqldeep_dup_str(const std::string& s) {
+    char *p = static_cast<char*>(std::malloc(s.size() + 1));
     if (p) std::memcpy(p, s.c_str(), s.size() + 1);
     return p;
 }
 
-// Set error output pointers. msg is malloc'd; caller frees with sqldeep_free.
 void sqldeep_set_error(char** err_msg, int* err_line, int* err_col,
                const sqldeep::Error& e) {
     if (err_msg)  *err_msg = sqldeep_dup_str(e.what());
@@ -10923,12 +10203,15 @@ void sqldeep_clear_error(char** err_msg, int* err_line, int* err_col) {
 }
 
 sqldeep::Backend to_backend(sqldeep_backend b) {
-    return b == SQLDEEP_POSTGRES ? sqldeep::Backend::postgres
-                                 : sqldeep::Backend::sqlite;
+    switch (b) {
+        case SQLDEEP_POSTGRES:       return sqldeep::Backend::postgres;
+        case SQLDEEP_SQLITE_VANILLA: return sqldeep::Backend::sqlite_vanilla;
+        default:                     return sqldeep::Backend::sqlite;
+    }
 }
 
 std::vector<sqldeep::ForeignKey> to_cpp_fks(const sqldeep_foreign_key* fks,
-                                             int fk_count) {
+                                              int fk_count) {
     std::vector<sqldeep::ForeignKey> cpp_fks;
     cpp_fks.reserve(fk_count);
     for (int i = 0; i < fk_count; ++i) {
@@ -10954,14 +10237,14 @@ extern "C" {
 char* sqldeep_transpile(const char* input,
                         char** err_msg, int* err_line, int* err_col) {
     return sqldeep_transpile_backend(input, SQLDEEP_SQLITE,
-                                     err_msg, err_line, err_col);
+                                      err_msg, err_line, err_col);
 }
 
 char* sqldeep_transpile_fk(const char* input,
                            const sqldeep_foreign_key* fks, int fk_count,
                            char** err_msg, int* err_line, int* err_col) {
     return sqldeep_transpile_fk_backend(input, SQLDEEP_SQLITE, fks, fk_count,
-                                        err_msg, err_line, err_col);
+                                         err_msg, err_line, err_col);
 }
 
 char* sqldeep_transpile_backend(const char* input,
@@ -11750,7 +11033,7 @@ static void sd_json(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 
 // ── Public registration ───────────────────────────────────────────���─
 
-int sqldeep_register_sqlite_xml(sqlite3 *db) {
+int sqldeep_register_sqlite(sqlite3 *db) {
     int rc;
     rc = sqlite3_create_function(db, "xml_element", -1, SQLITE_UTF8,
                                  0, sd_xml_element, 0, 0);

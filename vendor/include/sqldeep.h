@@ -6,9 +6,9 @@
 // sqldeep — C interface for transpiling JSON5-like SQL syntax to standard SQL.
 // Callers must free returned strings with sqldeep_free().
 
-#define SQLDEEP_VERSION       "0.18.0"
+#define SQLDEEP_VERSION       "0.23.0"
 #define SQLDEEP_VERSION_MAJOR 0
-#define SQLDEEP_VERSION_MINOR 18
+#define SQLDEEP_VERSION_MINOR 23
 #define SQLDEEP_VERSION_PATCH 0
 
 #ifdef __cplusplus
@@ -30,7 +30,11 @@ typedef struct {
 } sqldeep_foreign_key;
 
 // Target database backend.
-typedef enum { SQLDEEP_SQLITE = 0, SQLDEEP_POSTGRES = 1 } sqldeep_backend;
+typedef enum {
+    SQLDEEP_SQLITE         = 0, // Custom functions (sqldeep_json_object, etc.)
+    SQLDEEP_POSTGRES       = 1,
+    SQLDEEP_SQLITE_VANILLA = 2  // Built-in SQLite JSON functions only
+} sqldeep_backend;
 
 // Convention-based transpile (SQLite backend). Returns malloc'd string (caller
 // frees with sqldeep_free). On error returns NULL, sets err_msg/err_line/err_col.

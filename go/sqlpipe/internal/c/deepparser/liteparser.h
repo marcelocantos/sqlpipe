@@ -281,6 +281,18 @@ typedef enum {
     LP_VALUES_ROW,
     LP_TRIGGER_CMD,
 
+    /* sqldeep extensions */
+    LP_EXPR_SQLDEEP_OBJECT,
+    LP_EXPR_SQLDEEP_ARRAY,
+    LP_SQLDEEP_FIELD,
+    LP_SQLDEEP_JOIN_PATH,
+    LP_SQLDEEP_JOIN_STEP,
+    LP_EXPR_SQLDEEP_JSON_PATH,
+    LP_SQLDEEP_RECURSE,
+    LP_EXPR_SQLDEEP_XML,
+    LP_SQLDEEP_XML_ATTR,
+    LP_SQLDEEP_XML_TEXT,
+
     LP_NODE_KIND_COUNT
 } LpNodeKind;
 
@@ -305,8 +317,11 @@ struct LpNode {
 
         struct {
             int           distinct;
+            int           sqldeep_singular;  /* set by SELECT/1 modifier */
+            int           sqldeep_from_first;/* set by FROM-first variant */
             LpNodeList    result_columns;
             LpNode       *from;
+            LpNode       *sqldeep_recurse;   /* LP_SQLDEEP_RECURSE node, or NULL */
             LpNode       *where;
             LpNodeList    group_by;
             LpNode       *having;
@@ -691,6 +706,75 @@ struct LpNode {
         struct {
             LpNode       *stmt;        /* wrapped statement node */
         } trigger_cmd;
+
+        /* sqldeep extensions */
+
+        struct {
+            LpNodeList    fields;      /* LP_SQLDEEP_FIELD nodes */
+        } sqldeep_object;
+
+        struct {
+            LpNodeList    elements;    /* expression nodes */
+        } sqldeep_array;
+
+        struct {
+            /* key_form: 0=bare (id only), 1=named (id COLON expr),
+             * 2=string ("k" COLON expr), 3=computed ((expr) COLON expr),
+             * 4=recursive children (id COLON STAR),
+             * 5=qualified bare (a.b or a.b.c — key is last component,
+             *   value is the column-ref node of the full dotted path) */
+            int           key_form;
+            char         *key_text;    /* used by forms 0, 1, 2, 4, 5 (dequoted) */
+            LpNode       *key_expr;    /* used by form 3 only */
+            LpNode       *value;       /* NULL for forms 0 and 4 */
+        } sqldeep_field;
+
+        struct {
+            LpNode       *prefix;      /* preceding stl_prefix (joins/tables), or NULL */
+            char         *start_alias; /* leftmost table or alias name */
+            LpNodeList    steps;       /* LP_SQLDEEP_JOIN_STEP nodes */
+        } sqldeep_join_path;
+
+        struct {
+            int           forward;     /* 1 for ->, 0 for <- */
+            char         *table;
+            char         *alias;       /* NULL if not given */
+            LpNode       *on_expr;     /* ON expr, or NULL */
+            LpNodeList    using_cols;  /* USING (cols), empty if none */
+        } sqldeep_join_step;
+
+        struct {
+            LpNode       *base;        /* expression inside the leading (...) */
+            /* segments: each item is either an LP_EXPR_LITERAL_STRING
+             * (".name" form) or an LP_EXPR_LITERAL_INT ("[N]" form);
+             * renderer dispatches on kind. */
+            LpNodeList    segments;
+        } sqldeep_json_path;
+
+        struct {
+            char         *fk_col;      /* required: the FK column name */
+            char         *pk_col;      /* optional explicit PK (default "id") */
+        } sqldeep_recurse;
+
+        struct {
+            char         *tag;         /* tag name, may contain ':' and '.' */
+            LpNodeList    attrs;       /* LP_SQLDEEP_XML_ATTR nodes */
+            /* children: LP_SQLDEEP_XML_TEXT, LP_EXPR_SQLDEEP_XML,
+             * or any other expression node (treated as an
+             * interpolated {expr}). */
+            LpNodeList    children;
+            int           self_closing; /* 1 for <tag/>, 0 for <tag></tag> */
+        } sqldeep_xml;
+
+        struct {
+            char         *name;
+            LpNode       *value;       /* NULL for boolean attribute */
+            int           dynamic;     /* 1 = {expr}, 0 = "static" */
+        } sqldeep_xml_attr;
+
+        struct {
+            char         *text;        /* raw body text, exact source bytes */
+        } sqldeep_xml_text;
 
     } u;
 };

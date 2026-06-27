@@ -10,18 +10,18 @@ cxxflags = -Wall -Wextra -Wpedantic $sqlite_flags
 
 vendor      = vendor
 sqldeep     = ../sqldeep
-liteparser  = $vendor/github.com/sqliteai/liteparser
-incflags    = -Idist -I$vendor/include -I$liteparser/src
+deepparser  = $vendor/github.com/marcelocantos/deepparser
+incflags    = -Idist -I$vendor/include -I$deepparser/src
 
 # ── Sources ──────────────────────────────────────────────────────────
 test_srcs = tests/doctest_main.cpp $[wildcard tests/test_*.cpp]
 test_objs = $[patsubst %.cpp,build/%.o,$test_srcs]
 
 # ── Default target ───────────────────────────────────────────────────
-lp_srcs = arena liteparser lp_tokenize lp_unparse parse
-lp_objs = $[patsubst %,build/liteparser/%.o,$lp_srcs]
+dp_srcs = arena liteparser lp_tokenize lp_unparse parse
+dp_objs = $[patsubst %,build/deepparser/%.o,$dp_srcs]
 
-build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlpipe.o $lp_objs
+build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlpipe.o $dp_objs
     $ar rcs $target $inputs
 
 # ── Tasks ────────────────────────────────────────────────────────────
@@ -60,9 +60,9 @@ wasm_emflags = -sMODULARIZE=1 -sEXPORT_NAME=createSqlpipeModule \
     -sALLOW_TABLE_GROWTH -sINITIAL_MEMORY=16777216 -sALLOW_MEMORY_GROWTH=1 \
     -sSTACK_SIZE=1048576 -sDISABLE_EXCEPTION_CATCHING=0
 
-wasm_lp_objs = $[patsubst %,build/wasm/liteparser/%.o,$lp_srcs]
+wasm_dp_objs = $[patsubst %,build/wasm/deepparser/%.o,$dp_srcs]
 
-build/wasm/sqlpipe.js: build/wasm/sqlpipe_wapi.o build/wasm/sqldeep_wapi.o build/wasm/sqlpipe.o build/wasm/sqlite3.o build/wasm/lz4.o $wasm_lp_objs
+build/wasm/sqlpipe.js: build/wasm/sqlpipe_wapi.o build/wasm/sqldeep_wapi.o build/wasm/sqlpipe.o build/wasm/sqlite3.o build/wasm/lz4.o $wasm_dp_objs
     em++ -std=c++23 $wasm_emflags -o $target $inputs
 
 build/wasm/sqlpipe_wapi.o: web/sqlpipe_wapi.cpp
@@ -96,9 +96,9 @@ build/tests/{name}.o: tests/{name}.cpp
 build/examples/{name}.o: examples/{name}.cpp
     $cxx $cxxflags $incflags -c $input -o $target
 
-build/liteparser/{name}.o: $liteparser/src/{name}.c
-    $cc -w -O2 -I$liteparser/src -c $input -o $target
+build/deepparser/{name}.o: $deepparser/src/{name}.c
+    $cc -w -O2 -I$deepparser/src -c $input -o $target
 
-build/wasm/liteparser/{name}.o: $liteparser/src/{name}.c
-    emcc -w -O2 -DARENA_DEFAULT_ALIGN=16 -I$liteparser/src -c $input -o $target
+build/wasm/deepparser/{name}.o: $deepparser/src/{name}.c
+    emcc -w -O2 -DARENA_DEFAULT_ALIGN=16 -I$deepparser/src -c $input -o $target
 

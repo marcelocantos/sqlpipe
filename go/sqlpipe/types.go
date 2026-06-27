@@ -4,9 +4,9 @@
 package sqlpipe
 
 const (
-	Version      = "0.23.0"
+	Version      = "0.24.0"
 	VersionMajor = 0
-	VersionMinor = 23
+	VersionMinor = 24
 	VersionPatch = 0
 )
 
@@ -64,6 +64,14 @@ const (
 	DiffComputingRowHash                   // Computing per-row hashes.
 	DiffBuildingPatchset                   // Building INSERT patchset (master).
 	DiffApplyingPatchset                   // Applying patchset + deletes (replica).
+)
+
+// Delivery indicates the transport delivery mode for a message.
+type Delivery uint8
+
+const (
+	DeliveryReliable   Delivery = 0 // Must arrive (changesets, errors, acks, hellos, patchsets).
+	DeliveryBestEffort Delivery = 1 // Regenerable by convergence (bucket/row hashes, need-buckets).
 )
 
 // SenderRole identifies direction in peer-to-peer messages.
@@ -157,7 +165,7 @@ type ApproveOwnershipCallback func(requestedTables map[string]bool) bool
 // FlushCallback is called when the Master auto-flushes after a write
 // transaction committed via Master.Exec. It receives the changeset messages
 // ready to send to replicas.
-type FlushCallback func(messages []Message)
+type FlushCallback func(messages []OutMessage)
 
 // Protocol constants.
 const (
