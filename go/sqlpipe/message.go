@@ -133,16 +133,28 @@ type PeerMessage struct {
 	Payload    Message
 }
 
+// OutMessage pairs a Message with a transport delivery hint.
+type OutMessage struct {
+	Msg      Message
+	Delivery Delivery
+}
+
+// PeerOutMessage pairs a PeerMessage with a transport delivery hint.
+type PeerOutMessage struct {
+	Msg      PeerMessage
+	Delivery Delivery
+}
+
 // HandleResult is the return type for Replica.HandleMessage.
 type HandleResult struct {
-	Messages      []Message
+	Messages      []OutMessage
 	Changes       []ChangeEvent
 	Subscriptions []QueryResult
 }
 
 // PeerHandleResult is the return type for Peer.HandleMessage.
 type PeerHandleResult struct {
-	Messages      []PeerMessage
+	Messages      []PeerOutMessage
 	Changes       []ChangeEvent
 	Subscriptions []QueryResult
 }
