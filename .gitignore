@@ -1,4 +1,5 @@
 build/
+.cv/
 .mk/
 .claude/
 .cache/

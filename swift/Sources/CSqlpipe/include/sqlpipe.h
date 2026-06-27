@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#define SQLPIPE_VERSION       "0.23.0"
+#define SQLPIPE_VERSION       "0.24.0"
 #define SQLPIPE_VERSION_MAJOR 0
-#define SQLPIPE_VERSION_MINOR 23
+#define SQLPIPE_VERSION_MINOR 24
 #define SQLPIPE_VERSION_PATCH 0
 
 // ── Bundled: sqldeep (query transpiler) ─────────────────────────
 // Converts sqldeep extended SQL syntax to standard SQL.
 // Integrated into Database::exec/query/subscribe automatically.
 
-#define SQLDEEP_VERSION       "0.13.0"
+#define SQLDEEP_VERSION       "0.23.0"
 #define SQLDEEP_VERSION_MAJOR 0
-#define SQLDEEP_VERSION_MINOR 13
+#define SQLDEEP_VERSION_MINOR 23
 #define SQLDEEP_VERSION_PATCH 0
 
 typedef struct sqlite3 sqlite3;
@@ -34,7 +34,11 @@ typedef struct {
     int column_count;
 } sqldeep_foreign_key;
 
-typedef enum { SQLDEEP_SQLITE = 0, SQLDEEP_POSTGRES = 1 } sqldeep_backend;
+typedef enum {
+    SQLDEEP_SQLITE = 0,
+    SQLDEEP_POSTGRES = 1,
+    SQLDEEP_SQLITE_VANILLA = 2,
+} sqldeep_backend;
 
 /// Transpile sqldeep syntax to standard SQL (SQLite backend).
 /// Returns malloc'd string (caller frees with sqldeep_free).
@@ -59,9 +63,10 @@ char* sqldeep_transpile_fk_backend(const char* input, sqldeep_backend backend,
 const char* sqldeep_version(void);
 void sqldeep_free(void* ptr);
 
-/// Register xml_element, xml_attrs, and xml_agg on a SQLite connection.
+/// Register sqldeep SQLite runtime functions (xml_element, xml_attrs, xml_agg,
+/// sqldeep_json, sqldeep_json_object, sqldeep_json_array, sqldeep_json_group_array).
 /// Called automatically by Database constructor. Returns SQLITE_OK on success.
-int sqldeep_register_sqlite_xml(sqlite3* db);
+int sqldeep_register_sqlite(sqlite3* db);
 
 #ifdef __cplusplus
 }

@@ -75,6 +75,34 @@ static inline char *lp_buf_finish(LpBuf *b, arena_t *arena) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  XML lexer state (stack of nested XML elements + interpolations)    */
+/* ------------------------------------------------------------------ */
+/* Phase values for LpXmlFrame.phase: */
+#define LP_XML_PHASE_TAG_OPEN  1   /* inside <tag ...     (waiting for > or />) */
+#define LP_XML_PHASE_BODY      2   /* inside body         (waiting for </ or text) */
+#define LP_XML_PHASE_TAG_CLOSE 3   /* inside </tag        (waiting for >) */
+#define LP_XML_PHASE_INTERP    4   /* {expr} in XML body  (tracks brace depth) */
+
+typedef struct LpXmlFrame {
+    int                 phase;
+    int                 brace_depth;   /* used only in INTERP */
+    struct LpXmlFrame  *next;
+} LpXmlFrame;
+
+/* Brace frame tracks {...} / [...] literal nesting so the tokenizer
+ * can emit FIELD_COMMA (instead of COMMA) for top-level commas inside
+ * sqldeep object/array literals — the field-boundary form that ends
+ * the inner field-value's SELECT or expression. */
+#define LP_BRACE_FRAME_OBJECT 1
+#define LP_BRACE_FRAME_ARRAY  2
+
+typedef struct LpBraceFrame {
+    int                  type;          /* OBJECT or ARRAY */
+    int                  nest_depth;    /* LP-depth inside this frame */
+    struct LpBraceFrame *next;
+} LpBraceFrame;
+
+/* ------------------------------------------------------------------ */
 /*  Parse context (replaces SQLite's Parse struct)                     */
 /* ------------------------------------------------------------------ */
 typedef struct LpParseContext {
@@ -100,6 +128,19 @@ typedef struct LpParseContext {
     /* Tolerant mode (error recovery) */
     int         tolerant;      /* if non-zero, continue past errors */
     LpErrorList all_errors;    /* accumulated errors in tolerant mode */
+
+    /* sqldeep XML lexer state — stack of nested XML element frames,
+     * with interpolation frames pushed on top when inside {expr}. NULL
+     * when not currently inside any XML element. Managed entirely by
+     * the tokenizer driver in lp_tokenize.c. */
+    LpXmlFrame *xml_stack;
+
+    /* sqldeep brace lexer state — stack of {...} / [...] literal
+     * frames. When the top frame's nest_depth is 0, a COMMA is
+     * promoted to FIELD_COMMA (field/element separator) so that an
+     * inner bare-SELECT field value terminates instead of greedily
+     * extending FROM-lists, ORDER BY, etc. */
+    LpBraceFrame *brace_stack;
 } LpParseContext;
 
 /* ------------------------------------------------------------------ */
@@ -371,6 +412,35 @@ int lp_parse_join_type(LpParseContext *ctx, LpToken *a, LpToken *b, LpToken *c);
 
 /* --- ID list to node list --- */
 LpNode *lp_make_id_node(LpParseContext *ctx, LpToken *name);
+
+/* --- sqldeep extensions --- */
+LpNode *lp_make_sqldeep_object(LpParseContext *ctx, LpNodeList *fields);
+LpNode *lp_make_sqldeep_array(LpParseContext *ctx, LpNodeList *elements);
+LpNode *lp_make_sqldeep_field_bare(LpParseContext *ctx, LpToken *name);
+LpNode *lp_make_sqldeep_field_named(LpParseContext *ctx, LpToken *name, LpNode *value);
+LpNode *lp_make_sqldeep_field_string(LpParseContext *ctx, LpToken *key, LpNode *value);
+LpNode *lp_make_sqldeep_field_computed(LpParseContext *ctx, LpNode *key, LpNode *value);
+LpNode *lp_make_sqldeep_join_path(LpParseContext *ctx, LpNode *prefix,
+                                   LpToken *start_alias, LpNodeList *steps);
+LpNode *lp_make_sqldeep_join_step(LpParseContext *ctx, int forward,
+                                   LpToken *table, LpToken *alias,
+                                   LpNode *on_expr, LpNodeList *using_cols);
+LpNode *lp_make_sqldeep_json_path(LpParseContext *ctx, LpNode *base, LpNodeList *segments);
+LpNode *lp_make_sqldeep_path_name(LpParseContext *ctx, LpToken *name);
+LpNode *lp_make_sqldeep_path_index(LpParseContext *ctx, LpToken *idx);
+LpNode *lp_make_sqldeep_field_recursive(LpParseContext *ctx, LpToken *name);
+LpNode *lp_make_sqldeep_field_qualified(LpParseContext *ctx, LpToken *last,
+                                         LpNode *column_ref);
+LpNode *lp_make_sqldeep_recurse(LpParseContext *ctx, LpToken *fk, LpToken *pk);
+LpNode *lp_make_sqldeep_xml(LpParseContext *ctx, LpToken *tag,
+                             LpNodeList *attrs, LpNodeList *children,
+                             int self_closing);
+LpNode *lp_make_sqldeep_xml_attr(LpParseContext *ctx, LpToken *name,
+                                  LpNode *value, int dynamic);
+LpNode *lp_make_sqldeep_xml_text(LpParseContext *ctx, LpToken *text);
+/* Validate that close tag matches open tag, raising lp_error if not. */
+void    lp_check_xml_close_tag(LpParseContext *ctx, LpToken *open,
+                                LpToken *close);
 
 #ifdef __cplusplus
 }

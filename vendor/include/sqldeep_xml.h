@@ -24,7 +24,7 @@ extern "C" {
 
 // Register all sqldeep runtime functions on the given connection.
 // Returns SQLITE_OK on success.
-int sqldeep_register_sqlite_xml(sqlite3* db);
+int sqldeep_register_sqlite(sqlite3* db);
 
 #ifdef __cplusplus
 }

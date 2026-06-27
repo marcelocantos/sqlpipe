@@ -114,13 +114,21 @@ char *lp_token_dequote(LpParseContext *ctx, LpToken *tok) {
         s[inner_len] = '\0';
         return s;
     }
-    /* For ' " ` — strip quotes and unescape doubled quotes */
+    /* For ' " ` — strip quotes and unescape doubled quotes. For
+     * double-quoted identifiers, also unescape `\<any>` (sqldeep
+     * extension matching the tokenizer's lex rule). */
     const char *src = tok->z + 1;
     unsigned int src_len = tok->n - 2; /* skip opening and closing quote */
+    int allow_backslash = (q == '"');
     char *s = (char *)arena_alloc(ctx->arena, src_len + 1);
     if (!s) return NULL;
     unsigned int j = 0;
     for (unsigned int i = 0; i < src_len; i++) {
+        if (allow_backslash && src[i] == '\\' && i + 1 < src_len) {
+            s[j++] = src[i + 1];
+            i++;
+            continue;
+        }
         s[j++] = src[i];
         if (src[i] == q && i + 1 < src_len && src[i + 1] == q) {
             i++; /* skip the doubled quote */
@@ -1439,6 +1447,205 @@ LpNode *lp_make_id_node(LpParseContext *ctx, LpToken *name) {
 }
 
 /* ================================================================== */
+/*  sqldeep extensions                                                 */
+/* ================================================================== */
+
+LpNode *lp_make_sqldeep_object(LpParseContext *ctx, LpNodeList *fields) {
+    LpNode *n = lp_node_new(ctx, LP_EXPR_SQLDEEP_OBJECT);
+    if (!n) return NULL;
+    if (fields) n->u.sqldeep_object.fields = *fields;
+    return n;
+}
+
+LpNode *lp_make_sqldeep_array(LpParseContext *ctx, LpNodeList *elements) {
+    LpNode *n = lp_node_new(ctx, LP_EXPR_SQLDEEP_ARRAY);
+    if (!n) return NULL;
+    if (elements) n->u.sqldeep_array.elements = *elements;
+    return n;
+}
+
+LpNode *lp_make_sqldeep_field_bare(LpParseContext *ctx, LpToken *name) {
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_FIELD);
+    if (!n) return NULL;
+    node_pos_tok(n, name);
+    n->u.sqldeep_field.key_form = 0;
+    n->u.sqldeep_field.key_text = lp_token_dequote(ctx, name);
+    return n;
+}
+
+LpNode *lp_make_sqldeep_field_named(LpParseContext *ctx, LpToken *name, LpNode *value) {
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_FIELD);
+    if (!n) return NULL;
+    node_pos_tok(n, name);
+    n->u.sqldeep_field.key_form = 1;
+    n->u.sqldeep_field.key_text = lp_token_dequote(ctx, name);
+    n->u.sqldeep_field.value = value;
+    return n;
+}
+
+LpNode *lp_make_sqldeep_field_string(LpParseContext *ctx, LpToken *key, LpNode *value) {
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_FIELD);
+    if (!n) return NULL;
+    node_pos_tok(n, key);
+    n->u.sqldeep_field.key_form = 2;
+    n->u.sqldeep_field.key_text = lp_token_dequote(ctx, key);
+    n->u.sqldeep_field.value = value;
+    return n;
+}
+
+LpNode *lp_make_sqldeep_field_computed(LpParseContext *ctx, LpNode *key, LpNode *value) {
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_FIELD);
+    if (!n) return NULL;
+    node_pos_node(n, key);
+    n->u.sqldeep_field.key_form = 3;
+    n->u.sqldeep_field.key_expr = key;
+    n->u.sqldeep_field.value = value;
+    return n;
+}
+
+LpNode *lp_make_sqldeep_join_path(LpParseContext *ctx, LpNode *prefix,
+                                   LpToken *start_alias, LpNodeList *steps) {
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_JOIN_PATH);
+    if (!n) return NULL;
+    node_pos_tok(n, start_alias);
+    n->u.sqldeep_join_path.prefix = prefix;
+    n->u.sqldeep_join_path.start_alias = lp_token_dequote(ctx, start_alias);
+    if (steps) n->u.sqldeep_join_path.steps = *steps;
+    return n;
+}
+
+LpNode *lp_make_sqldeep_join_step(LpParseContext *ctx, int forward,
+                                   LpToken *table, LpToken *alias,
+                                   LpNode *on_expr, LpNodeList *using_cols) {
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_JOIN_STEP);
+    if (!n) return NULL;
+    node_pos_tok(n, table);
+    n->u.sqldeep_join_step.forward = forward;
+    n->u.sqldeep_join_step.table = lp_token_dequote(ctx, table);
+    if (alias && alias->n > 0)
+        n->u.sqldeep_join_step.alias = lp_token_dequote(ctx, alias);
+    n->u.sqldeep_join_step.on_expr = on_expr;
+    if (using_cols) n->u.sqldeep_join_step.using_cols = *using_cols;
+    return n;
+}
+
+LpNode *lp_make_sqldeep_json_path(LpParseContext *ctx, LpNode *base, LpNodeList *segments) {
+    LpNode *n = lp_node_new(ctx, LP_EXPR_SQLDEEP_JSON_PATH);
+    if (!n) return NULL;
+    node_pos_node(n, base);
+    n->u.sqldeep_json_path.base = base;
+    if (segments) n->u.sqldeep_json_path.segments = *segments;
+    return n;
+}
+
+/* JSON path segment helpers: emit a literal string for ".name" forms
+ * and a literal int for "[N]" forms. The path node's renderer dispatches
+ * on kind. */
+LpNode *lp_make_sqldeep_path_name(LpParseContext *ctx, LpToken *name) {
+    LpNode *n = lp_node_new(ctx, LP_EXPR_LITERAL_STRING);
+    if (!n) return NULL;
+    node_pos_tok(n, name);
+    n->u.literal.value = lp_token_dequote(ctx, name);
+    return n;
+}
+
+LpNode *lp_make_sqldeep_path_index(LpParseContext *ctx, LpToken *idx) {
+    LpNode *n = lp_node_new(ctx, LP_EXPR_LITERAL_INT);
+    if (!n) return NULL;
+    node_pos_tok(n, idx);
+    n->u.literal.value = lp_token_str(ctx, idx);
+    return n;
+}
+
+LpNode *lp_make_sqldeep_field_recursive(LpParseContext *ctx, LpToken *name) {
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_FIELD);
+    if (!n) return NULL;
+    node_pos_tok(n, name);
+    n->u.sqldeep_field.key_form = 4;  /* recursive children marker */
+    n->u.sqldeep_field.key_text = lp_token_dequote(ctx, name);
+    return n;
+}
+
+LpNode *lp_make_sqldeep_field_qualified(LpParseContext *ctx, LpToken *last,
+                                         LpNode *column_ref) {
+    /* Qualified bare field: { a.b } or { a.b.c }. Key text is the
+     * last component; value is the full column-ref node so the
+     * renderer emits the dotted source verbatim. */
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_FIELD);
+    if (!n) return NULL;
+    node_pos_node(n, column_ref);
+    n->u.sqldeep_field.key_form = 5;
+    n->u.sqldeep_field.key_text = lp_token_dequote(ctx, last);
+    n->u.sqldeep_field.value = column_ref;
+    return n;
+}
+
+LpNode *lp_make_sqldeep_recurse(LpParseContext *ctx, LpToken *fk, LpToken *pk) {
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_RECURSE);
+    if (!n) return NULL;
+    node_pos_tok(n, fk);
+    n->u.sqldeep_recurse.fk_col = lp_token_dequote(ctx, fk);
+    if (pk && pk->n > 0)
+        n->u.sqldeep_recurse.pk_col = lp_token_dequote(ctx, pk);
+    return n;
+}
+
+LpNode *lp_make_sqldeep_xml(LpParseContext *ctx, LpToken *tag,
+                             LpNodeList *attrs, LpNodeList *children,
+                             int self_closing) {
+    LpNode *n = lp_node_new(ctx, LP_EXPR_SQLDEEP_XML);
+    if (!n) return NULL;
+    node_pos_tok(n, tag);
+    /* tag may span multiple source tokens (ids . ids : ids ...) so we
+     * copy directly from the source span rather than dequoting. */
+    n->u.sqldeep_xml.tag = (char *)arena_alloc(ctx->arena, tag->n + 1);
+    if (n->u.sqldeep_xml.tag) {
+        memcpy(n->u.sqldeep_xml.tag, tag->z, tag->n);
+        n->u.sqldeep_xml.tag[tag->n] = '\0';
+    }
+    if (attrs) n->u.sqldeep_xml.attrs = *attrs;
+    if (children) n->u.sqldeep_xml.children = *children;
+    n->u.sqldeep_xml.self_closing = self_closing;
+    return n;
+}
+
+LpNode *lp_make_sqldeep_xml_attr(LpParseContext *ctx, LpToken *name,
+                                  LpNode *value, int dynamic) {
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_XML_ATTR);
+    if (!n) return NULL;
+    node_pos_tok(n, name);
+    n->u.sqldeep_xml_attr.name = lp_token_dequote(ctx, name);
+    n->u.sqldeep_xml_attr.value = value;
+    n->u.sqldeep_xml_attr.dynamic = dynamic;
+    return n;
+}
+
+LpNode *lp_make_sqldeep_xml_text(LpParseContext *ctx, LpToken *text) {
+    LpNode *n = lp_node_new(ctx, LP_SQLDEEP_XML_TEXT);
+    if (!n) return NULL;
+    node_pos_tok(n, text);
+    /* Copy raw bytes verbatim — do not interpret as a SQL token. */
+    n->u.sqldeep_xml_text.text = (char *)arena_alloc(ctx->arena, text->n + 1);
+    if (n->u.sqldeep_xml_text.text) {
+        memcpy(n->u.sqldeep_xml_text.text, text->z, text->n);
+        n->u.sqldeep_xml_text.text[text->n] = '\0';
+    }
+    return n;
+}
+
+void lp_check_xml_close_tag(LpParseContext *ctx, LpToken *open,
+                             LpToken *close) {
+    if (!open || !close) return;
+    if (open->n != close->n || memcmp(open->z, close->z, open->n) != 0) {
+        LpSrcPos end = lp_token_end(close);
+        lp_error(ctx, LP_ERR_SYNTAX, end,
+                 "%u:%u: mismatched XML close tag: expected </%.*s> but found </%.*s>",
+                 close->pos.line, close->pos.col,
+                 open->n, open->z, close->n, close->z);
+    }
+}
+
+/* ================================================================== */
 /*  Name functions                                                     */
 /* ================================================================== */
 
@@ -1511,6 +1718,16 @@ const char *lp_node_kind_name(LpNodeKind kind) {
         case LP_INDEX_COLUMN:        return "INDEX_COLUMN";
         case LP_VALUES_ROW:          return "VALUES_ROW";
         case LP_TRIGGER_CMD:         return "TRIGGER_CMD";
+        case LP_EXPR_SQLDEEP_OBJECT: return "EXPR_SQLDEEP_OBJECT";
+        case LP_EXPR_SQLDEEP_ARRAY:  return "EXPR_SQLDEEP_ARRAY";
+        case LP_SQLDEEP_FIELD:       return "SQLDEEP_FIELD";
+        case LP_SQLDEEP_JOIN_PATH:   return "SQLDEEP_JOIN_PATH";
+        case LP_SQLDEEP_JOIN_STEP:   return "SQLDEEP_JOIN_STEP";
+        case LP_EXPR_SQLDEEP_JSON_PATH: return "EXPR_SQLDEEP_JSON_PATH";
+        case LP_SQLDEEP_RECURSE:     return "SQLDEEP_RECURSE";
+        case LP_EXPR_SQLDEEP_XML:    return "EXPR_SQLDEEP_XML";
+        case LP_SQLDEEP_XML_ATTR:    return "SQLDEEP_XML_ATTR";
+        case LP_SQLDEEP_XML_TEXT:    return "SQLDEEP_XML_TEXT";
         case LP_NODE_KIND_COUNT:     return "NODE_KIND_COUNT";
     }
     return "UNKNOWN";
@@ -1629,6 +1846,8 @@ int lp_node_equal(const LpNode *a, const LpNode *b) {
     switch (a->kind) {
         case LP_STMT_SELECT:
             IE(a->u.select.distinct, b->u.select.distinct);
+            IE(a->u.select.sqldeep_singular, b->u.select.sqldeep_singular);
+            IE(a->u.select.sqldeep_from_first, b->u.select.sqldeep_from_first);
             LE(a->u.select.result_columns, b->u.select.result_columns);
             NE(a->u.select.from, b->u.select.from);
             NE(a->u.select.where, b->u.select.where);
@@ -2028,6 +2247,62 @@ int lp_node_equal(const LpNode *a, const LpNode *b) {
             NE(a->u.trigger_cmd.stmt, b->u.trigger_cmd.stmt);
             break;
 
+        case LP_EXPR_SQLDEEP_OBJECT:
+            LE(a->u.sqldeep_object.fields, b->u.sqldeep_object.fields);
+            break;
+
+        case LP_EXPR_SQLDEEP_ARRAY:
+            LE(a->u.sqldeep_array.elements, b->u.sqldeep_array.elements);
+            break;
+
+        case LP_SQLDEEP_FIELD:
+            IE(a->u.sqldeep_field.key_form, b->u.sqldeep_field.key_form);
+            SE(a->u.sqldeep_field.key_text, b->u.sqldeep_field.key_text);
+            NE(a->u.sqldeep_field.key_expr, b->u.sqldeep_field.key_expr);
+            NE(a->u.sqldeep_field.value, b->u.sqldeep_field.value);
+            break;
+
+        case LP_SQLDEEP_JOIN_PATH:
+            NE(a->u.sqldeep_join_path.prefix, b->u.sqldeep_join_path.prefix);
+            SE(a->u.sqldeep_join_path.start_alias, b->u.sqldeep_join_path.start_alias);
+            LE(a->u.sqldeep_join_path.steps, b->u.sqldeep_join_path.steps);
+            break;
+
+        case LP_SQLDEEP_JOIN_STEP:
+            IE(a->u.sqldeep_join_step.forward, b->u.sqldeep_join_step.forward);
+            SE(a->u.sqldeep_join_step.table, b->u.sqldeep_join_step.table);
+            SE(a->u.sqldeep_join_step.alias, b->u.sqldeep_join_step.alias);
+            NE(a->u.sqldeep_join_step.on_expr, b->u.sqldeep_join_step.on_expr);
+            LE(a->u.sqldeep_join_step.using_cols, b->u.sqldeep_join_step.using_cols);
+            break;
+
+        case LP_EXPR_SQLDEEP_JSON_PATH:
+            NE(a->u.sqldeep_json_path.base, b->u.sqldeep_json_path.base);
+            LE(a->u.sqldeep_json_path.segments, b->u.sqldeep_json_path.segments);
+            break;
+
+        case LP_SQLDEEP_RECURSE:
+            SE(a->u.sqldeep_recurse.fk_col, b->u.sqldeep_recurse.fk_col);
+            SE(a->u.sqldeep_recurse.pk_col, b->u.sqldeep_recurse.pk_col);
+            break;
+
+        case LP_EXPR_SQLDEEP_XML:
+            SE(a->u.sqldeep_xml.tag, b->u.sqldeep_xml.tag);
+            IE(a->u.sqldeep_xml.self_closing, b->u.sqldeep_xml.self_closing);
+            LE(a->u.sqldeep_xml.attrs, b->u.sqldeep_xml.attrs);
+            LE(a->u.sqldeep_xml.children, b->u.sqldeep_xml.children);
+            break;
+
+        case LP_SQLDEEP_XML_ATTR:
+            SE(a->u.sqldeep_xml_attr.name, b->u.sqldeep_xml_attr.name);
+            IE(a->u.sqldeep_xml_attr.dynamic, b->u.sqldeep_xml_attr.dynamic);
+            NE(a->u.sqldeep_xml_attr.value, b->u.sqldeep_xml_attr.value);
+            break;
+
+        case LP_SQLDEEP_XML_TEXT:
+            SE(a->u.sqldeep_xml_text.text, b->u.sqldeep_xml_text.text);
+            break;
+
         case LP_NODE_KIND_COUNT:
             break;
     }
@@ -2332,6 +2607,51 @@ static void fix_node(LpNode *node) {
             FIX_NODE(node, node->u.trigger_cmd.stmt);
             break;
 
+        case LP_EXPR_SQLDEEP_OBJECT:
+            FIX_LIST(node, node->u.sqldeep_object.fields);
+            break;
+
+        case LP_EXPR_SQLDEEP_ARRAY:
+            FIX_LIST(node, node->u.sqldeep_array.elements);
+            break;
+
+        case LP_SQLDEEP_FIELD:
+            FIX_NODE(node, node->u.sqldeep_field.key_expr);
+            FIX_NODE(node, node->u.sqldeep_field.value);
+            break;
+
+        case LP_SQLDEEP_JOIN_PATH:
+            FIX_NODE(node, node->u.sqldeep_join_path.prefix);
+            FIX_LIST(node, node->u.sqldeep_join_path.steps);
+            break;
+
+        case LP_SQLDEEP_JOIN_STEP:
+            FIX_NODE(node, node->u.sqldeep_join_step.on_expr);
+            FIX_LIST(node, node->u.sqldeep_join_step.using_cols);
+            break;
+
+        case LP_EXPR_SQLDEEP_JSON_PATH:
+            FIX_NODE(node, node->u.sqldeep_json_path.base);
+            FIX_LIST(node, node->u.sqldeep_json_path.segments);
+            break;
+
+        case LP_SQLDEEP_RECURSE:
+            /* no child nodes */
+            break;
+
+        case LP_EXPR_SQLDEEP_XML:
+            FIX_LIST(node, node->u.sqldeep_xml.attrs);
+            FIX_LIST(node, node->u.sqldeep_xml.children);
+            break;
+
+        case LP_SQLDEEP_XML_ATTR:
+            FIX_NODE(node, node->u.sqldeep_xml_attr.value);
+            break;
+
+        case LP_SQLDEEP_XML_TEXT:
+            /* no child nodes */
+            break;
+
         case LP_NODE_KIND_COUNT:
             break;
     }
@@ -2427,6 +2747,8 @@ LpNode *lp_node_clone(arena_t *arena, const LpNode *node) {
     switch (node->kind) {
         case LP_STMT_SELECT:
             n->u.select.distinct = node->u.select.distinct;
+            n->u.select.sqldeep_singular = node->u.select.sqldeep_singular;
+            n->u.select.sqldeep_from_first = node->u.select.sqldeep_from_first;
             n->u.select.result_columns = CL(node->u.select.result_columns);
             n->u.select.from = CN(node->u.select.from);
             n->u.select.where = CN(node->u.select.where);
@@ -2828,6 +3150,62 @@ LpNode *lp_node_clone(arena_t *arena, const LpNode *node) {
             n->u.trigger_cmd.stmt = CN(node->u.trigger_cmd.stmt);
             break;
 
+        case LP_EXPR_SQLDEEP_OBJECT:
+            n->u.sqldeep_object.fields = CL(node->u.sqldeep_object.fields);
+            break;
+
+        case LP_EXPR_SQLDEEP_ARRAY:
+            n->u.sqldeep_array.elements = CL(node->u.sqldeep_array.elements);
+            break;
+
+        case LP_SQLDEEP_FIELD:
+            n->u.sqldeep_field.key_form = node->u.sqldeep_field.key_form;
+            n->u.sqldeep_field.key_text = CS(node->u.sqldeep_field.key_text);
+            n->u.sqldeep_field.key_expr = CN(node->u.sqldeep_field.key_expr);
+            n->u.sqldeep_field.value = CN(node->u.sqldeep_field.value);
+            break;
+
+        case LP_SQLDEEP_JOIN_PATH:
+            n->u.sqldeep_join_path.prefix = CN(node->u.sqldeep_join_path.prefix);
+            n->u.sqldeep_join_path.start_alias = CS(node->u.sqldeep_join_path.start_alias);
+            n->u.sqldeep_join_path.steps = CL(node->u.sqldeep_join_path.steps);
+            break;
+
+        case LP_SQLDEEP_JOIN_STEP:
+            n->u.sqldeep_join_step.forward = node->u.sqldeep_join_step.forward;
+            n->u.sqldeep_join_step.table = CS(node->u.sqldeep_join_step.table);
+            n->u.sqldeep_join_step.alias = CS(node->u.sqldeep_join_step.alias);
+            n->u.sqldeep_join_step.on_expr = CN(node->u.sqldeep_join_step.on_expr);
+            n->u.sqldeep_join_step.using_cols = CL(node->u.sqldeep_join_step.using_cols);
+            break;
+
+        case LP_EXPR_SQLDEEP_JSON_PATH:
+            n->u.sqldeep_json_path.base = CN(node->u.sqldeep_json_path.base);
+            n->u.sqldeep_json_path.segments = CL(node->u.sqldeep_json_path.segments);
+            break;
+
+        case LP_SQLDEEP_RECURSE:
+            n->u.sqldeep_recurse.fk_col = CS(node->u.sqldeep_recurse.fk_col);
+            n->u.sqldeep_recurse.pk_col = CS(node->u.sqldeep_recurse.pk_col);
+            break;
+
+        case LP_EXPR_SQLDEEP_XML:
+            n->u.sqldeep_xml.tag = CS(node->u.sqldeep_xml.tag);
+            n->u.sqldeep_xml.attrs = CL(node->u.sqldeep_xml.attrs);
+            n->u.sqldeep_xml.children = CL(node->u.sqldeep_xml.children);
+            n->u.sqldeep_xml.self_closing = node->u.sqldeep_xml.self_closing;
+            break;
+
+        case LP_SQLDEEP_XML_ATTR:
+            n->u.sqldeep_xml_attr.name = CS(node->u.sqldeep_xml_attr.name);
+            n->u.sqldeep_xml_attr.value = CN(node->u.sqldeep_xml_attr.value);
+            n->u.sqldeep_xml_attr.dynamic = node->u.sqldeep_xml_attr.dynamic;
+            break;
+
+        case LP_SQLDEEP_XML_TEXT:
+            n->u.sqldeep_xml_text.text = CS(node->u.sqldeep_xml_text.text);
+            break;
+
         case LP_NODE_KIND_COUNT:
             break;
     }
@@ -3160,6 +3538,51 @@ static int walk_children(LpNode *node, LpVisitor *v) {
             WALK_NODE(node->u.trigger_cmd.stmt);
             break;
 
+        case LP_EXPR_SQLDEEP_OBJECT:
+            WALK_LIST(node->u.sqldeep_object.fields);
+            break;
+
+        case LP_EXPR_SQLDEEP_ARRAY:
+            WALK_LIST(node->u.sqldeep_array.elements);
+            break;
+
+        case LP_SQLDEEP_FIELD:
+            WALK_NODE(node->u.sqldeep_field.key_expr);
+            WALK_NODE(node->u.sqldeep_field.value);
+            break;
+
+        case LP_SQLDEEP_JOIN_PATH:
+            WALK_NODE(node->u.sqldeep_join_path.prefix);
+            WALK_LIST(node->u.sqldeep_join_path.steps);
+            break;
+
+        case LP_SQLDEEP_JOIN_STEP:
+            WALK_NODE(node->u.sqldeep_join_step.on_expr);
+            WALK_LIST(node->u.sqldeep_join_step.using_cols);
+            break;
+
+        case LP_EXPR_SQLDEEP_JSON_PATH:
+            WALK_NODE(node->u.sqldeep_json_path.base);
+            WALK_LIST(node->u.sqldeep_json_path.segments);
+            break;
+
+        case LP_SQLDEEP_RECURSE:
+            /* no child nodes */
+            break;
+
+        case LP_EXPR_SQLDEEP_XML:
+            WALK_LIST(node->u.sqldeep_xml.attrs);
+            WALK_LIST(node->u.sqldeep_xml.children);
+            break;
+
+        case LP_SQLDEEP_XML_ATTR:
+            WALK_NODE(node->u.sqldeep_xml_attr.value);
+            break;
+
+        case LP_SQLDEEP_XML_TEXT:
+            /* no child nodes */
+            break;
+
         case LP_NODE_KIND_COUNT:
             break;
     }
@@ -3430,6 +3853,10 @@ static void json_node(LpNode *node, LpBuf *out, int depth, int pretty) {
     switch (node->kind) {
         case LP_STMT_SELECT:
             J_BOOL("distinct", node->u.select.distinct);
+            if (node->u.select.sqldeep_singular)
+                J_BOOL("sqldeep_singular", node->u.select.sqldeep_singular);
+            if (node->u.select.sqldeep_from_first)
+                J_BOOL("sqldeep_from_first", node->u.select.sqldeep_from_first);
             J_LIST("result_columns", node->u.select.result_columns);
             J_NODE("from", node->u.select.from);
             J_NODE("where", node->u.select.where);
@@ -3835,6 +4262,63 @@ static void json_node(LpNode *node, LpBuf *out, int depth, int pretty) {
 
         case LP_TRIGGER_CMD:
             J_NODE("stmt", node->u.trigger_cmd.stmt);
+            break;
+
+        case LP_EXPR_SQLDEEP_OBJECT:
+            J_LIST("fields", node->u.sqldeep_object.fields);
+            break;
+
+        case LP_EXPR_SQLDEEP_ARRAY:
+            J_LIST("elements", node->u.sqldeep_array.elements);
+            break;
+
+        case LP_SQLDEEP_FIELD:
+            J_SEP(); J_KEY("key_form");
+            lp_buf_printf(out, "%d", node->u.sqldeep_field.key_form);
+            J_STR("key_text", node->u.sqldeep_field.key_text);
+            J_NODE("key_expr", node->u.sqldeep_field.key_expr);
+            J_NODE("value", node->u.sqldeep_field.value);
+            break;
+
+        case LP_SQLDEEP_JOIN_PATH:
+            J_NODE("prefix", node->u.sqldeep_join_path.prefix);
+            J_STR("start_alias", node->u.sqldeep_join_path.start_alias);
+            J_LIST("steps", node->u.sqldeep_join_path.steps);
+            break;
+
+        case LP_SQLDEEP_JOIN_STEP:
+            J_BOOL("forward", node->u.sqldeep_join_step.forward);
+            J_STR("table", node->u.sqldeep_join_step.table);
+            J_STR("alias", node->u.sqldeep_join_step.alias);
+            J_NODE("on_expr", node->u.sqldeep_join_step.on_expr);
+            J_LIST("using_cols", node->u.sqldeep_join_step.using_cols);
+            break;
+
+        case LP_EXPR_SQLDEEP_JSON_PATH:
+            J_NODE("base", node->u.sqldeep_json_path.base);
+            J_LIST("segments", node->u.sqldeep_json_path.segments);
+            break;
+
+        case LP_SQLDEEP_RECURSE:
+            J_STR("fk_col", node->u.sqldeep_recurse.fk_col);
+            J_STR("pk_col", node->u.sqldeep_recurse.pk_col);
+            break;
+
+        case LP_EXPR_SQLDEEP_XML:
+            J_STR("tag", node->u.sqldeep_xml.tag);
+            J_BOOL("self_closing", node->u.sqldeep_xml.self_closing);
+            J_LIST("attrs", node->u.sqldeep_xml.attrs);
+            J_LIST("children", node->u.sqldeep_xml.children);
+            break;
+
+        case LP_SQLDEEP_XML_ATTR:
+            J_STR("name", node->u.sqldeep_xml_attr.name);
+            J_BOOL("dynamic", node->u.sqldeep_xml_attr.dynamic);
+            J_NODE("value", node->u.sqldeep_xml_attr.value);
+            break;
+
+        case LP_SQLDEEP_XML_TEXT:
+            J_STR("text", node->u.sqldeep_xml_text.text);
             break;
 
         case LP_NODE_KIND_COUNT:

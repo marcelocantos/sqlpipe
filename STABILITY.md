@@ -26,26 +26,26 @@ API surface complexity:
 
 The clock starts from the last breaking change to the interaction surface.
 
-Current surface: ~105 items → 3 months. Last breaking change: v0.23.0
-(bundled sqlift bumped to v0.14.0 — `BreakingChangeError` moved from a
-diff-time throw to an apply-time policy gate, and `SQLIFT_ALLOW_ALL`
-expanded to include two new opt-ins. The `sqlift_apply()` signature is
-unchanged, but documented semantics differ. 2026-05-09).
-Eligible: 2026-08-09.
+Current surface: ~105 items → 3 months. Last breaking change: v0.24.0
+(bundled sqldeep bumped to v0.23.0 — `sqldeep_register_sqlite_xml` renamed
+to `sqldeep_register_sqlite` and now also registers the BLOB-returning
+`sqldeep_json*` runtime functions; output of XML/JSON aggregation moved
+to a BLOB protocol. 2026-06-28).
+Eligible: 2026-09-28.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.23.0. Items annotated with stability assessments.
+Snapshot as of v0.24.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.23.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.24.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `23` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `24` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
-| `SQLDEEP_VERSION` | `"0.13.0"` | **Stable** (bundled) |
+| `SQLDEEP_VERSION` | `"0.23.0"` | **Stable** (bundled) |
 | `SQLIFT_VERSION` | `"0.14.0"` | **Stable** (bundled) |
 
 ### Type aliases
@@ -309,10 +309,13 @@ The following C APIs are bundled into `dist/sqlpipe.h` and available to consumer
 | `sqldeep_transpile_fk()` | **Stable** |
 | `sqldeep_transpile_backend()` | **Stable** |
 | `sqldeep_transpile_fk_backend()` | **Stable** |
+| `sqldeep_backend` enum (`SQLDEEP_SQLITE`, `SQLDEEP_POSTGRES`, `SQLDEEP_SQLITE_VANILLA`) | **Stable** (`_VANILLA` added in sqldeep 0.21.0) |
 | `sqldeep_version()` / `sqldeep_free()` | **Stable** |
-| `sqldeep_register_sqlite_xml(db)` | **Fluid** (new in v0.20.0) |
-| SQLite: `xml_element()`, `xml_attrs()`, `xml_agg()` | **Fluid** (new in v0.20.0, HTML string output) |
-| SQLite: `xml_element_jsonml()`, `xml_attrs_jsonml()`, `jsonml_agg()` | **Fluid** (new in v0.20.0, JSONML output) |
+| `sqldeep_register_sqlite(db)` | **Fluid** (renamed from `sqldeep_register_sqlite_xml` in v0.24.0; now also registers `sqldeep_json*`) |
+| SQLite: `xml_element()`, `xml_attrs()`, `xml_agg()` | **Fluid** (BLOB output since sqldeep 0.17.0) |
+| SQLite: `xml_element_jsonml()`, `xml_attrs_jsonml()`, `jsonml_agg()` | **Fluid** (BLOB output since sqldeep 0.17.0) |
+| SQLite: `xml_element_jsx()`, `xml_attrs_jsx()`, `jsx_agg()` | **Fluid** (new in v0.24.0, JSX BLOB output) |
+| SQLite: `sqldeep_json()`, `sqldeep_json_object()`, `sqldeep_json_array()`, `sqldeep_json_group_array()` | **Fluid** (new in v0.24.0, BLOB output for JSON aggregates) |
 | `sqlift_parse()` / `sqlift_diff()` | **Stable** (matches sqlift 0.14.0; data-dependent changes are tagged on plan ops rather than thrown by `sqlift_diff`) |
 | `sqlift_apply()` | **Fluid** (signature stable since v0.22.0; v0.23.0 added `SQLIFT_ALLOW_LOOSEN` and `SQLIFT_ALLOW_DATA_DEPENDENT` opt-ins; `BreakingChangeError` is now an apply-time policy gate) |
 | `sqlift_extract()` / `sqlift_db_wrap()` / `sqlift_db_close()` | **Stable** |
