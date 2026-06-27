@@ -75,7 +75,7 @@ std::vector<Message> deliver_to_replica(const std::vector<Message>& msgs,
     std::vector<Message> back;
     for (const auto& m : msgs) {
         auto result = replica.handle_message(m);
-        back.insert(back.end(), result.messages.begin(), result.messages.end());
+        for (auto& om : result.messages) back.push_back(om.msg);
     }
     return back;
 }
@@ -85,7 +85,7 @@ std::vector<Message> deliver_to_master(const std::vector<Message>& msgs,
     std::vector<Message> responses;
     for (const auto& m : msgs) {
         auto result = master.handle_message(m);
-        responses.insert(responses.end(), result.begin(), result.end());
+        for (auto& om : result) responses.push_back(om.msg);
     }
     return responses;
 }
@@ -219,8 +219,8 @@ TEST_CASE("bench: diff sync 10k rows with continuous writes during handshake") {
         }
         master_db.exec("COMMIT");
         auto msgs = master.flush();
-        for (const auto& m : msgs) {
-            replica.handle_message(m);
+        for (const auto& om : msgs) {
+            replica.handle_message(om.msg);
         }
     }
     REQUIRE(master_db.count("t1") == 10000);
@@ -239,13 +239,13 @@ TEST_CASE("bench: diff sync 10k rows with continuous writes during handshake") {
                        std::to_string(next_id) + "')");
         ++next_id;
         auto msgs = master2.flush();
-        queued_flushes.insert(queued_flushes.end(), msgs.begin(), msgs.end());
+        for (auto& om : msgs) queued_flushes.push_back(om.msg);
     };
 
     // Round 1: HelloMsg
     auto hello = replica2.hello();
     write_and_queue();
-    auto master_hello_resp = deliver_to_master({hello}, master2);
+    auto master_hello_resp = deliver_to_master({hello.msg}, master2);
     write_and_queue();
 
     // Round 2: BucketHashesMsg

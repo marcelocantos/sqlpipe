@@ -455,8 +455,8 @@ func convertError(e C.sqlpipe_error) error {
 
 // ── Message buffer decoding ─────────────────────────────────────
 
-// decodeMessages reads [u32 count][[msg]]... from a C buffer.
-func decodeMessages(buf C.sqlpipe_buf) ([]Message, error) {
+// decodeMessages reads [u32 count][[msg][u8 delivery]]... from a C buffer.
+func decodeMessages(buf C.sqlpipe_buf) ([]OutMessage, error) {
 	if buf.data == nil || buf.len == 0 {
 		return nil, nil
 	}
@@ -465,13 +465,13 @@ func decodeMessages(buf C.sqlpipe_buf) ([]Message, error) {
 	return decodeMessagesFromBytes(data)
 }
 
-func decodeMessagesFromBytes(data []byte) ([]Message, error) {
+func decodeMessagesFromBytes(data []byte) ([]OutMessage, error) {
 	if len(data) < 4 {
 		return nil, nil
 	}
 	count := binary.LittleEndian.Uint32(data[:4])
 	pos := 4
-	msgs := make([]Message, 0, count)
+	msgs := make([]OutMessage, 0, count)
 	for i := uint32(0); i < count; i++ {
 		if pos+4 > len(data) {
 			break
@@ -486,13 +486,19 @@ func decodeMessagesFromBytes(data []byte) ([]Message, error) {
 			return nil, err
 		}
 		pos += total
-		msgs = append(msgs, msg)
+		// Read delivery byte.
+		if pos >= len(data) {
+			break
+		}
+		delivery := Delivery(data[pos])
+		pos++
+		msgs = append(msgs, OutMessage{Msg: msg, Delivery: delivery})
 	}
 	return msgs, nil
 }
 
-// decodePeerMessages reads [u32 count][[pmsg]]... from a C buffer.
-func decodePeerMessages(buf C.sqlpipe_buf) ([]PeerMessage, error) {
+// decodePeerMessages reads [u32 count][[pmsg][u8 delivery]]... from a C buffer.
+func decodePeerMessages(buf C.sqlpipe_buf) ([]PeerOutMessage, error) {
 	if buf.data == nil || buf.len == 0 {
 		return nil, nil
 	}
@@ -503,7 +509,7 @@ func decodePeerMessages(buf C.sqlpipe_buf) ([]PeerMessage, error) {
 	}
 	count := binary.LittleEndian.Uint32(data[:4])
 	pos := 4
-	msgs := make([]PeerMessage, 0, count)
+	msgs := make([]PeerOutMessage, 0, count)
 	for i := uint32(0); i < count; i++ {
 		if pos+4 > len(data) {
 			break
@@ -518,7 +524,13 @@ func decodePeerMessages(buf C.sqlpipe_buf) ([]PeerMessage, error) {
 			return nil, err
 		}
 		pos += total
-		msgs = append(msgs, msg)
+		// Read delivery byte.
+		if pos >= len(data) {
+			break
+		}
+		delivery := Delivery(data[pos])
+		pos++
+		msgs = append(msgs, PeerOutMessage{Msg: msg, Delivery: delivery})
 	}
 	return msgs, nil
 }
@@ -620,7 +632,7 @@ func decodeHandleResult(buf C.sqlpipe_buf) (HandleResult, error) {
 
 	// Messages.
 	msgCount := d.u32()
-	var msgs []Message
+	var msgs []OutMessage
 	for i := uint32(0); i < msgCount; i++ {
 		mlen := binary.LittleEndian.Uint32(d.data[d.pos:])
 		total := 4 + int(mlen)
@@ -629,7 +641,8 @@ func decodeHandleResult(buf C.sqlpipe_buf) (HandleResult, error) {
 			return HandleResult{}, err
 		}
 		d.pos += total
-		msgs = append(msgs, msg)
+		delivery := Delivery(d.u8())
+		msgs = append(msgs, OutMessage{Msg: msg, Delivery: delivery})
 	}
 
 	// Changes.
@@ -680,7 +693,7 @@ func decodePeerHandleResult(buf C.sqlpipe_buf) (PeerHandleResult, error) {
 
 	// PeerMessages.
 	msgCount := d.u32()
-	var msgs []PeerMessage
+	var msgs []PeerOutMessage
 	for i := uint32(0); i < msgCount; i++ {
 		mlen := binary.LittleEndian.Uint32(d.data[d.pos:])
 		total := 4 + int(mlen)
@@ -689,7 +702,8 @@ func decodePeerHandleResult(buf C.sqlpipe_buf) (PeerHandleResult, error) {
 			return PeerHandleResult{}, err
 		}
 		d.pos += total
-		msgs = append(msgs, msg)
+		delivery := Delivery(d.u8())
+		msgs = append(msgs, PeerOutMessage{Msg: msg, Delivery: delivery})
 	}
 
 	// Changes.
@@ -845,7 +859,7 @@ func (m *Master) Exec(sql string) error {
 }
 
 // Flush extracts the changeset since the last flush and returns messages to send.
-func (m *Master) Flush() ([]Message, error) {
+func (m *Master) Flush() ([]OutMessage, error) {
 	var buf C.sqlpipe_buf
 	if err := convertError(C.sqlpipe_master_flush(m.ptr, &buf)); err != nil {
 		return nil, err
@@ -854,7 +868,7 @@ func (m *Master) Flush() ([]Message, error) {
 }
 
 // HandleMessage processes an incoming message from a replica.
-func (m *Master) HandleMessage(msg Message) ([]Message, error) {
+func (m *Master) HandleMessage(msg Message) ([]OutMessage, error) {
 	wire := Serialize(msg)
 	var buf C.sqlpipe_buf
 	if err := convertError(C.sqlpipe_master_handle_message(
@@ -943,46 +957,50 @@ func NewReplica(db *Database, config ReplicaConfig) (*Replica, error) {
 }
 
 // Hello generates the initial HelloMsg to send to the master.
-func (r *Replica) Hello() (Message, error) {
+func (r *Replica) Hello() (OutMessage, error) {
 	var buf C.sqlpipe_buf
 	if err := convertError(C.sqlpipe_replica_hello(r.ptr, &buf)); err != nil {
-		return nil, err
+		return OutMessage{}, err
 	}
 	defer C.sqlpipe_free_buf(buf)
 	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
 	if len(data) < 5 {
-		return nil, fmt.Errorf("hello response too short: %d bytes", len(data))
+		return OutMessage{}, fmt.Errorf("hello response too short: %d bytes", len(data))
 	}
+	// The wire format is [serialized msg][u8 delivery].
+	// The serialized msg has a 4-byte LE length prefix.
 	mlen := binary.LittleEndian.Uint32(data[:4])
 	total := 4 + int(mlen)
 	msg, err := Deserialize(data[:total])
 	if err != nil {
-		return nil, err
+		return OutMessage{}, err
 	}
-	return msg, nil
+	delivery := Delivery(data[total])
+	return OutMessage{Msg: msg, Delivery: delivery}, nil
 }
 
 // Converge initiates a convergence round. Computes bucket hashes for
 // the current local state and returns the message to send to the
 // master. Can be called in any state — replaces the hello() handshake
 // for loss-tolerant, stateless sync.
-func (r *Replica) Converge() (Message, error) {
+func (r *Replica) Converge() (OutMessage, error) {
 	var buf C.sqlpipe_buf
 	if err := convertError(C.sqlpipe_replica_converge(r.ptr, &buf)); err != nil {
-		return nil, err
+		return OutMessage{}, err
 	}
 	defer C.sqlpipe_free_buf(buf)
 	data := C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len))
 	if len(data) < 5 {
-		return nil, fmt.Errorf("converge response too short: %d bytes", len(data))
+		return OutMessage{}, fmt.Errorf("converge response too short: %d bytes", len(data))
 	}
 	mlen := binary.LittleEndian.Uint32(data[:4])
 	total := 4 + int(mlen)
 	msg, err := Deserialize(data[:total])
 	if err != nil {
-		return nil, err
+		return OutMessage{}, err
 	}
-	return msg, nil
+	delivery := Delivery(data[total])
+	return OutMessage{Msg: msg, Delivery: delivery}, nil
 }
 
 // HandleMessage processes an incoming message from the master.
@@ -1125,7 +1143,7 @@ func NewPeer(db *Database, config PeerConfig) (*Peer, error) {
 }
 
 // Start initiates the handshake (client only).
-func (p *Peer) Start() ([]PeerMessage, error) {
+func (p *Peer) Start() ([]PeerOutMessage, error) {
 	var buf C.sqlpipe_buf
 	if err := convertError(C.sqlpipe_peer_start(p.ptr, &buf)); err != nil {
 		return nil, err
@@ -1134,7 +1152,7 @@ func (p *Peer) Start() ([]PeerMessage, error) {
 }
 
 // Flush extracts changes on owned tables.
-func (p *Peer) Flush() ([]PeerMessage, error) {
+func (p *Peer) Flush() ([]PeerOutMessage, error) {
 	var buf C.sqlpipe_buf
 	if err := convertError(C.sqlpipe_peer_flush(p.ptr, &buf)); err != nil {
 		return nil, err
@@ -1231,22 +1249,22 @@ func SyncHandshake(m *Master, r *Replica) error {
 	if err != nil {
 		return err
 	}
-	pending, err := m.HandleMessage(hello)
+	pending, err := m.HandleMessage(hello.Msg)
 	if err != nil {
 		return err
 	}
 	for len(pending) > 0 {
-		var forMaster []Message
-		for _, msg := range pending {
-			hr, err := r.HandleMessage(msg)
+		var forMaster []OutMessage
+		for _, om := range pending {
+			hr, err := r.HandleMessage(om.Msg)
 			if err != nil {
 				return err
 			}
 			forMaster = append(forMaster, hr.Messages...)
 		}
 		pending = nil
-		for _, msg := range forMaster {
-			resp, err := m.HandleMessage(msg)
+		for _, om := range forMaster {
+			resp, err := m.HandleMessage(om.Msg)
 			if err != nil {
 				return err
 			}
@@ -1266,17 +1284,17 @@ func SyncPeerHandshake(client, server *Peer) error {
 	}
 	for len(pendingForServer) > 0 ||
 		client.State() != PeerLive || server.State() != PeerLive {
-		var pendingForClient []PeerMessage
-		for _, msg := range pendingForServer {
-			hr, err := server.HandleMessage(msg)
+		var pendingForClient []PeerOutMessage
+		for _, om := range pendingForServer {
+			hr, err := server.HandleMessage(om.Msg)
 			if err != nil {
 				return err
 			}
 			pendingForClient = append(pendingForClient, hr.Messages...)
 		}
 		pendingForServer = nil
-		for _, msg := range pendingForClient {
-			hr, err := client.HandleMessage(msg)
+		for _, om := range pendingForClient {
+			hr, err := client.HandleMessage(om.Msg)
 			if err != nil {
 				return err
 			}

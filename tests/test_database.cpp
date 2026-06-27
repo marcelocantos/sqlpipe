@@ -118,8 +118,8 @@ TEST_CASE("database: handle() works with Master/Replica") {
     auto msgs = master.flush();
 
     // Apply on replica side.
-    for (auto& msg : msgs) {
-        replica.handle_message(msg);
+    for (auto& om : msgs) {
+        replica.handle_message(om.msg);
     }
     // Notify replica_db so subscriptions fire.
     replica_db.notify();

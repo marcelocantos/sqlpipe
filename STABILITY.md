@@ -26,24 +26,27 @@ API surface complexity:
 
 The clock starts from the last breaking change to the interaction surface.
 
-Current surface: ~105 items → 3 months. Last breaking change: v0.23.0
-(bundled sqlift bumped to v0.14.0 — `BreakingChangeError` moved from a
-diff-time throw to an apply-time policy gate, and `SQLIFT_ALLOW_ALL`
-expanded to include two new opt-ins. The `sqlift_apply()` signature is
-unchanged, but documented semantics differ. 2026-05-09).
-Eligible: 2026-08-09.
+Current surface: ~107 items → 3 months. Last breaking change: v0.24.0
+(`Delivery`, `OutMessage`, and `PeerOutMessage` reinstated to expose
+transport routing hints for dual-channel transports like QUIC.
+`Master::flush()`, `Master::handle_message()`, `Replica::hello()`,
+`Replica::converge()`, `Peer::start()`, `Peer::flush()`, `Relay::hello()`
+now return `OutMessage`/`PeerOutMessage`; `HandleResult::messages` and
+`PeerHandleResult::messages` are `vector<OutMessage>`/`vector<PeerOutMessage>`;
+`FlushCallback` and `SinkCallback` take the tagged variants. 2026-06-28).
+Eligible: 2026-09-28.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.23.0. Items annotated with stability assessments.
+Snapshot as of v0.24.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.23.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.24.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `23` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `24` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 | `SQLDEEP_VERSION` | `"0.13.0"` | **Stable** (bundled) |
 | `SQLIFT_VERSION` | `"0.14.0"` | **Stable** (bundled) |
@@ -62,8 +65,8 @@ Snapshot as of v0.23.0. Items annotated with stability assessments.
 | `LogCallback` | `std::function<void(LogLevel, std::string_view)>` | **Stable** |
 | `SchemaMismatchCallback` | `std::function<bool(SchemaVersion remote, SchemaVersion local, const std::string& remote_schema_sql)>` | **Stable** |
 | `ApproveOwnershipCallback` | `std::function<bool(const std::set<std::string>&)>` | **Stable** |
-| `FlushCallback` | `std::function<void(const std::vector<Message>&)>` | **Stable** |
-| `SinkCallback` | `std::function<void(const Message&)>` | **Stable** |
+| `FlushCallback` | `std::function<void(const std::vector<OutMessage>&)>` | **Fluid** (took `Message` v0.17.0–v0.23.0; restored `OutMessage` in v0.24.0) |
+| `SinkCallback` | `std::function<void(const OutMessage&)>` | **Fluid** (took `Message` v0.17.0–v0.23.0; restored `OutMessage` in v0.24.0) |
 | `SubscriptionCallback` | `std::function<void(const QueryResult&)>` | **Fluid** (new in v0.19.0) |
 
 ### Enums
@@ -71,6 +74,7 @@ Snapshot as of v0.23.0. Items annotated with stability assessments.
 | Enum | Variants | Stability |
 |---|---|---|
 | `OpType` | `Insert=1, Update=2, Delete=3` | **Stable** |
+| `Delivery` | `Reliable=0, BestEffort=1` | **Fluid** (introduced v0.15.0, removed v0.17.0, reinstated v0.24.0) |
 | `ConflictAction` | `Omit, Replace, Abort` | **Stable** |
 | `ConflictType` | `Data, NotFound, Conflict, Constraint, ForeignKey` | **Stable** |
 | `ErrorCode` | `Ok=0, SqliteError, ProtocolError, SchemaMismatch, InvalidState, OwnershipRejected, WithoutRowidTable` | **Stable** |
@@ -89,9 +93,11 @@ Snapshot as of v0.23.0. Items annotated with stability assessments.
 | `ChangeEvent` | `table, op, pk_flags, old_values, new_values` | **Stable** |
 | `QueryResult` | `id, columns, rows` | **Stable** |
 | `DiffProgress` | `phase, table, items_done, items_total` | **Stable** |
-| `HandleResult` | `messages: vector<Message>, changes, subscriptions` | **Stable** |
-| `PeerHandleResult` | `messages: vector<PeerMessage>, changes, subscriptions` | **Stable** |
+| `HandleResult` | `messages: vector<OutMessage>, changes, subscriptions` | **Fluid** (carried `vector<Message>` v0.17.0–v0.23.0) |
+| `PeerHandleResult` | `messages: vector<PeerOutMessage>, changes, subscriptions` | **Fluid** (carried `vector<PeerMessage>` v0.17.0–v0.23.0) |
 | `PeerMessage` | `sender_role, payload` | **Stable** |
+| `OutMessage` | `msg: Message, delivery: Delivery` | **Fluid** (introduced v0.15.0, removed v0.17.0, reinstated v0.24.0) |
+| `PeerOutMessage` | `msg: PeerMessage, delivery: Delivery` | **Fluid** (introduced v0.15.0, removed v0.17.0, reinstated v0.24.0) |
 
 ### Message structs
 
