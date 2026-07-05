@@ -236,6 +236,43 @@ TEST_CASE("master: on_flush transaction rollback produces nothing") {
     CHECK(received.empty());  // nothing committed, no flush
 }
 
+// T16/F2: after a committed write leaves flush_pending set, a subsequent
+// rolled-back transaction must NOT be streamed downstream, and the master's
+// in-memory seq must not advance past the persisted seq.
+TEST_CASE("master: committed write then rolled-back tx produces nothing (T16/F2)") {
+    DB d;
+    d.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+
+    std::vector<Message> received;
+    MasterConfig cfg;
+    cfg.on_flush = [&](const std::vector<OutMessage>& msgs) {
+        for (const auto& om : msgs) received.push_back(om.msg);
+    };
+    Master master(d.db, cfg);
+
+    // 1) A committed write auto-flushes seq=1.
+    master.exec("INSERT INTO t VALUES (1, 'committed')");
+    CHECK(received.size() == 1);
+    CHECK(master.current_seq() == 1);
+    received.clear();
+
+    // 2) A rolled-back transaction must produce nothing and not bump seq.
+    master.exec("BEGIN");
+    master.exec("INSERT INTO t VALUES (2, 'rolled-back')");
+    master.exec("ROLLBACK");
+
+    CHECK(received.empty());
+    CHECK(master.current_seq() == 1);
+
+    // The rolled-back row must not persist on the master.
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(d.db, "SELECT COUNT(*) FROM t", -1, &stmt, nullptr);
+    sqlite3_step(stmt);
+    int n = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    CHECK(n == 1);
+}
+
 TEST_CASE("master: changeset queue replay on reconnect") {
     DB master_db, replica_db;
     const char* schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)";

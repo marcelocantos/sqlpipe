@@ -122,3 +122,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `b995c49`
 - **Outcome**: Released v0.21.0. Diff sync performance benchmark suite (🎯T12) — 6 scenarios covering 10k–1M rows, continuous writes during handshake, and reconnect after disconnect. All pass well under acceptance criteria. Submodule vendoring for sqldeep/sqlift.
+
+## 2026-07-05 — /release v0.25.0
+
+- **Commit**: (pending)
+- **Outcome**: Released v0.25.0. Fable-5 deep-audit remediation (🎯T15–T23; audit at `docs/audit/fable-2026-07.md`) — 9 findings fixed, each with a regression test written before the fix and confirmed to fail against unfixed code (oracle-first). Two CRITICAL data-integrity fixes: non-`INTEGER PRIMARY KEY` tables now rejected at construction instead of silently diverging under rowid-keyed diff sync (F1/T15, surface-affecting → settling clock reset, eligible 2026-10-05); auto-flush made one-shot + autocommit-gated so uncommitted/rolled-back rows are never streamed (F2/T16). Six HIGH: bucket_hi honored under bucket_size mismatch (F3/T17); `deserialize` validates decompressed changeset length (F4/T18) and row-hash run count (F5/T19) in both C++ and Go; Wasm FFI shim migrated to the OutMessage API and now built in CI (F6/T20); `handle_diff_ready` rolls back + restores foreign_keys on a failed delete (F7/T21); `build_insert_patchset` never leaks the `_sqlpipe_stage` attachment (F8/T22). One MEDIUM: FFI buffer allocation routed through `detail::checked_malloc` so OOM surfaces a clean error instead of a segfault (F9/T23). Also fixed latent F12 (auto_flush reentrancy guard exception-safety) alongside F2. CI hardened with Go-test and Wasm-build+smoke jobs. Verified: `cv test` 162/162, `go test ./...`, `cv wasm` + TS smoke, `swift build`.

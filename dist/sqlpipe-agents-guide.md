@@ -13,8 +13,10 @@ sqldeep and sqlift — no separate installs needed. Compile with:
 -std=c++23 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK
 ```
 
-Requires SQLite 3 on the include path. All tables must have explicit `PRIMARY
-KEY`s. `WITHOUT ROWID` tables are not supported.
+Requires SQLite 3 on the include path. All tables must have a single
+`INTEGER PRIMARY KEY` (a rowid alias). Composite primary keys, non-`INTEGER`
+primary keys (e.g. `TEXT`), and `WITHOUT ROWID` tables are not supported and are
+rejected at `Master`/`Replica` construction with `WithoutRowidTable`.
 
 ## API
 

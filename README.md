@@ -94,8 +94,12 @@ lost and recovered by the next convergence round.
 - SQLite 3 compiled with `-DSQLITE_ENABLE_SESSION
   -DSQLITE_ENABLE_PREUPDATE_HOOK`
 
-All tables must have explicit `PRIMARY KEY`s (required by SQLite's session
-extension). `WITHOUT ROWID` tables are not supported.
+All tables must have a single `INTEGER PRIMARY KEY` (a rowid alias). This is
+required by SQLite's session extension and by rowid-keyed diff sync — the rowid
+must identify the same logical row on every peer. Tables with a composite
+primary key, a non-`INTEGER` primary key (e.g. `TEXT`), or `WITHOUT ROWID` are
+not supported and are rejected at `Master`/`Replica` construction with
+`WithoutRowidTable`.
 
 ## Quick start
 
@@ -503,7 +507,7 @@ try {
 | `SchemaMismatch` | Master and replica schemas differ | Install `on_schema_mismatch`, or migrate offline and reconnect |
 | `InvalidState` | Operation not valid in current state | Bug in calling code |
 | `OwnershipRejected` | Peer ownership request rejected | Server's `approve_ownership` returned false |
-| `WithoutRowidTable` | Table uses `WITHOUT ROWID` | Use regular rowid tables |
+| `WithoutRowidTable` | Table uses `WITHOUT ROWID`, or its PK is not a single `INTEGER PRIMARY KEY` rowid alias | Use a rowid table with a single `INTEGER PRIMARY KEY` |
 
 ## Schema migration
 

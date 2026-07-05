@@ -31,3 +31,49 @@ jobs:
 
       - name: Build and test
         run: cv test
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Go test
+        run: cd go/sqlpipe && go test ./...
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install cv
+        run: |
+          CV_VERSION="0.10.0"
+          curl -fsSL "https://github.com/marcelocantos/mk/releases/download/v${CV_VERSION}/cv-${CV_VERSION}-linux-amd64.tar.gz" \
+            | tar xz -C /usr/local/bin cv
+
+      - uses: mymindstorm/setup-emsdk@v14
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # Compile the Wasm module — this exercises the emscripten FFI shim
+      # (web/sqlpipe_wapi.cpp), which the `cv test` job does not build, so a
+      # stale-API break there cannot ship silently — then run the TS smoke test.
+      - name: Build Wasm
+        run: cv wasm
+
+      - name: TypeScript smoke test
+        run: |
+          cd web
+          npm install
+          npx tsc
+          node dist/test/smoke.test.js

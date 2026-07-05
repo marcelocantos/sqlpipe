@@ -740,3 +740,130 @@ TEST_CASE("convergence: schema mismatch via converge()") {
     CHECK(err.code == ErrorCode::SchemaMismatch);
     CHECK(!err.remote_schema_sql.empty());
 }
+
+// T15/F1: diff sync identifies rows by rowid, which is only stable across
+// databases when the PK is an INTEGER PRIMARY KEY (rowid alias). A TEXT or
+// composite PK would silently diverge/lose rows, so such tables must be
+// rejected at construction rather than tracked.
+TEST_CASE("diff sync: non-integer-PK table is rejected at construction (T15/F1)") {
+    {
+        DB d;
+        d.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)");
+        CHECK_THROWS_AS(Master(d.db), Error);
+    }
+    {
+        DB d;
+        d.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)");
+        CHECK_THROWS_AS(Replica(d.db), Error);
+    }
+    {
+        // Composite PK is not a rowid alias either.
+        DB d;
+        d.exec("CREATE TABLE t (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY(a, b))");
+        CHECK_THROWS_AS(Master(d.db), Error);
+    }
+    {
+        // A single INTEGER PRIMARY KEY (rowid alias) is fine.
+        DB d;
+        d.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        CHECK_NOTHROW(Master(d.db));
+    }
+}
+
+// T17/F3: the master must honor each transmitted bucket_hi so that a
+// bucket_size mismatch between the two sides never leaves rows un-diffed.
+TEST_CASE("diff sync: bucket_size mismatch still converges (T17/F3)") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    MasterConfig mcfg;
+    mcfg.bucket_size = 1024;
+    Master master(master_db.db, mcfg);  // master empty
+
+    // Replica has rows 1..4000 that the (empty) master lacks.
+    replica_db.exec("BEGIN");
+    for (int i = 1; i <= 4000; ++i) {
+        replica_db.exec(("INSERT INTO t VALUES (" + std::to_string(i) +
+                         ", 'x')").c_str());
+    }
+    replica_db.exec("COMMIT");
+
+    ReplicaConfig rcfg;
+    rcfg.bucket_size = 4096;
+    Replica replica(replica_db.db, rcfg);
+
+    handshake(master, replica);
+
+    CHECK(replica.state() == Replica::State::Live);
+    // Master is empty, so the replica must be emptied. Before the fix the
+    // master requests only [0,1023] and rows 1024..4000 survive (2977 rows).
+    CHECK(replica_db.count("t") == 0);
+}
+
+// T21/F7: if the diff-ready delete loop throws, handle_diff_ready must roll
+// back the transaction and restore the prior foreign_keys setting.
+TEST_CASE("diff sync: delete-loop failure rolls back and restores FK (T21/F7)") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    master_db.exec("INSERT INTO t VALUES (1, 'a')");
+    master.flush();
+
+    // Replica has an extra row (id=2) the master lacks → master emits a
+    // delete for it; a BEFORE DELETE trigger aborts that delete.
+    replica_db.exec("INSERT INTO t VALUES (1, 'a')");
+    replica_db.exec("INSERT INTO t VALUES (2, 'b')");
+    replica_db.exec("CREATE TRIGGER guard BEFORE DELETE ON t "
+                    "BEGIN SELECT RAISE(ABORT, 'no deletes'); END");
+    replica_db.exec("PRAGMA foreign_keys = ON");
+
+    Replica replica(replica_db.db);
+    CHECK_THROWS_AS(handshake(master, replica), Error);
+
+    // Transaction must be rolled back and FK enforcement restored.
+    CHECK(sqlite3_get_autocommit(replica_db.db) == 1);
+    CHECK(replica_db.query_val("PRAGMA foreign_keys") == "1");
+}
+
+// T22/F8: a throw inside build_insert_patchset (e.g. a generated column that
+// makes `INSERT ... SELECT *` fail) must not leak the _sqlpipe_stage attached
+// database, which would poison all future diff syncs on that connection.
+TEST_CASE("diff sync: failed patchset build does not leak _sqlpipe_stage (T22/F8)") {
+    DB master_db, replica_db;
+    const char* schema =
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, "
+        "vlen INTEGER GENERATED ALWAYS AS (length(v)) STORED)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    // Populate the master directly (no flush(): a generated column also breaks
+    // main-session changeset extraction, and diff sync reads table state, not
+    // the session). Both sides stay at seq 0, so a full diff sync runs.
+    master_db.exec("INSERT INTO t (id, v) VALUES (1, 'hello')");
+
+    Replica replica(replica_db.db);
+    // The generated column makes build_insert_patchset throw; the sync fails
+    // either way, but it must not leak the attachment.
+    CHECK_THROWS_AS(handshake(master, replica), Error);
+    CHECK(master_db.query_val(
+        "SELECT name FROM pragma_database_list WHERE name='_sqlpipe_stage'")
+        == "");
+
+    // A second attempt must fail with the SAME (generated-column) error, never
+    // "database _sqlpipe_stage is already in use".
+    Replica replica2(replica_db.db);
+    bool already_in_use = false;
+    try {
+        handshake(master, replica2);
+    } catch (const Error& e) {
+        already_in_use =
+            std::string(e.what()).find("already in use") != std::string::npos;
+    }
+    CHECK_FALSE(already_in_use);
+}

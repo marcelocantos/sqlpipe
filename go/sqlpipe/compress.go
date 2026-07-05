@@ -61,6 +61,13 @@ func (r *reader) readChangeset() (Changeset, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Validate the wire-supplied decompressed length before allocating: an
+		// unbounded origLen is a memory-amplification DoS and makes make() panic
+		// rather than returning a clean ProtocolError (F4).
+		if origLen > MaxMessageSize {
+			return nil, errorf(ErrProtocol,
+				"decompressed changeset length exceeds limit")
+		}
 		compressedLen := payloadLen - 4
 		compressed, err := r.readBytes(compressedLen)
 		if err != nil {
@@ -71,7 +78,10 @@ func (r *reader) readChangeset() (Changeset, error) {
 		if err != nil {
 			return nil, errorf(ErrProtocol, "LZ4 decompression failed: %v", err)
 		}
-		_ = n
+		if uint32(n) != origLen {
+			return nil, errorf(ErrProtocol,
+				"decompressed changeset length mismatch")
+		}
 		return Changeset(cs), nil
 
 	default:

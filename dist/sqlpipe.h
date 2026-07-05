@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#define SQLPIPE_VERSION       "0.24.0"
+#define SQLPIPE_VERSION       "0.25.0"
 #define SQLPIPE_VERSION_MAJOR 0
-#define SQLPIPE_VERSION_MINOR 24
+#define SQLPIPE_VERSION_MINOR 25
 #define SQLPIPE_VERSION_PATCH 0
 
 // ── Bundled: sqldeep (query transpiler) ─────────────────────────
@@ -144,8 +144,10 @@ void sqlift_free(void* ptr);
 // ── sqlpipe ────────────────────────────────────────────────────
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <span>
@@ -157,6 +159,19 @@ void sqlift_free(void* ptr);
 
 // ── types.h ─────────────────────────────────────────────────────
 namespace sqlpipe {
+
+namespace detail {
+/// std::malloc that throws std::bad_alloc on failure. FFI shims allocate the
+/// buffers they hand back to managed runtimes through this so an allocation
+/// failure surfaces as a clean error via their try/catch, instead of
+/// dereferencing a null pointer in a subsequent memcpy (F9). Header-inline so
+/// the C-API and Wasm shims (separate translation units) share one definition.
+inline void* checked_malloc(std::size_t n) {
+    void* p = std::malloc(n);
+    if (!p) throw std::bad_alloc{};
+    return p;
+}
+}  // namespace detail
 
 /// Monotonically increasing sequence number for changesets.
 using Seq = std::int64_t;
