@@ -26,31 +26,35 @@ API surface complexity:
 
 The clock starts from the last breaking change to the interaction surface.
 
-Current surface: ~107 items → 3 months. Last breaking change: v0.24.0
-(two bundled changes in one release: bundled sqldeep bumped to v0.23.0 —
-`sqldeep_register_sqlite_xml` renamed to `sqldeep_register_sqlite` and
-now also registers BLOB-returning `sqldeep_json*` runtime functions,
-output of XML/JSON aggregation moved to a BLOB protocol; AND `Delivery`,
-`OutMessage`, `PeerOutMessage` reinstated to expose transport routing
-hints for dual-channel transports like QUIC — `Master::flush()`,
-`Master::handle_message()`, `Replica::hello()`, `Replica::converge()`,
-`Peer::start()`, `Peer::flush()`, `Relay::hello()` now return
-`OutMessage`/`PeerOutMessage`, `HandleResult::messages` and
-`PeerHandleResult::messages` are `vector<OutMessage>`/`vector<PeerOutMessage>`,
-`FlushCallback` and `SinkCallback` take the tagged variants. 2026-06-28).
-Eligible: 2026-09-28.
+Current surface: ~107 items → 3 months. Last breaking change: v0.25.0
+(Fable-5 audit remediation. The one surface-affecting change: tables whose
+primary key is not a single INTEGER PRIMARY KEY rowid alias — a composite PK,
+or a single non-`INTEGER`-typed PK such as `TEXT` — are now rejected at
+Master/Replica construction with `ErrorCode::WithoutRowidTable`, instead of
+being tracked and silently diverging/losing rows during rowid-keyed diff sync.
+Previously such tables were accepted; code that relied on tracking them now
+fails closed. The other eight fixes are internal-robustness hardening with no
+surface change: `deserialize` now rejects an oversized decompressed changeset
+length and an out-of-range row-hash run count as `ProtocolError` instead of
+over-allocating; `handle_diff_ready` rolls back and restores `foreign_keys` on
+a failed delete; `build_insert_patchset` never leaks the `_sqlpipe_stage`
+attachment; auto-flush no longer streams uncommitted/rolled-back rows; diff
+sync honours a transmitted `bucket_hi` under a `bucket_size` mismatch; the Wasm
+FFI shim compiles again; and FFI buffer allocation surfaces a clean error
+instead of crashing on OOM. 2026-07-05).
+Eligible: 2026-10-05.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.24.0. Items annotated with stability assessments.
+Snapshot as of v0.25.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.24.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.25.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `24` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `25` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 | `SQLDEEP_VERSION` | `"0.23.0"` | **Stable** (bundled) |
 | `SQLIFT_VERSION` | `"0.14.0"` | **Stable** (bundled) |
@@ -360,5 +364,8 @@ Keys: `seq` (Master/Replica solo), `master_seq` / `replica_seq` (Peer mode).
 - Subscription prepared statement sharing (statement cache keyed by SQL text
   for duplicate queries).
 - Multi-master replication (more than two peers).
-- WITHOUT ROWID table support.
+- WITHOUT ROWID tables, and any table whose primary key is not a single
+  `INTEGER PRIMARY KEY` rowid alias (composite or non-`INTEGER` PKs). Diff sync
+  is rowid-keyed and requires a rowid alias; such tables are rejected at
+  construction.
 - Incremental View Maintenance for subscriptions.

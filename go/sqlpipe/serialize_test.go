@@ -4,6 +4,7 @@
 package sqlpipe
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -377,6 +378,71 @@ func TestDeserializeRejectsAbsurdArrayCount(t *testing.T) {
 	_, err := Deserialize(buf)
 	if err == nil {
 		t.Fatal("expected error for absurd array count")
+	}
+}
+
+// T18/F4: the Go decoder must validate the wire-supplied decompressed length
+// before make() so an oversized value returns a ProtocolError instead of
+// panicking ("makeslice: len out of range").
+func TestDeserializeRejectsOversizedChangesetLength(t *testing.T) {
+	var b []byte
+	putU32 := func(v uint32) { b = append(b, byte(v), byte(v>>8), byte(v>>16), byte(v>>24)) }
+	putI64 := func(v int64) {
+		u := uint64(v)
+		for i := 0; i < 8; i++ {
+			b = append(b, byte(u>>(i*8)))
+		}
+	}
+	b = make([]byte, 4) // length placeholder
+	b = append(b, byte(TagChangeset))
+	putI64(1) // seq
+	// Changeset frame: [u32 frame_len][u8 type=0x01][u32 origLen][data]
+	compressed := []byte{0, 0, 0, 0, 0}
+	putU32(uint32(1 + 4 + len(compressed))) // frame_len
+	b = append(b, 0x01)                     // LZ4
+	putU32(MaxMessageSize + 1)              // origLen > limit
+	b = append(b, compressed...)
+	total := uint32(len(b) - 4)
+	b[0], b[1], b[2], b[3] = byte(total), byte(total>>8), byte(total>>16), byte(total>>24)
+
+	_, err := Deserialize(b)
+	if err == nil {
+		t.Fatal("expected error for oversized decompressed changeset length")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected 'exceeds limit' error, got: %v", err)
+	}
+}
+
+// T19/F5: the Go decoder must validate RowHashRun.count before make() so a
+// negative value returns a ProtocolError instead of panicking.
+func TestDeserializeRejectsNegativeRowHashCount(t *testing.T) {
+	var b []byte
+	putU32 := func(v uint32) { b = append(b, byte(v), byte(v>>8), byte(v>>16), byte(v>>24)) }
+	putI64 := func(v int64) {
+		u := uint64(v)
+		for i := 0; i < 8; i++ {
+			b = append(b, byte(u>>(i*8)))
+		}
+	}
+	b = make([]byte, 4) // length placeholder
+	b = append(b, byte(TagRowHashes))
+	putU32(1)  // entry_count
+	putU32(0)  // entry.table: empty string
+	putI64(0)  // entry.lo
+	putI64(0)  // entry.hi
+	putU32(1)  // run_count
+	putI64(0)  // run.start_rowid
+	putI64(-1) // run.count = -1 → make([]uint64, -1) panics before the fix
+	total := uint32(len(b) - 4)
+	b[0], b[1], b[2], b[3] = byte(total), byte(total>>8), byte(total>>16), byte(total>>24)
+
+	_, err := Deserialize(b)
+	if err == nil {
+		t.Fatal("expected error for negative row hash run count")
+	}
+	if !strings.Contains(err.Error(), "count") {
+		t.Fatalf("expected 'count out of range' error, got: %v", err)
 	}
 }
 

@@ -355,6 +355,13 @@ func deserializeRowHashes(r *reader) (RowHashesMsg, error) {
 			if err != nil {
 				return RowHashesMsg{}, err
 			}
+			// Validate the wire-supplied i64 count before allocating so a
+			// negative or huge value surfaces as a ProtocolError instead of
+			// panicking make() ("makeslice: len out of range") (F5).
+			if count < 0 || uint64(count) > uint64(MaxArrayCount) {
+				return RowHashesMsg{}, errorf(ErrProtocol,
+					"row hash run count out of range")
+			}
 			hashes := make([]uint64, count)
 			for k := int64(0); k < count; k++ {
 				h, err := r.readU64()

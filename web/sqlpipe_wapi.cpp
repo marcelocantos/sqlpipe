@@ -146,23 +146,26 @@ void encode_query_result(Buf& b, const sqlpipe::QueryResult& qr) {
     }
 }
 
-// Encode vector<Message> as [u32 count][serialized msg]...
-Buf encode_messages(const std::vector<sqlpipe::Message>& msgs) {
+// Encode vector<OutMessage> as [u32 count][serialized msg]... The core API
+// returns delivery-tagged OutMessage; we serialize the wrapped Message only.
+// (The TypeScript decoder reads [u32 count] + length-prefixed bodies and does
+// not consume a delivery byte, so — unlike the Go C-API — none is emitted.)
+Buf encode_messages(const std::vector<sqlpipe::OutMessage>& msgs) {
     Buf b;
     put_u32(b, static_cast<uint32_t>(msgs.size()));
-    for (auto& m : msgs) {
-        auto wire = sqlpipe::serialize(m);
+    for (auto& om : msgs) {
+        auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
     }
     return b;
 }
 
-// Encode vector<PeerMessage> as [u32 count][serialized pmsg]...
-Buf encode_peer_messages(const std::vector<sqlpipe::PeerMessage>& msgs) {
+// Encode vector<PeerOutMessage> as [u32 count][serialized pmsg]...
+Buf encode_peer_messages(const std::vector<sqlpipe::PeerOutMessage>& msgs) {
     Buf b;
     put_u32(b, static_cast<uint32_t>(msgs.size()));
-    for (auto& m : msgs) {
-        auto wire = sqlpipe::serialize(m);
+    for (auto& om : msgs) {
+        auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
     }
     return b;
@@ -172,8 +175,8 @@ Buf encode_peer_messages(const std::vector<sqlpipe::PeerMessage>& msgs) {
 Buf encode_handle_result(const sqlpipe::HandleResult& hr) {
     Buf b;
     put_u32(b, static_cast<uint32_t>(hr.messages.size()));
-    for (auto& m : hr.messages) {
-        auto wire = sqlpipe::serialize(m);
+    for (auto& om : hr.messages) {
+        auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
     }
     put_u32(b, static_cast<uint32_t>(hr.changes.size()));
@@ -187,8 +190,8 @@ Buf encode_handle_result(const sqlpipe::HandleResult& hr) {
 Buf encode_peer_handle_result(const sqlpipe::PeerHandleResult& phr) {
     Buf b;
     put_u32(b, static_cast<uint32_t>(phr.messages.size()));
-    for (auto& m : phr.messages) {
-        auto wire = sqlpipe::serialize(m);
+    for (auto& om : phr.messages) {
+        auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
     }
     put_u32(b, static_cast<uint32_t>(phr.changes.size()));
@@ -200,7 +203,9 @@ Buf encode_peer_handle_result(const sqlpipe::PeerHandleResult& phr) {
 
 sqlpipe_buf to_buf(Buf&& v) {
     if (v.empty()) return {nullptr, 0};
-    auto* p = static_cast<uint8_t*>(std::malloc(v.size()));
+    // checked_malloc throws std::bad_alloc on failure so the enclosing
+    // try/catch returns a clean error instead of memcpy dereferencing null (F9).
+    auto* p = static_cast<uint8_t*>(sqlpipe::detail::checked_malloc(v.size()));
     std::memcpy(p, v.data(), v.size());
     return {p, v.size()};
 }
@@ -607,8 +612,8 @@ void sqlpipe_replica_free(sqlpipe_replica* r) { delete r; }
 EMSCRIPTEN_KEEPALIVE
 int sqlpipe_replica_hello(sqlpipe_replica* r, sqlpipe_buf* out, sqlpipe_error* err) {
     try {
-        auto hello_msg = r->impl.hello();
-        auto wire = sqlpipe::serialize(hello_msg);
+        auto hello_out = r->impl.hello();
+        auto wire = sqlpipe::serialize(hello_out.msg);
         *out = to_buf(Buf(wire.begin(), wire.end()));
         *err = ok();
         return 0;

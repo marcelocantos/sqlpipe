@@ -161,8 +161,11 @@ Two sync modes:
   (default 1024). Bucket hash = XOR of `fnv1a(rowid || row_hash)` for each row.
   Order-independent. Enables O(d + b) bandwidth for diff where d = differing
   rows and b = total buckets.
-- **WITHOUT ROWID**: Not supported. Tables using `WITHOUT ROWID` are rejected
-  during table discovery with `ErrorCode::WithoutRowidTable`.
+- **Primary key**: Every tracked table must have a single `INTEGER PRIMARY KEY`
+  (a rowid alias). Diff sync identifies rows by rowid, which is only stable
+  across databases for a rowid-alias PK. Composite PKs, non-`INTEGER` PKs (e.g.
+  `TEXT`), and `WITHOUT ROWID` tables are rejected during table discovery with
+  `ErrorCode::WithoutRowidTable`.
 - **Query subscriptions**: Replica-side feature. `Replica::subscribe(sql)`
   registers a query and returns the current result. After each
   `handle_message` that applies changes to a table the query reads from, the
@@ -244,6 +247,7 @@ Add new tests to the file matching the component under test.
 ## Conventions
 
 - Use `SPDLOG_INFO`/`SPDLOG_WARN`/`SPDLOG_ERROR` macros (not `spdlog::info`).
-- All tables must have explicit PRIMARY KEYs (SQLite session extension
-  requirement).
+- All tables must have a single `INTEGER PRIMARY KEY` rowid alias (SQLite
+  session extension + rowid-keyed diff sync requirement); other PK shapes are
+  rejected at construction.
 - Apache 2.0 license with SPDX headers on all source files.

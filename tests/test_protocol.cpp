@@ -249,3 +249,102 @@ TEST_CASE("deserialize rejects absurd array count") {
 
     CHECK_THROWS_AS(deserialize(buf), Error);
 }
+
+namespace {
+
+void put_u8(std::vector<std::uint8_t>& b, std::uint8_t v) { b.push_back(v); }
+
+void put_u32(std::vector<std::uint8_t>& b, std::uint32_t v) {
+    b.push_back(static_cast<std::uint8_t>(v));
+    b.push_back(static_cast<std::uint8_t>(v >> 8));
+    b.push_back(static_cast<std::uint8_t>(v >> 16));
+    b.push_back(static_cast<std::uint8_t>(v >> 24));
+}
+
+void put_i64(std::vector<std::uint8_t>& b, std::int64_t v) {
+    auto u = static_cast<std::uint64_t>(v);
+    for (int i = 0; i < 8; ++i)
+        b.push_back(static_cast<std::uint8_t>(u >> (i * 8)));
+}
+
+void patch_len(std::vector<std::uint8_t>& b) {
+    auto total = static_cast<std::uint32_t>(b.size() - 4);
+    b[0] = static_cast<std::uint8_t>(total);
+    b[1] = static_cast<std::uint8_t>(total >> 8);
+    b[2] = static_cast<std::uint8_t>(total >> 16);
+    b[3] = static_cast<std::uint8_t>(total >> 24);
+}
+
+bool throws_with(const std::vector<std::uint8_t>& buf, const char* needle) {
+    try {
+        deserialize(buf);
+    } catch (const Error& e) {
+        return std::string(e.what()).find(needle) != std::string::npos;
+    } catch (...) {
+        return false;
+    }
+    return false;
+}
+
+}  // namespace
+
+// T18/F4: read_changeset must validate the wire-supplied decompressed length
+// against kMaxMessageSize before allocating, and surface a ProtocolError
+// rather than attempting an unbounded allocation / throwing std::bad_alloc.
+TEST_CASE("deserialize rejects oversized decompressed changeset length (T18/F4)") {
+    std::vector<std::uint8_t> buf;
+    buf.resize(4);  // length placeholder
+    put_u8(buf, static_cast<std::uint8_t>(MessageTag::Changeset));
+    put_i64(buf, 1);  // seq
+
+    // Changeset frame: [u32 frame_len][u8 type=0x01 LZ4][u32 original_len][data]
+    std::uint32_t original_len =
+        static_cast<std::uint32_t>(kMaxMessageSize) + 1;  // > limit
+    std::vector<std::uint8_t> compressed = {0, 0, 0, 0, 0};  // 5 arbitrary bytes
+    std::uint32_t frame_len =
+        1 + 4 + static_cast<std::uint32_t>(compressed.size());
+    put_u32(buf, frame_len);
+    put_u8(buf, 0x01);
+    put_u32(buf, original_len);
+    buf.insert(buf.end(), compressed.begin(), compressed.end());
+    patch_len(buf);
+
+    // Must throw a ProtocolError naming the limit — not "LZ4 decompression
+    // failed" (which is what the unbounded pre-fix path reaches after a large
+    // allocation), and never std::bad_alloc.
+    CHECK(throws_with(buf, "exceeds"));
+}
+
+// T19/F5: RowHashRun.count is an i64 read straight off the wire; it must be
+// validated before hashes.resize(), surfacing a ProtocolError instead of
+// std::length_error (negative) or std::bad_alloc (huge).
+TEST_CASE("deserialize rejects out-of-range row hash run count (T19/F5)") {
+    std::vector<std::uint8_t> buf;
+    buf.resize(4);  // length placeholder
+    put_u8(buf, static_cast<std::uint8_t>(MessageTag::RowHashes));
+    put_u32(buf, 1);   // entry_count
+    put_u32(buf, 0);   // entry.table: empty string (len 0)
+    put_i64(buf, 0);   // entry.lo
+    put_i64(buf, 0);   // entry.hi
+    put_u32(buf, 1);   // run_count
+    put_i64(buf, 0);   // run.start_rowid
+    put_i64(buf, -1);  // run.count = -1 → resize(SIZE_MAX) before the fix
+    patch_len(buf);
+
+    // Before the fix this throws std::length_error (not an sqlpipe::Error),
+    // escaping the deserialize contract; after the fix it is a ProtocolError.
+    CHECK_THROWS_AS(deserialize(buf), Error);
+    CHECK(throws_with(buf, "count"));
+}
+
+// T23/F9: the C-API and Wasm FFI shims allocate every buffer they hand back to
+// managed runtimes via detail::checked_malloc, which must throw std::bad_alloc
+// on failure so the shim's try/catch returns a clean error instead of
+// dereferencing a null pointer in the following memcpy.
+TEST_CASE("checked_malloc throws on allocation failure (T23/F9)") {
+    void* p = detail::checked_malloc(64);
+    CHECK(p != nullptr);
+    std::free(p);
+    // SIZE_MAX bytes cannot be allocated → malloc returns nullptr → must throw.
+    CHECK_THROWS_AS(detail::checked_malloc(SIZE_MAX), std::bad_alloc);
+}

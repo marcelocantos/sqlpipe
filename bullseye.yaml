@@ -490,7 +490,7 @@ targets:
     discovered: 2026-05-09
   T15:
     name: Diff sync identifies rows by PRIMARY KEY, never conflating rowid identity across databases
-    status: identified
+    status: achieved
     value: 13.0
     cost: 3.0
     acceptance:
@@ -499,9 +499,10 @@ targets:
     context: Prevents silent, permanent loss of rows the master holds on content-identical tables whose PK is not an INTEGER-PRIMARY-KEY rowid alias, during the routine diff-sync repair path (replica falsely reports Live/in-sync). Found by Fable-5 audit 2026-07 (docs/audit/fable-2026-07.md).
     origin: manual
     discovered: 2026-07-02
+    achieved: 2026-07-05
   T16:
     name: Master auto-flush never streams uncommitted or rolled-back rows to replicas
-    status: identified
+    status: achieved
     value: 13.0
     cost: 3.0
     acceptance:
@@ -510,9 +511,10 @@ targets:
     context: Prevents permanent replica divergence and seq desync caused by flush_pending never being reset, which streams a later (uncommitted, rolled-back) statement's rows downstream after any committed write. Found by Fable-5 audit 2026-07 (docs/audit/fable-2026-07.md).
     origin: manual
     discovered: 2026-07-02
+    achieved: 2026-07-05
   T17:
     name: Diff sync honors each transmitted bucket_hi so a bucket_size mismatch never leaves rows un-diffed
-    status: identified
+    status: achieved
     value: 8.0
     cost: 3.0
     acceptance:
@@ -521,9 +523,10 @@ targets:
     context: 'Prevents silent, permanent divergence when master and replica are configured with different bucket_size: the master recomputes each requested range from its own bucket_size and discards the transmitted bucket_hi, truncating NeedBucketRanges. Found by Fable-5 audit 2026-07 (docs/audit/fable-2026-07.md).'
     origin: manual
     discovered: 2026-07-02
+    achieved: 2026-07-05
   T18:
     name: Changeset decompression validates the wire-supplied length before allocating and throws only sqlpipe::Error (C++ and Go)
-    status: identified
+    status: achieved
     value: 8.0
     cost: 3.0
     acceptance:
@@ -532,9 +535,10 @@ targets:
     context: Prevents a ~150-million-x memory-amplification DoS and a contract-violating uncaught std::bad_alloc/negative dstCapacity when read_changeset (and go/sqlpipe/compress.go) allocate from an unvalidated wire-supplied decompressed length. Found by Fable-5 audit 2026-07 (docs/audit/fable-2026-07.md).
     origin: manual
     discovered: 2026-07-02
+    achieved: 2026-07-05
   T19:
     name: RowHashRun.count is validated before resize so deserialize throws only sqlpipe::Error on malformed input (C++ and Go)
-    status: identified
+    status: achieved
     value: 8.0
     cost: 3.0
     acceptance:
@@ -543,6 +547,7 @@ targets:
     context: 'Prevents a crash escaping the ProtocolError contract: an unvalidated i64 run.count drives vector::resize (negative -> std::length_error, huge -> std::bad_alloc/memory amplification), mirrored in go/sqlpipe/deserialize.go. Found by Fable-5 audit 2026-07 (docs/audit/fable-2026-07.md).'
     origin: manual
     discovered: 2026-07-02
+    achieved: 2026-07-05
   T2:
     name: sqlpipe reaches 1.0
     status: identified
@@ -560,7 +565,7 @@ targets:
     discovered: 2026-03-12
   T20:
     name: The Wasm FFI shim (sqlpipe_wapi.cpp) compiles against the current OutMessage API and is covered by CI
-    status: identified
+    status: achieved
     value: 8.0
     cost: 3.0
     acceptance:
@@ -569,9 +574,10 @@ targets:
     context: 'Prevents the Wasm/browser build from being permanently broken: every message-producing entry point in the shim still uses the stale Message API instead of OutMessage. Found by Fable-5 audit 2026-07 (docs/audit/fable-2026-07.md).'
     origin: manual
     discovered: 2026-07-02
+    achieved: 2026-07-05
   T21:
     name: handle_diff_ready always rolls back and restores foreign_keys when the delete loop or write_seq throws
-    status: identified
+    status: achieved
     value: 8.0
     cost: 3.0
     acceptance:
@@ -580,9 +586,10 @@ targets:
     context: Prevents an exception in the delete loop from leaving the replica transaction open and foreign_keys OFF (no RAII/rollback on that path), corrupting subsequent operations on the caller's connection. Found by Fable-5 audit 2026-07 (docs/audit/fable-2026-07.md).
     origin: manual
     discovered: 2026-07-02
+    achieved: 2026-07-05
   T22:
     name: build_insert_patchset always detaches _sqlpipe_stage even when CREATE/INSERT throws
-    status: identified
+    status: achieved
     value: 8.0
     cost: 3.0
     acceptance:
@@ -591,9 +598,10 @@ targets:
     context: Prevents a leaked _sqlpipe_stage attached database (when CREATE/INSERT throws) from permanently disabling all future diff sync with 'database _sqlpipe_stage is already in use'. Found by Fable-5 audit 2026-07 (docs/audit/fable-2026-07.md).
     origin: manual
     discovered: 2026-07-02
+    achieved: 2026-07-05
   T23:
     name: FFI to_buf() checks the malloc result and returns a clean FFI error instead of segfaulting on allocation failure
-    status: identified
+    status: achieved
     value: 5.0
     cost: 3.0
     acceptance:
@@ -602,6 +610,7 @@ targets:
     context: Prevents an unchecked std::malloc result being memcpy'd into (segfault) at the FFI boundary on allocation failure; the same defect is duplicated in the capi and wapi shims. Found by Fable-5 audit 2026-07 (docs/audit/fable-2026-07.md).
     origin: manual
     discovered: 2026-07-02
+    achieved: 2026-07-05
   T3:
     name: sqlpipe runs in the browser via Emscripten + JS wrapper
     status: identified

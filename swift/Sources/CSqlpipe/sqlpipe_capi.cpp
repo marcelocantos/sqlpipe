@@ -192,7 +192,9 @@ std::vector<sqlpipe::Message> decode_messages(const uint8_t* data, size_t len) {
 // Copy a Buf into a heap-allocated sqlpipe_buf.
 sqlpipe_buf to_buf(Buf&& v) {
     if (v.empty()) return {nullptr, 0};
-    auto* p = static_cast<uint8_t*>(std::malloc(v.size()));
+    // checked_malloc throws std::bad_alloc on failure so the enclosing
+    // try/catch returns a clean error instead of memcpy dereferencing null (F9).
+    auto* p = static_cast<uint8_t*>(sqlpipe::detail::checked_malloc(v.size()));
     std::memcpy(p, v.data(), v.size());
     return {p, v.size()};
 }

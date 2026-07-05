@@ -368,6 +368,13 @@ public:
             auto original_len = read_u32();
             auto compressed_len = payload_len - 4;
             check(compressed_len);
+            // Validate the wire-supplied decompressed length before allocating:
+            // an unbounded original_len is a memory-amplification DoS and, for
+            // values above INT_MAX, feeds a negative dstCapacity to LZ4 (F4).
+            if (original_len > kMaxMessageSize) {
+                throw Error(ErrorCode::ProtocolError,
+                            "decompressed changeset length exceeds limit");
+            }
             Changeset cs(original_len);
             int result = LZ4_decompress_safe(
                 reinterpret_cast<const char*>(data_ + pos_),
@@ -377,6 +384,10 @@ public:
             if (result < 0) {
                 throw Error(ErrorCode::ProtocolError,
                             "LZ4 decompression failed");
+            }
+            if (static_cast<std::size_t>(result) != original_len) {
+                throw Error(ErrorCode::ProtocolError,
+                            "decompressed changeset length mismatch");
             }
             pos_ += compressed_len;
             return cs;
@@ -606,9 +617,19 @@ Message deserialize(std::span<const std::uint8_t> buf) {
             m.entries[i].runs.resize(run_count);
             for (std::uint32_t j = 0; j < run_count; ++j) {
                 m.entries[i].runs[j].start_rowid = r.read_i64();
-                m.entries[i].runs[j].count = r.read_i64();
+                auto run_len = r.read_i64();
+                // run.count is an i64 read straight off the wire; validate it
+                // before resize so a negative value (std::length_error) or a
+                // huge one (std::bad_alloc / memory amplification) surfaces as
+                // a ProtocolError instead of escaping the contract (F5).
+                if (run_len < 0 ||
+                    static_cast<std::uint64_t>(run_len) > kMaxArrayCount) {
+                    throw Error(ErrorCode::ProtocolError,
+                                "row hash run count out of range");
+                }
+                m.entries[i].runs[j].count = run_len;
                 m.entries[i].runs[j].hashes.resize(
-                    static_cast<std::size_t>(m.entries[i].runs[j].count));
+                    static_cast<std::size_t>(run_len));
                 for (std::int64_t k = 0; k < m.entries[i].runs[j].count; ++k) {
                     m.entries[i].runs[j].hashes[static_cast<std::size_t>(k)] =
                         r.read_u64();
@@ -746,18 +767,24 @@ std::vector<std::string> get_tracked_tables(
             continue;
         }
 
-        // Check if table has an explicit PK.
+        // Inspect the primary key. Diff sync identifies rows by rowid, which
+        // is only stable across databases when the PK is a single INTEGER
+        // PRIMARY KEY (a rowid alias). PRAGMA table_info column 5 is the
+        // 1-based PK position (0 = not part of the PK); column 2 is the
+        // declared type.
         std::string pragma = "PRAGMA table_info('" + name + "')";
         auto pk_stmt = prepare(db, pragma.c_str());
-        bool has_pk = false;
+        int pk_count = 0;
+        std::string pk_type;
         while (sqlite3_step(pk_stmt.get()) == SQLITE_ROW) {
             if (sqlite3_column_int(pk_stmt.get(), 5) > 0) {  // pk column
-                has_pk = true;
-                break;
+                ++pk_count;
+                const unsigned char* t = sqlite3_column_text(pk_stmt.get(), 2);
+                pk_type = t ? reinterpret_cast<const char*>(t) : "";
             }
         }
 
-        if (!has_pk) {
+        if (pk_count == 0) {
             SQLPIPE_LOG(on_log ? *on_log : LogCallback{}, LogLevel::Warn,
                        "table '{}' has no explicit PRIMARY KEY, skipping", name);
             continue;
@@ -767,6 +794,20 @@ std::vector<std::string> get_tracked_tables(
         if (is_without_rowid(db, name)) {
             throw Error(ErrorCode::WithoutRowidTable,
                         "table '" + name + "' uses WITHOUT ROWID (not supported)");
+        }
+
+        // Reject tables whose PK is not an INTEGER PRIMARY KEY rowid alias
+        // (a composite PK, or a single PK column not declared exactly
+        // "INTEGER"). For those the rowid is assigned independently per
+        // database, so rowid-keyed diff sync would conflate distinct logical
+        // rows and silently diverge / lose data. Fail closed at construction.
+        for (auto& ch : pk_type) {
+            if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
+        }
+        if (pk_count != 1 || pk_type != "INTEGER") {
+            throw Error(ErrorCode::WithoutRowidTable,
+                        "table '" + name + "' primary key is not an INTEGER "
+                        "PRIMARY KEY rowid alias (not supported)");
         }
 
         tables.push_back(std::move(name));
@@ -1131,6 +1172,20 @@ Changeset build_insert_patchset(
 
     exec(db, "ATTACH ':memory:' AS _sqlpipe_stage");
 
+    // Detach _sqlpipe_stage on every exit path, including exceptions. Without
+    // this, a throw between here and the explicit detach (e.g. a generated
+    // column making the INSERT ... SELECT * fail) leaves the schema name bound
+    // to the caller's connection, and every future diff sync fails at ATTACH
+    // with "database _sqlpipe_stage is already in use" (F8). The session
+    // (SessionGuard, declared below) is destroyed before this guard runs, so
+    // the detach always sees no attached session.
+    struct DetachGuard {
+        sqlite3* db;
+        ~DetachGuard() {
+            sqlite3_exec(db, "DETACH _sqlpipe_stage", nullptr, nullptr, nullptr);
+        }
+    } detach_guard{db};
+
     // Create table in _sqlpipe_stage.
     std::string prefixed = create_sql;
     auto pos = prefixed.find("CREATE TABLE ");
@@ -1143,7 +1198,6 @@ Changeset build_insert_patchset(
     sqlite3_session* raw = nullptr;
     int rc = sqlite3session_create(db, "_sqlpipe_stage", &raw);
     if (rc != SQLITE_OK) {
-        exec(db, "DETACH _sqlpipe_stage");
         throw Error(ErrorCode::SqliteError,
                     std::string("session_create: ") + sqlite3_errmsg(db));
     }
@@ -1151,7 +1205,6 @@ Changeset build_insert_patchset(
 
     rc = sqlite3session_attach(raw, table.c_str());
     if (rc != SQLITE_OK) {
-        exec(db, "DETACH _sqlpipe_stage");
         throw Error(ErrorCode::SqliteError,
                     std::string("session_attach: ") + sqlite3_errmsg(db));
     }
@@ -1172,7 +1225,6 @@ Changeset build_insert_patchset(
     void* p = nullptr;
     rc = sqlite3session_patchset(raw, &n, &p);
     if (rc != SQLITE_OK) {
-        exec(db, "DETACH _sqlpipe_stage");
         throw Error(ErrorCode::SqliteError,
                     std::string("session_patchset: ") + sqlite3_errmsg(db));
     }
@@ -1184,10 +1236,10 @@ Changeset build_insert_patchset(
     }
     sqlite3_free(p);
 
-    // Cleanup.
+    // Cleanup. Free the session, then drop the staged table; DetachGuard
+    // detaches _sqlpipe_stage on return.
     session = SessionGuard{};  // delete before detach
     exec(db, ("DROP TABLE _sqlpipe_stage.\"" + table + "\"").c_str());
-    exec(db, "DETACH _sqlpipe_stage");
 
     return cs;
 }
@@ -1397,7 +1449,17 @@ struct Master::Impl {
     }
 
     void auto_flush() {
+        // flush_pending is one-shot: consume it on entry so a later statement
+        // that does not commit never re-triggers a flush (F2). in_auto_flush
+        // is reset on every exit path — including exceptions from on_flush or
+        // write_seq — so a transient failure cannot permanently disarm the
+        // commit hook (F12).
+        flush_pending = false;
         in_auto_flush = true;
+        struct ResetGuard {
+            Impl* self;
+            ~ResetGuard() { self->in_auto_flush = false; }
+        } reset_guard{this};
 
         // Check for schema changes.
         auto sv = detail::compute_schema_fingerprint(db, filter());
@@ -1422,8 +1484,6 @@ struct Master::Impl {
                 tagged(Message{ChangesetMsg{seq, std::move(cs)}})};
             config.on_flush(msgs);
         }
-
-        in_auto_flush = false;
     }
 
     void init() {
@@ -1658,10 +1718,20 @@ struct Master::Impl {
         std::unordered_map<BucketKey, std::uint64_t, BucketKeyHash>
             my_bucket_map;
         std::unordered_set<BucketKey, BucketKeyHash> my_bucket_keys;
+        // Track each bucket's transmitted inclusive upper bound (bucket_hi),
+        // taking the max across both sides, so a differing bucket is diffed
+        // across its full span even when the two sides use a different
+        // bucket_size (F3).
+        std::unordered_map<BucketKey, std::int64_t, BucketKeyHash> hi_map;
+        auto record_hi = [&](const BucketKey& k, std::int64_t hi) {
+            auto it = hi_map.find(k);
+            if (it == hi_map.end() || hi > it->second) hi_map[k] = hi;
+        };
         for (const auto& b : my_buckets) {
             BucketKey key{b.table, b.bucket_lo};
             my_bucket_map[key] = b.hash;
             my_bucket_keys.insert(key);
+            record_hi(key, b.bucket_hi);
         }
 
         // Build lookup for replica's buckets.
@@ -1672,6 +1742,7 @@ struct Master::Impl {
             BucketKey key{b.table, b.bucket_lo};
             their_bucket_map[key] = b.hash;
             their_bucket_keys.insert(key);
+            record_hi(key, b.bucket_hi);
         }
 
         // Find mismatched buckets.
@@ -1695,8 +1766,12 @@ struct Master::Impl {
             }
 
             if (differs) {
-                // Find the hi bound from whichever side has it.
+                // Use the widest transmitted upper bound for this bucket so a
+                // bucket_size mismatch never leaves part of a bucket un-diffed;
+                // fall back to our own bucket span if unknown (F3).
                 std::int64_t hi = key.lo + config.bucket_size - 1;
+                auto hi_it = hi_map.find(key);
+                if (hi_it != hi_map.end()) hi = std::max(hi, hi_it->second);
                 need.ranges.push_back(
                     NeedBucketRange{key.table, key.lo, hi});
             }
@@ -1864,7 +1939,12 @@ Master& Master::operator=(Master&&) noexcept = default;
 
 void Master::exec(const std::string& sql) {
     detail::exec(impl_->db, sql.c_str());
-    if (impl_->config.on_flush && impl_->flush_pending) {
+    // Auto-flush only after a real commit: flush_pending was set by the commit
+    // hook (which fires on COMMIT, not ROLLBACK), and the connection must be
+    // back in autocommit mode so we never flush uncommitted rows mid-transaction
+    // (F2).
+    if (impl_->config.on_flush && impl_->flush_pending &&
+        sqlite3_get_autocommit(impl_->db)) {
         impl_->auto_flush();
     }
 }
@@ -4599,6 +4679,12 @@ struct Replica::Impl {
     void init() {
         detail::ensure_meta_table(db);
         seq = detail::read_seq(db, config.seq_key);
+        // Validate tracked tables up front so an unsupported table (WITHOUT
+        // ROWID, or a non-INTEGER-PRIMARY-KEY that rowid-keyed diff sync cannot
+        // handle safely) is rejected at construction rather than mid-handshake
+        // (F1).
+        detail::get_tracked_tables(db, filter(),
+            config.on_log ? &config.on_log : nullptr);
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "replica initialized at seq={}", seq);
     }
 
@@ -4777,6 +4863,25 @@ struct Replica::Impl {
             detail::exec(db, "PRAGMA foreign_keys = OFF");
         }
 
+        // Roll back the transaction and restore foreign_keys on any failure
+        // between BEGIN and COMMIT (delete loop, write_seq, etc.) so an
+        // exception never leaves the caller's connection with an open
+        // transaction and FK enforcement disabled (F7).
+        bool committed = false;
+        struct TxGuard {
+            sqlite3* db;
+            bool fk_was_on;
+            bool* committed;
+            ~TxGuard() {
+                if (*committed) return;
+                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                if (fk_was_on) {
+                    sqlite3_exec(db, "PRAGMA foreign_keys = ON",
+                                 nullptr, nullptr, nullptr);
+                }
+            }
+        } tx_guard{db, fk_was_on, &committed};
+
         detail::exec(db, "BEGIN");
 
         report(DiffPhase::ApplyingPatchset, {},
@@ -4796,8 +4901,7 @@ struct Replica::Impl {
                 nullptr);
 
             if (rc != SQLITE_OK) {
-                detail::exec(db, "ROLLBACK");
-                if (fk_was_on) detail::exec(db, "PRAGMA foreign_keys = ON");
+                // TxGuard rolls back and restores foreign_keys.
                 throw Error(ErrorCode::SqliteError,
                             std::string("diff patchset apply: ") +
                             sqlite3_errmsg(db));
@@ -4842,6 +4946,7 @@ struct Replica::Impl {
         detail::write_seq(db, seq, config.seq_key);
 
         detail::exec(db, "COMMIT");
+        committed = true;
 
         if (fk_was_on) {
             detail::exec(db, "PRAGMA foreign_keys = ON");
