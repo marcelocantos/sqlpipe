@@ -145,12 +145,18 @@ cp go/sqlpipe/sqlpipe_capi.{h,cpp} go/sqlpipe/internal/c/
 # vendor deepparser sources so consumers don't need to fetch them.
 if [ -d "$DEEPPARSER_SUB/src" ]; then
     dp_files=(arena.c arena.h liteparser.c liteparser.h liteparser_internal.h lp_lempar.c lp_tokenize.c lp_unparse.c parse.c parse.h)
-    mkdir -p go/sqlpipe/internal/c/deepparser
-    for f in "${dp_files[@]}"; do
-        cp "$DEEPPARSER_SUB/src/$f" go/sqlpipe/internal/c/deepparser/
+    # Both the Go and Swift wrappers compile the bundled sqlpipe.cpp, which
+    # parses via deepparser; each must vendor the deepparser sources so
+    # consumers don't need to fetch them. (The Swift package excludes
+    # lp_lempar.c from compilation via Package.swift — it is a lemon template.)
+    for dest in go/sqlpipe/internal/c/deepparser swift/Sources/CSqlpipe/deepparser; do
+        mkdir -p "$dest"
+        for f in "${dp_files[@]}"; do
+            cp "$DEEPPARSER_SUB/src/$f" "$dest/"
+        done
     done
-    echo "Copied deepparser sources to Go wrapper ($(cd "$DEEPPARSER_SUB" && git describe --tags --always))"
+    echo "Copied deepparser sources to Go and Swift wrappers ($(cd "$DEEPPARSER_SUB" && git describe --tags --always))"
 else
-    echo "Warning: $DEEPPARSER_SUB not found — Go wrapper deepparser sources not refreshed" >&2
+    echo "Warning: $DEEPPARSER_SUB not found — wrapper deepparser sources not refreshed" >&2
 fi
 echo "Copied to Go and Swift wrappers"

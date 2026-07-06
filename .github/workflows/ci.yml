@@ -46,6 +46,19 @@ jobs:
       - name: Go test
         run: cd go/sqlpipe && go test ./...
 
+  swift:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # Builds the Swift package (CSqlpipe compiles the bundled sqlpipe.cpp +
+      # vendored deepparser). Not covered by `cv test`, so a vendoring gap here
+      # cannot ship silently.
+      - name: Swift build
+        run: cd swift && swift build
+
   wasm:
     runs-on: ubuntu-latest
     steps:
