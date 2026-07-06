@@ -134,6 +134,12 @@ cp dist/sqlpipe.{h,cpp} go/sqlpipe/internal/c/
 cp dist/sqlpipe.{h,cpp} swift/Sources/CSqlpipe/
 cp dist/sqlpipe.h swift/Sources/CSqlpipe/include/
 
+# The Go module vendors a copy of the C-API shim under internal/c/ as well as
+# the top-level go/sqlpipe/ copy: the cgo-generated prolog resolves
+# #include "sqlpipe_capi.h" via -I internal/c, so a stale copy there silently
+# feeds cgo the wrong prototypes. Keep it in lockstep with the source of truth.
+cp go/sqlpipe/sqlpipe_capi.{h,cpp} go/sqlpipe/internal/c/
+
 # ── 6. Sync deepparser sources to wrappers ────────────────────
 # The bundled sqldeep parses input via deepparser. Wrappers must
 # vendor deepparser sources so consumers don't need to fetch them.

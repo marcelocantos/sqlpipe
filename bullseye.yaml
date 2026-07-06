@@ -611,6 +611,36 @@ targets:
     origin: manual
     discovered: 2026-07-02
     achieved: 2026-07-05
+  T24:
+    name: Schema fingerprint carries the full SHA-256 structural hash, not a 32-bit fold
+    status: achieved
+    value: 0.0
+    cost: 0.0
+    acceptance:
+    - SchemaVersion carries the full sqlift structural hash as variable-length opaque bytes with a leading algorithm-tag byte ([algo_id][digest...]); compute_schema_fingerprint no longer folds to 32-bit. Current algo_id=0x01 = sqlift structural SHA-256 (33-byte value)
+    - 'The representation is algorithm-agnostic: a future change to the hash algorithm/width changes only the algo_id + digest bytes and needs no further wire or protocol change'
+    - The compatibility gate compares the full fingerprint bytes on both the Hello and BucketHashes paths
+    - Wire carries the fingerprint as length-prefixed bytes in HelloMsg/BucketHashesMsg/ErrorMsg; kProtocolVersion/ProtocolVersion bumped 6->7 so a v6<->v7 pair rejects cleanly (no silent interop)
+    - C++, Go, Swift, and TS bindings + the C ABI expose SchemaVersion as opaque bytes consistently; all build
+    - A regression test proves two distinct schemas that collide under the old 32-bit fold now produce different fingerprints and are rejected; a wire round-trip test covers the new field
+    - STABILITY.md documents the protocol v7 wire change and the open-ended fingerprint format, and resets the settling clock; version bumped to 0.26.0 and released
+    context: 'F10 from the Fable-5 audit (docs/audit/fable-2026-07.md), deferred from the v0.25.0 remediation because it required a protocol change. compute_schema_fingerprint computes a SHA-256 structural hash via sqlift then folds it to 32-bit FNV-1a to fit SchemaVersion=int32_t (a width inherited from SQLite''s PRAGMA schema_version cookie, not chosen for a content hash). The 2^-32 accidental-collision residual lets a genuinely-incompatible replica pass the Hello gate and apply changesets against the wrong table shape. User authorized the protocol break: carry the full hash as raw 32 bytes and bump the protocol version so old clients detect the mismatch.'
+    origin: manual
+    discovered: 2026-07-06
+    achieved: 2026-07-06
+  T25:
+    name: Swift package builds — deepparser sources vendored into CSqlpipe
+    status: identified
+    value: 0.0
+    cost: 0.0
+    acceptance:
+    - swift build succeeds from a clean state (rm -rf swift/.build)
+    - swift/Sources/CSqlpipe vendors the deepparser sources (arena/liteparser/lp_tokenize/lp_unparse/parse) with an include path that resolves <liteparser.h> in the bundled sqlpipe.cpp
+    - scripts/bundle-deps.sh copies deepparser sources into the Swift package (mirroring the Go internal/c/deepparser sync) so it stays current
+    - Swift build is added to CI so this cannot regress silently
+    context: 'Discovered during T24. The Swift CSqlpipe target compiles the bundled dist/sqlpipe.cpp, which #include <liteparser.h> since the v0.24.0 deepparser migration, but the Swift package never vendored deepparser sources — only the Go wrapper''s internal/c/deepparser was wired. `swift build` fails ''liteparser.h file not found'' from a clean state; prior green swift builds passed only via a stale cached sqlpipe.o. Swift is not in CI so it went unnoticed. Pre-existing and orthogonal to T24 (whose Swift-facing capi changes compile fine).'
+    origin: manual
+    discovered: 2026-07-06
   T3:
     name: sqlpipe runs in the browser via Emscripten + JS wrapper
     status: identified

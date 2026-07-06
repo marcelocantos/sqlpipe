@@ -28,10 +28,12 @@ func goProgressTrampoline(handle C.uintptr_t, phase C.uint8_t, table *C.char, do
 }
 
 //export goSchemaMismatchTrampoline
-func goSchemaMismatchTrampoline(handle C.uintptr_t, remoteSV C.int32_t, localSV C.int32_t, remoteSQL *C.char) C.int {
+func goSchemaMismatchTrampoline(handle C.uintptr_t, remoteSV *C.uint8_t, remoteSVLen C.size_t, localSV *C.uint8_t, localSVLen C.size_t, remoteSQL *C.char) C.int {
 	h := cgo.Handle(handle)
 	fn := h.Value().(SchemaMismatchCallback)
-	if fn(SchemaVersion(remoteSV), SchemaVersion(localSV), C.GoString(remoteSQL)) {
+	remote := SchemaVersion(C.GoBytes(unsafe.Pointer(remoteSV), C.int(remoteSVLen)))
+	local := SchemaVersion(C.GoBytes(unsafe.Pointer(localSV), C.int(localSVLen)))
+	if fn(remote, local, C.GoString(remoteSQL)) {
 		return 1
 	}
 	return 0

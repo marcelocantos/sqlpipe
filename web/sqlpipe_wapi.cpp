@@ -60,7 +60,9 @@ typedef void (*sqlpipe_progress_fn)(
     int64_t done, int64_t total);
 
 typedef int (*sqlpipe_schema_mismatch_fn)(
-    int ctx, int32_t remote_sv, int32_t local_sv,
+    int ctx,
+    const uint8_t* remote_sv, size_t remote_sv_len,
+    const uint8_t* local_sv, size_t local_sv_len,
     const char* remote_schema_sql);
 
 typedef uint8_t (*sqlpipe_conflict_fn)(
@@ -250,9 +252,10 @@ sqlpipe::MasterConfig to_master_config(
         auto fn = on_schema_mismatch;
         auto ctx = schema_mismatch_ctx;
         mc.on_schema_mismatch = [fn, ctx](
-            sqlpipe::SchemaVersion rsv, sqlpipe::SchemaVersion lsv,
+            const sqlpipe::SchemaVersion& rsv, const sqlpipe::SchemaVersion& lsv,
             const std::string& rsql) -> bool {
-            return fn(ctx, rsv, lsv, rsql.c_str()) != 0;
+            return fn(ctx, rsv.data(), rsv.size(), lsv.data(), lsv.size(),
+                      rsql.c_str()) != 0;
         };
     }
     if (on_log) {
@@ -307,9 +310,10 @@ sqlpipe::ReplicaConfig to_replica_config(
         auto fn = on_schema_mismatch;
         auto ctx = schema_mismatch_ctx;
         rc.on_schema_mismatch = [fn, ctx](
-            sqlpipe::SchemaVersion rsv, sqlpipe::SchemaVersion lsv,
+            const sqlpipe::SchemaVersion& rsv, const sqlpipe::SchemaVersion& lsv,
             const std::string& rsql) -> bool {
-            return fn(ctx, rsv, lsv, rsql.c_str()) != 0;
+            return fn(ctx, rsv.data(), rsv.size(), lsv.data(), lsv.size(),
+                      rsql.c_str()) != 0;
         };
     }
     if (on_log) {
@@ -376,9 +380,10 @@ sqlpipe::PeerConfig to_peer_config(
         auto fn = on_schema_mismatch;
         auto ctx = schema_mismatch_ctx;
         pc.on_schema_mismatch = [fn, ctx](
-            sqlpipe::SchemaVersion rsv, sqlpipe::SchemaVersion lsv,
+            const sqlpipe::SchemaVersion& rsv, const sqlpipe::SchemaVersion& lsv,
             const std::string& rsql) -> bool {
-            return fn(ctx, rsv, lsv, rsql.c_str()) != 0;
+            return fn(ctx, rsv.data(), rsv.size(), lsv.data(), lsv.size(),
+                      rsql.c_str()) != 0;
         };
     }
     if (on_log) {
@@ -570,8 +575,8 @@ int64_t sqlpipe_master_current_seq(sqlpipe_master* m) {
 }
 
 EMSCRIPTEN_KEEPALIVE
-int32_t sqlpipe_master_schema_version(sqlpipe_master* m) {
-    return m->impl.schema_version();
+void sqlpipe_master_schema_version(sqlpipe_master* m, sqlpipe_buf* out) {
+    *out = to_buf(Buf(m->impl.schema_version()));
 }
 
 // ── Replica ─────────────────────────────────────────────────────
@@ -675,8 +680,8 @@ int64_t sqlpipe_replica_current_seq(sqlpipe_replica* r) {
 }
 
 EMSCRIPTEN_KEEPALIVE
-int32_t sqlpipe_replica_schema_version(sqlpipe_replica* r) {
-    return r->impl.schema_version();
+void sqlpipe_replica_schema_version(sqlpipe_replica* r, sqlpipe_buf* out) {
+    *out = to_buf(Buf(r->impl.schema_version()));
 }
 
 // ── Peer ────────────────────────────────────────────────────────

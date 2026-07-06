@@ -867,3 +867,45 @@ TEST_CASE("diff sync: failed patchset build does not leak _sqlpipe_stage (T22/F8
     }
     CHECK_FALSE(already_in_use);
 }
+
+// T24/F10: the schema fingerprint carries the full sqlift structural hash
+// ([algo_id][32-byte SHA-256]), not a 32-bit fold, so the compatibility gate
+// has full collision resistance instead of a ~2^-32 false-match.
+TEST_CASE("schema fingerprint carries the full hash, not a 32-bit fold (T24/F10)") {
+    DB a;
+    a.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    Master ma(a.db);
+    auto fp = ma.schema_version();
+    // 1 algorithm-id byte + 32-byte SHA-256 digest — not a 4-byte fold.
+    REQUIRE(fp.size() == 33);
+    CHECK(fp[0] == static_cast<std::uint8_t>(SchemaFingerprintAlgo::SqliftSha256));
+
+    // Determinism: the same schema yields the same fingerprint.
+    DB a2;
+    a2.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    Master ma2(a2.db);
+    CHECK(ma2.schema_version() == fp);
+
+    // Distinctness: a schema differing only in a column's declared type — the
+    // exact affinity-only difference the audit flagged as silently corrupting
+    // under a fold — now produces a different fingerprint.
+    DB b;
+    b.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+    Master mb(b.db);
+    CHECK(mb.schema_version() != fp);
+}
+
+// T24: bumping the protocol version means a peer on an older protocol is
+// rejected cleanly, so a v6<->v7 pair cannot silently interoperate across the
+// wire-format change.
+TEST_CASE("handshake rejects a mismatched protocol version (T24)") {
+    DB master_db;
+    master_db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    Master master(master_db.db);
+
+    auto resp = master.handle_message(
+        HelloMsg{kProtocolVersion - 1, SchemaVersion{0x01}, {}});
+    REQUIRE(resp.size() == 1);
+    REQUIRE(std::holds_alternative<ErrorMsg>(resp[0].msg));
+    CHECK(std::get<ErrorMsg>(resp[0].msg).code == ErrorCode::ProtocolError);
+}

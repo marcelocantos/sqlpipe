@@ -26,35 +26,32 @@ API surface complexity:
 
 The clock starts from the last breaking change to the interaction surface.
 
-Current surface: ~107 items → 3 months. Last breaking change: v0.25.0
-(Fable-5 audit remediation. The one surface-affecting change: tables whose
-primary key is not a single INTEGER PRIMARY KEY rowid alias — a composite PK,
-or a single non-`INTEGER`-typed PK such as `TEXT` — are now rejected at
-Master/Replica construction with `ErrorCode::WithoutRowidTable`, instead of
-being tracked and silently diverging/losing rows during rowid-keyed diff sync.
-Previously such tables were accepted; code that relied on tracking them now
-fails closed. The other eight fixes are internal-robustness hardening with no
-surface change: `deserialize` now rejects an oversized decompressed changeset
-length and an out-of-range row-hash run count as `ProtocolError` instead of
-over-allocating; `handle_diff_ready` rolls back and restores `foreign_keys` on
-a failed delete; `build_insert_patchset` never leaks the `_sqlpipe_stage`
-attachment; auto-flush no longer streams uncommitted/rolled-back rows; diff
-sync honours a transmitted `bucket_hi` under a `bucket_size` mismatch; the Wasm
-FFI shim compiles again; and FFI buffer allocation surfaces a clean error
-instead of crashing on OOM. 2026-07-05).
-Eligible: 2026-10-05.
+Current surface: ~107 items → 3 months. Last breaking change: v0.26.0
+(Schema fingerprint widened to the full sqlift structural hash. `SchemaVersion`
+changes from `std::int32_t` to opaque variable-length bytes
+(`std::vector<std::uint8_t>`) of the form `[algorithm-id][digest]` — previously
+the SHA-256 structural hash was folded to 32-bit FNV-1a, leaving a ~2^-32
+false-match in the compatibility gate. The wire now carries the fingerprint as
+length-prefixed bytes in HelloMsg/BucketHashesMsg/ErrorMsg, and `kProtocolVersion`
+/ `ProtocolVersion` bump 6→7 so a v6↔v7 pair rejects cleanly rather than
+mis-parsing. `SchemaMismatchCallback`, `Master`/`Replica::schema_version()`, the
+Go/Swift/TS `SchemaVersion` types, and the C ABI (`sqlpipe_*_schema_version`,
+`sqlpipe_schema_mismatch_fn`) all change to opaque bytes. The representation is
+algorithm-agnostic: a future hash change bumps the algorithm-id + digest and
+needs no further wire or protocol change. 2026-07-06).
+Eligible: 2026-10-06.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.25.0. Items annotated with stability assessments.
+Snapshot as of v0.26.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.25.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.26.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `25` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `26` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 | `SQLDEEP_VERSION` | `"0.23.0"` | **Stable** (bundled) |
 | `SQLIFT_VERSION` | `"0.14.0"` | **Stable** (bundled) |
@@ -64,14 +61,14 @@ Snapshot as of v0.25.0. Items annotated with stability assessments.
 | Name | Definition | Stability |
 |---|---|---|
 | `Seq` | `std::int64_t` | **Stable** |
-| `SchemaVersion` | `std::int32_t` | **Stable** |
+| `SchemaVersion` | `std::vector<std::uint8_t>` (opaque `[algo-id][digest]` fingerprint) | **Fluid** (was `std::int32_t` through v0.25.0; widened to the full structural hash in v0.26.0) |
 | `Changeset` | `std::vector<std::uint8_t>` | **Stable** |
 | `Value` | `std::variant<monostate, int64_t, double, string, vector<uint8_t>>` | **Stable** |
 | `SubscriptionId` | `std::uint64_t` | **Stable** |
 | `ConflictCallback` | `std::function<ConflictAction(ConflictType, const ChangeEvent&)>` | **Stable** |
 | `ProgressCallback` | `std::function<void(const DiffProgress&)>` | **Stable** |
 | `LogCallback` | `std::function<void(LogLevel, std::string_view)>` | **Stable** |
-| `SchemaMismatchCallback` | `std::function<bool(SchemaVersion remote, SchemaVersion local, const std::string& remote_schema_sql)>` | **Stable** |
+| `SchemaMismatchCallback` | `std::function<bool(const SchemaVersion& remote, const SchemaVersion& local, const std::string& remote_schema_sql)>` | **Fluid** (fingerprints became opaque bytes, passed by const-ref, in v0.26.0) |
 | `ApproveOwnershipCallback` | `std::function<bool(const std::set<std::string>&)>` | **Stable** |
 | `FlushCallback` | `std::function<void(const std::vector<OutMessage>&)>` | **Fluid** (took `Message` v0.17.0–v0.23.0; restored `OutMessage` in v0.24.0) |
 | `SinkCallback` | `std::function<void(const OutMessage&)>` | **Fluid** (took `Message` v0.17.0–v0.23.0; restored `OutMessage` in v0.24.0) |
@@ -139,7 +136,7 @@ Snapshot as of v0.25.0. Items annotated with stability assessments.
 
 | Name | Value | Stability |
 |---|---|---|
-| `kProtocolVersion` | `6` | **Stable** (will increment with breaking wire changes) |
+| `kProtocolVersion` | `7` | **Stable** (increments with breaking wire changes; 6→7 in v0.26.0 for the widened schema fingerprint) |
 | `kDefaultBucketSize` | `1024` | **Stable** |
 | `kMaxMessageSize` | `64 * 1024 * 1024` (64 MB) | **Stable** |
 | `kMaxArrayCount` | `10'000'000` (10 M) | **Stable** |

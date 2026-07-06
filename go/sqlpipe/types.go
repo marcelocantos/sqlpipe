@@ -4,17 +4,20 @@
 package sqlpipe
 
 const (
-	Version      = "0.25.0"
+	Version      = "0.26.0"
 	VersionMajor = 0
-	VersionMinor = 25
+	VersionMinor = 26
 	VersionPatch = 0
 )
 
 // Seq is a monotonically increasing sequence number for changesets.
 type Seq int64
 
-// SchemaVersion is an FNV-1a fingerprint of the sorted CREATE TABLE SQL.
-type SchemaVersion int32
+// SchemaVersion is a structural schema fingerprint: opaque, variable-length
+// bytes of the form [algorithm-id byte][digest...]. Compare with bytes.Equal.
+// The representation is algorithm-agnostic, so a future hash change needs no
+// wire or protocol change.
+type SchemaVersion []byte
 
 // Changeset holds a raw SQLite changeset blob.
 type Changeset []byte
@@ -169,7 +172,7 @@ type FlushCallback func(messages []OutMessage)
 
 // Protocol constants.
 const (
-	ProtocolVersion = 6
+	ProtocolVersion = 7
 	DefaultBucketSize int64  = 1024
 	MaxMessageSize    uint32 = 64 * 1024 * 1024
 	MaxArrayCount     uint32 = 10_000_000

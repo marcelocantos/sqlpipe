@@ -45,9 +45,12 @@ function registerSchemaMismatchCb(
 ): number {
   if (!cb) return 0;
   const ptr = M.addFunction(
-    (ctx: number, rsv: number, lsv: number, rsqlPtr: number) => {
-      return cb(rsv, lsv, M.UTF8ToString(rsqlPtr)) ? 1 : 0;
-    }, 'iiiii');
+    (ctx: number, rsvPtr: number, rsvLen: number,
+     lsvPtr: number, lsvLen: number, rsqlPtr: number) => {
+      const remote = M.HEAPU8.slice(rsvPtr, rsvPtr + rsvLen);
+      const local = M.HEAPU8.slice(lsvPtr, lsvPtr + lsvLen);
+      return cb(remote, local, M.UTF8ToString(rsqlPtr)) ? 1 : 0;
+    }, 'iiiiiii');
   fns.push(ptr);
   return ptr;
 }
@@ -255,8 +258,9 @@ export class Master {
     return this.M._sqlpipe_master_current_seq(this.ptr);
   }
 
-  get schemaVersion(): number {
-    return this.M._sqlpipe_master_schema_version(this.ptr);
+  get schemaVersion(): Uint8Array {
+    this.M._sqlpipe_master_schema_version(this.ptr, this.bufPtr);
+    return readBuf(this.M, this.bufPtr);
   }
 
   close(): void {
@@ -369,8 +373,9 @@ export class Replica {
     return this.M._sqlpipe_replica_current_seq(this.ptr);
   }
 
-  get schemaVersion(): number {
-    return this.M._sqlpipe_replica_schema_version(this.ptr);
+  get schemaVersion(): Uint8Array {
+    this.M._sqlpipe_replica_schema_version(this.ptr, this.bufPtr);
+    return readBuf(this.M, this.bufPtr);
   }
 
   close(): void {

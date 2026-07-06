@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#define SQLPIPE_VERSION       "0.25.0"
+#define SQLPIPE_VERSION       "0.26.0"
 #define SQLPIPE_VERSION_MAJOR 0
-#define SQLPIPE_VERSION_MINOR 25
+#define SQLPIPE_VERSION_MINOR 26
 #define SQLPIPE_VERSION_PATCH 0
 
 // ── Bundled: sqldeep (query transpiler) ─────────────────────────
@@ -176,8 +176,20 @@ inline void* checked_malloc(std::size_t n) {
 /// Monotonically increasing sequence number for changesets.
 using Seq = std::int64_t;
 
-/// Schema version tracked by PRAGMA schema_version.
-using SchemaVersion = std::int32_t;
+/// Structural schema fingerprint used to gate replication compatibility.
+///
+/// Opaque, variable-length bytes: a leading algorithm-id byte followed by the
+/// raw digest — `[algo_id][digest...]`. Comparison is byte-wise equality. The
+/// representation is deliberately algorithm-agnostic: changing the hash
+/// algorithm or digest width later changes only the algo id and digest bytes
+/// and needs no further wire or protocol change (mismatched fingerprints simply
+/// compare unequal, which fails the compatibility gate cleanly).
+using SchemaVersion = std::vector<std::uint8_t>;
+
+/// Algorithm ids for the leading byte of a SchemaVersion fingerprint.
+enum class SchemaFingerprintAlgo : std::uint8_t {
+    SqliftSha256 = 0x01,  ///< sqlift structural hash, SHA-256 digest (32 bytes).
+};
 
 /// A byte buffer holding a raw SQLite changeset blob.
 using Changeset = std::vector<std::uint8_t>;
@@ -300,7 +312,7 @@ using LogCallback = std::function<void(LogLevel level, std::string_view message)
 /// Return true to recompute fingerprints and retry; false to proceed
 /// with the default behaviour (ErrorMsg on master, Error state on replica).
 using SchemaMismatchCallback = std::function<bool(
-    SchemaVersion remote_sv, SchemaVersion local_sv,
+    const SchemaVersion& remote_sv, const SchemaVersion& local_sv,
     const std::string& remote_schema_sql)>;
 
 /// Execute a one-shot SQL query and return the result set.
@@ -480,7 +492,7 @@ private:
 // ── protocol.h ──────────────────────────────────────────────────
 namespace sqlpipe {
 
-inline constexpr std::uint32_t kProtocolVersion = 6;
+inline constexpr std::uint32_t kProtocolVersion = 7;
 
 // ── Message types ───────────────────────────────────────────────────
 
@@ -509,12 +521,12 @@ struct AckMsg {
 struct ErrorMsg {
     ErrorCode     code{};                      ///< Machine-readable error category.
     std::string   detail;                      ///< Human-readable description.
-    SchemaVersion remote_schema_version = 0;   ///< Remote fingerprint (SchemaMismatch only).
+    SchemaVersion remote_schema_version;       ///< Remote fingerprint (SchemaMismatch only; empty otherwise).
     std::string   remote_schema_sql;           ///< Remote CREATE TABLE SQL (SchemaMismatch only).
 
     ErrorMsg() = default;
     ErrorMsg(ErrorCode c, std::string d,
-             SchemaVersion rsv = 0, std::string rsql = {})
+             SchemaVersion rsv = {}, std::string rsql = {})
         : code(c), detail(std::move(d)),
           remote_schema_version(rsv), remote_schema_sql(std::move(rsql)) {}
 };
@@ -536,7 +548,7 @@ struct BucketHashesMsg {
     std::vector<BucketHashEntry> buckets;
     Seq                last_seq = -1;           ///< Sender's last applied seq (-1 = unknown).
     std::uint32_t      protocol_version = 0;    ///< Sender's protocol version (0 = legacy).
-    SchemaVersion      schema_version = 0;      ///< Sender's schema fingerprint (0 = legacy).
+    SchemaVersion      schema_version;          ///< Sender's schema fingerprint (empty = legacy).
 };
 
 /// One bucket range the master needs row-level detail for.
