@@ -105,8 +105,9 @@ TEST_CASE("master: schema mismatch returns ErrorMsg") {
     d.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
     Master m(d.db);
 
-    // Send a hello with wrong schema version.
-    auto msgs = m.handle_message(HelloMsg{kProtocolVersion, 99999, {}});
+    // Send a hello with a wrong schema fingerprint.
+    auto msgs = m.handle_message(
+        HelloMsg{kProtocolVersion, SchemaVersion{0xde, 0xad, 0xbe, 0xef}, {}});
 
     REQUIRE(msgs.size() == 1);
     CHECK(std::holds_alternative<ErrorMsg>(msgs[0].msg));

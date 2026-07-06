@@ -504,7 +504,7 @@ TEST_CASE("integration: replica schema migration hook resolves mismatch") {
     Master master(master_db.db);
 
     bool callback_called = false;
-    SchemaVersion received_remote_sv = 0;
+    SchemaVersion received_remote_sv;
     std::string received_remote_sql;
     ReplicaConfig rc;
     rc.on_schema_mismatch = [&](SchemaVersion remote_sv, SchemaVersion,

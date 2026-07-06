@@ -6,12 +6,12 @@
 using namespace sqlpipe;
 
 TEST_CASE("HelloMsg round-trip") {
-    HelloMsg orig{kProtocolVersion, 3, {}};
+    HelloMsg orig{kProtocolVersion, SchemaVersion{0x01, 0x03}, {}};
     auto buf = serialize(Message{orig});
     auto msg = deserialize(buf);
     auto& m = std::get<HelloMsg>(msg);
     CHECK(m.protocol_version == kProtocolVersion);
-    CHECK(m.schema_version == 3);
+    CHECK(m.schema_version == SchemaVersion{0x01, 0x03});
     CHECK(m.owned_tables.empty());
 }
 
@@ -50,14 +50,15 @@ TEST_CASE("AckMsg round-trip") {
 }
 
 TEST_CASE("ErrorMsg round-trip") {
-    ErrorMsg orig(ErrorCode::SchemaMismatch, "schema differs", 42,
+    ErrorMsg orig(ErrorCode::SchemaMismatch, "schema differs",
+                  SchemaVersion{0x01, 0x2a},
                   "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);");
     auto buf = serialize(Message{orig});
     auto msg = deserialize(buf);
     auto& m = std::get<ErrorMsg>(msg);
     CHECK(m.code == ErrorCode::SchemaMismatch);
     CHECK(m.detail == "schema differs");
-    CHECK(m.remote_schema_version == 42);
+    CHECK(m.remote_schema_version == SchemaVersion{0x01, 0x2a});
     CHECK(m.remote_schema_sql ==
           "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);");
 }
@@ -69,7 +70,7 @@ TEST_CASE("ErrorMsg round-trip (non-schema-mismatch defaults)") {
     auto& m = std::get<ErrorMsg>(msg);
     CHECK(m.code == ErrorCode::ProtocolError);
     CHECK(m.detail == "bad version");
-    CHECK(m.remote_schema_version == 0);
+    CHECK(m.remote_schema_version.empty());
     CHECK(m.remote_schema_sql.empty());
 }
 
@@ -169,14 +170,14 @@ TEST_CASE("deserialize rejects truncated buffer") {
 TEST_CASE("HelloMsg with owned_tables round-trip") {
     HelloMsg orig;
     orig.protocol_version = kProtocolVersion;
-    orig.schema_version = 42;
+    orig.schema_version = SchemaVersion{0x01, 0x2a};
     orig.owned_tables = {"drafts", "local_prefs", "settings"};
 
     auto buf = serialize(Message{orig});
     auto msg = deserialize(buf);
     auto& m = std::get<HelloMsg>(msg);
     CHECK(m.protocol_version == kProtocolVersion);
-    CHECK(m.schema_version == 42);
+    CHECK(m.schema_version == SchemaVersion{0x01, 0x2a});
     REQUIRE(m.owned_tables.size() == 3);
     CHECK(m.owned_tables.count("drafts") == 1);
     CHECK(m.owned_tables.count("local_prefs") == 1);
@@ -186,7 +187,7 @@ TEST_CASE("HelloMsg with owned_tables round-trip") {
 TEST_CASE("HelloMsg without owned_tables") {
     HelloMsg orig;
     orig.protocol_version = kProtocolVersion;
-    orig.schema_version = 7;
+    orig.schema_version = SchemaVersion{0x01, 0x07};
     // owned_tables is empty by default.
 
     auto buf = serialize(Message{orig});

@@ -80,6 +80,24 @@ func (r *reader) readString() (string, error) {
 	return s, nil
 }
 
+// readFingerprint reads a length-prefixed schema fingerprint (opaque bytes).
+func (r *reader) readFingerprint() (SchemaVersion, error) {
+	length, err := r.readU32()
+	if err != nil {
+		return nil, err
+	}
+	if length > MaxMessageSize {
+		return nil, errorf(ErrProtocol, "schema fingerprint length exceeds limit")
+	}
+	if err := r.check(int(length)); err != nil {
+		return nil, err
+	}
+	fp := make(SchemaVersion, length)
+	copy(fp, r.data[r.pos:r.pos+int(length)])
+	r.pos += int(length)
+	return fp, nil
+}
+
 func checkCount(n uint32) error {
 	if n > MaxArrayCount {
 		return errorf(ErrProtocol, "array count exceeds limit (%d)", n)
@@ -161,11 +179,11 @@ func deserializeHello(r *reader) (HelloMsg, error) {
 	if err != nil {
 		return HelloMsg{}, err
 	}
-	sv, err := r.readI32()
+	sv, err := r.readFingerprint()
 	if err != nil {
 		return HelloMsg{}, err
 	}
-	m := HelloMsg{ProtocolVersion: pv, SchemaVersion: SchemaVersion(sv), LastSeq: -1}
+	m := HelloMsg{ProtocolVersion: pv, SchemaVersion: sv, LastSeq: -1}
 	count, err := r.readU32()
 	if err != nil {
 		return HelloMsg{}, err
@@ -219,7 +237,7 @@ func deserializeError(r *reader) (ErrorMsg, error) {
 	if err != nil {
 		return ErrorMsg{}, err
 	}
-	rsv, err := r.readI32()
+	rsv, err := r.readFingerprint()
 	if err != nil {
 		return ErrorMsg{}, err
 	}
@@ -230,7 +248,7 @@ func deserializeError(r *reader) (ErrorMsg, error) {
 	return ErrorMsg{
 		Code:                ErrorCode(code),
 		Detail:              detail,
-		RemoteSchemaVersion: SchemaVersion(rsv),
+		RemoteSchemaVersion: rsv,
 		RemoteSchemaSQL:     rsql,
 	}, nil
 }
@@ -244,7 +262,7 @@ func deserializeBucketHashes(r *reader) (BucketHashesMsg, error) {
 	if err != nil {
 		return BucketHashesMsg{}, err
 	}
-	schemaVer, err := r.readI32()
+	schemaVer, err := r.readFingerprint()
 	if err != nil {
 		return BucketHashesMsg{}, err
 	}
@@ -285,7 +303,7 @@ func deserializeBucketHashes(r *reader) (BucketHashesMsg, error) {
 		Buckets:         buckets,
 		LastSeq:         Seq(lastSeq),
 		ProtocolVersion: protoVer,
-		SchemaVersion:   SchemaVersion(schemaVer),
+		SchemaVersion:   schemaVer,
 	}, nil
 }
 

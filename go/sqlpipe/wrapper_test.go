@@ -4,6 +4,7 @@
 package sqlpipe
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -141,7 +142,7 @@ func TestMasterHandleHello(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected HelloMsg, got %T", msgs[0].Msg)
 	}
-	if reply.SchemaVersion != sv {
+	if !bytes.Equal(reply.SchemaVersion, sv) {
 		t.Errorf("reply schema_version = %d, want %d", reply.SchemaVersion, sv)
 	}
 }
@@ -160,7 +161,7 @@ func TestMasterSchemaMismatch(t *testing.T) {
 
 	msgs, err := m.HandleMessage(HelloMsg{
 		ProtocolVersion: ProtocolVersion,
-		SchemaVersion:   99999,
+		SchemaVersion:   SchemaVersion{0xde, 0xad, 0xbe, 0xef},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +192,7 @@ func TestMasterProtocolVersionMismatch(t *testing.T) {
 
 	msgs, err := m.HandleMessage(HelloMsg{
 		ProtocolVersion: 999,
-		SchemaVersion:   0,
+		SchemaVersion:   nil,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -415,7 +416,7 @@ func TestSchemaMismatchCallback(t *testing.T) {
 
 	msgs, err := m.HandleMessage(HelloMsg{
 		ProtocolVersion: ProtocolVersion,
-		SchemaVersion:   99999,
+		SchemaVersion:   SchemaVersion{0xde, 0xad, 0xbe, 0xef},
 	})
 	if err != nil {
 		t.Fatal(err)

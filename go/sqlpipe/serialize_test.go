@@ -4,12 +4,13 @@
 package sqlpipe
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
 
 func TestHelloMsgRoundTrip(t *testing.T) {
-	orig := HelloMsg{ProtocolVersion: ProtocolVersion, SchemaVersion: 3}
+	orig := HelloMsg{ProtocolVersion: ProtocolVersion, SchemaVersion: SchemaVersion{0x01, 0x03}}
 	buf := Serialize(orig)
 	msg, err := Deserialize(buf)
 	if err != nil {
@@ -22,7 +23,7 @@ func TestHelloMsgRoundTrip(t *testing.T) {
 	if m.ProtocolVersion != ProtocolVersion {
 		t.Errorf("protocol_version: got %d, want %d", m.ProtocolVersion, ProtocolVersion)
 	}
-	if m.SchemaVersion != 3 {
+	if !bytes.Equal(m.SchemaVersion, SchemaVersion{0x01, 0x03}) {
 		t.Errorf("schema_version: got %d, want 3", m.SchemaVersion)
 	}
 	if len(m.OwnedTables) != 0 {
@@ -88,7 +89,7 @@ func TestErrorMsgRoundTrip(t *testing.T) {
 	orig := ErrorMsg{
 		Code:                ErrSchemaMismatch,
 		Detail:              "schema differs",
-		RemoteSchemaVersion: 42,
+		RemoteSchemaVersion: SchemaVersion{0x01, 0x2a},
 		RemoteSchemaSQL:     "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);",
 	}
 	buf := Serialize(orig)
@@ -103,7 +104,7 @@ func TestErrorMsgRoundTrip(t *testing.T) {
 	if m.Detail != "schema differs" {
 		t.Errorf("detail: got %q", m.Detail)
 	}
-	if m.RemoteSchemaVersion != 42 {
+	if !bytes.Equal(m.RemoteSchemaVersion, SchemaVersion{0x01, 0x2a}) {
 		t.Errorf("remote_schema_version: got %d, want 42", m.RemoteSchemaVersion)
 	}
 	if m.RemoteSchemaSQL != "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);" {
@@ -122,7 +123,7 @@ func TestErrorMsgRoundTripDefaults(t *testing.T) {
 	if m.Code != ErrProtocol {
 		t.Errorf("code: got %d", m.Code)
 	}
-	if m.RemoteSchemaVersion != 0 {
+	if len(m.RemoteSchemaVersion) != 0 {
 		t.Errorf("remote_schema_version: got %d, want 0", m.RemoteSchemaVersion)
 	}
 	if m.RemoteSchemaSQL != "" {
@@ -272,7 +273,7 @@ func TestDeserializeRejectsTruncated(t *testing.T) {
 func TestHelloMsgWithOwnedTables(t *testing.T) {
 	orig := HelloMsg{
 		ProtocolVersion: ProtocolVersion,
-		SchemaVersion:   42,
+		SchemaVersion:   SchemaVersion{0x01, 0x2a},
 		OwnedTables:     []string{"drafts", "local_prefs", "settings"},
 	}
 	buf := Serialize(orig)
@@ -284,7 +285,7 @@ func TestHelloMsgWithOwnedTables(t *testing.T) {
 	if m.ProtocolVersion != ProtocolVersion {
 		t.Errorf("protocol_version: got %d", m.ProtocolVersion)
 	}
-	if m.SchemaVersion != 42 {
+	if !bytes.Equal(m.SchemaVersion, SchemaVersion{0x01, 0x2a}) {
 		t.Errorf("schema_version: got %d", m.SchemaVersion)
 	}
 	if len(m.OwnedTables) != 3 {
@@ -299,7 +300,7 @@ func TestHelloMsgWithOwnedTables(t *testing.T) {
 }
 
 func TestHelloMsgWithoutOwnedTables(t *testing.T) {
-	orig := HelloMsg{ProtocolVersion: ProtocolVersion, SchemaVersion: 7}
+	orig := HelloMsg{ProtocolVersion: ProtocolVersion, SchemaVersion: SchemaVersion{0x01, 0x07}}
 	buf := Serialize(orig)
 	msg, err := Deserialize(buf)
 	if err != nil {

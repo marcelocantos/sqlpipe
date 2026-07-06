@@ -133,17 +133,14 @@ Buf encode_peer_messages(const std::vector<sqlpipe::PeerOutMessage>& msgs) {
 // Encode HandleResult.
 Buf encode_handle_result(const sqlpipe::HandleResult& hr) {
     Buf b;
-    // Messages.
     put_u32(b, static_cast<uint32_t>(hr.messages.size()));
     for (auto& om : hr.messages) {
         auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
         put_u8(b, static_cast<uint8_t>(om.delivery));
     }
-    // Changes.
     put_u32(b, static_cast<uint32_t>(hr.changes.size()));
     for (auto& ce : hr.changes) encode_change_event(b, ce);
-    // Subscriptions.
     put_u32(b, static_cast<uint32_t>(hr.subscriptions.size()));
     for (auto& qr : hr.subscriptions) encode_query_result(b, qr);
     return b;
@@ -152,17 +149,14 @@ Buf encode_handle_result(const sqlpipe::HandleResult& hr) {
 // Encode PeerHandleResult.
 Buf encode_peer_handle_result(const sqlpipe::PeerHandleResult& phr) {
     Buf b;
-    // Messages.
     put_u32(b, static_cast<uint32_t>(phr.messages.size()));
     for (auto& om : phr.messages) {
         auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
         put_u8(b, static_cast<uint8_t>(om.delivery));
     }
-    // Changes.
     put_u32(b, static_cast<uint32_t>(phr.changes.size()));
     for (auto& ce : phr.changes) encode_change_event(b, ce);
-    // Subscriptions.
     put_u32(b, static_cast<uint32_t>(phr.subscriptions.size()));
     for (auto& qr : phr.subscriptions) encode_query_result(b, qr);
     return b;
@@ -232,9 +226,10 @@ sqlpipe::MasterConfig to_master_config(sqlpipe_master_config cfg) {
         auto fn = cfg.on_schema_mismatch;
         auto ctx = cfg.schema_mismatch_ctx;
         mc.on_schema_mismatch = [fn, ctx](
-            sqlpipe::SchemaVersion rsv, sqlpipe::SchemaVersion lsv,
+            const sqlpipe::SchemaVersion& rsv, const sqlpipe::SchemaVersion& lsv,
             const std::string& rsql) -> bool {
-            return fn(ctx, rsv, lsv, rsql.c_str()) != 0;
+            return fn(ctx, rsv.data(), rsv.size(), lsv.data(), lsv.size(),
+                      rsql.c_str()) != 0;
         };
     }
     if (cfg.on_log) {
@@ -293,9 +288,10 @@ sqlpipe::ReplicaConfig to_replica_config(sqlpipe_replica_config cfg) {
         auto fn = cfg.on_schema_mismatch;
         auto ctx = cfg.schema_mismatch_ctx;
         rc.on_schema_mismatch = [fn, ctx](
-            sqlpipe::SchemaVersion rsv, sqlpipe::SchemaVersion lsv,
+            const sqlpipe::SchemaVersion& rsv, const sqlpipe::SchemaVersion& lsv,
             const std::string& rsql) -> bool {
-            return fn(ctx, rsv, lsv, rsql.c_str()) != 0;
+            return fn(ctx, rsv.data(), rsv.size(), lsv.data(), lsv.size(),
+                      rsql.c_str()) != 0;
         };
     }
     if (cfg.on_log) {
@@ -355,9 +351,10 @@ sqlpipe::PeerConfig to_peer_config(sqlpipe_peer_config cfg) {
         auto fn = cfg.on_schema_mismatch;
         auto ctx = cfg.schema_mismatch_ctx;
         pc.on_schema_mismatch = [fn, ctx](
-            sqlpipe::SchemaVersion rsv, sqlpipe::SchemaVersion lsv,
+            const sqlpipe::SchemaVersion& rsv, const sqlpipe::SchemaVersion& lsv,
             const std::string& rsql) -> bool {
-            return fn(ctx, rsv, lsv, rsql.c_str()) != 0;
+            return fn(ctx, rsv.data(), rsv.size(), lsv.data(), lsv.size(),
+                      rsql.c_str()) != 0;
         };
     }
     if (cfg.on_log) {
@@ -456,8 +453,8 @@ int64_t sqlpipe_master_current_seq(sqlpipe_master* m) {
     return m->impl.current_seq();
 }
 
-int32_t sqlpipe_master_schema_version(sqlpipe_master* m) {
-    return m->impl.schema_version();
+sqlpipe_buf sqlpipe_master_schema_version(sqlpipe_master* m) {
+    return to_buf(Buf(m->impl.schema_version()));
 }
 
 // ── Replica ─────────────────────────────────────────────────────
@@ -534,6 +531,24 @@ sqlpipe_error sqlpipe_replica_unsubscribe(sqlpipe_replica* r, uint64_t id) {
       catch (const std::exception& e) { return make_error(1, e.what()); }
 }
 
+sqlpipe_error sqlpipe_replica_converge(sqlpipe_replica* r, sqlpipe_buf* out) {
+    try {
+        auto msgs = r->impl.converge();
+        // Encode the same way as Hello: single message + delivery byte.
+        // converge() always returns exactly one BucketHashesMsg.
+        if (msgs.empty()) {
+            *out = {nullptr, 0};
+        } else {
+            auto wire = sqlpipe::serialize(msgs[0].msg);
+            Buf b(wire.begin(), wire.end());
+            put_u8(b, static_cast<uint8_t>(msgs[0].delivery));
+            *out = to_buf(std::move(b));
+        }
+        return ok();
+    } catch (const sqlpipe::Error& e) { return make_error(e); }
+      catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+
 void sqlpipe_replica_reset(sqlpipe_replica* r) {
     r->impl.reset();
 }
@@ -546,8 +561,8 @@ int64_t sqlpipe_replica_current_seq(sqlpipe_replica* r) {
     return r->impl.current_seq();
 }
 
-int32_t sqlpipe_replica_schema_version(sqlpipe_replica* r) {
-    return r->impl.schema_version();
+sqlpipe_buf sqlpipe_replica_schema_version(sqlpipe_replica* r) {
+    return to_buf(Buf(r->impl.schema_version()));
 }
 
 // ── Peer ────────────────────────────────────────────────────────

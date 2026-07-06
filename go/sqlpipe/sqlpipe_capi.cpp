@@ -226,9 +226,10 @@ sqlpipe::MasterConfig to_master_config(sqlpipe_master_config cfg) {
         auto fn = cfg.on_schema_mismatch;
         auto ctx = cfg.schema_mismatch_ctx;
         mc.on_schema_mismatch = [fn, ctx](
-            sqlpipe::SchemaVersion rsv, sqlpipe::SchemaVersion lsv,
+            const sqlpipe::SchemaVersion& rsv, const sqlpipe::SchemaVersion& lsv,
             const std::string& rsql) -> bool {
-            return fn(ctx, rsv, lsv, rsql.c_str()) != 0;
+            return fn(ctx, rsv.data(), rsv.size(), lsv.data(), lsv.size(),
+                      rsql.c_str()) != 0;
         };
     }
     if (cfg.on_log) {
@@ -287,9 +288,10 @@ sqlpipe::ReplicaConfig to_replica_config(sqlpipe_replica_config cfg) {
         auto fn = cfg.on_schema_mismatch;
         auto ctx = cfg.schema_mismatch_ctx;
         rc.on_schema_mismatch = [fn, ctx](
-            sqlpipe::SchemaVersion rsv, sqlpipe::SchemaVersion lsv,
+            const sqlpipe::SchemaVersion& rsv, const sqlpipe::SchemaVersion& lsv,
             const std::string& rsql) -> bool {
-            return fn(ctx, rsv, lsv, rsql.c_str()) != 0;
+            return fn(ctx, rsv.data(), rsv.size(), lsv.data(), lsv.size(),
+                      rsql.c_str()) != 0;
         };
     }
     if (cfg.on_log) {
@@ -349,9 +351,10 @@ sqlpipe::PeerConfig to_peer_config(sqlpipe_peer_config cfg) {
         auto fn = cfg.on_schema_mismatch;
         auto ctx = cfg.schema_mismatch_ctx;
         pc.on_schema_mismatch = [fn, ctx](
-            sqlpipe::SchemaVersion rsv, sqlpipe::SchemaVersion lsv,
+            const sqlpipe::SchemaVersion& rsv, const sqlpipe::SchemaVersion& lsv,
             const std::string& rsql) -> bool {
-            return fn(ctx, rsv, lsv, rsql.c_str()) != 0;
+            return fn(ctx, rsv.data(), rsv.size(), lsv.data(), lsv.size(),
+                      rsql.c_str()) != 0;
         };
     }
     if (cfg.on_log) {
@@ -450,8 +453,8 @@ int64_t sqlpipe_master_current_seq(sqlpipe_master* m) {
     return m->impl.current_seq();
 }
 
-int32_t sqlpipe_master_schema_version(sqlpipe_master* m) {
-    return m->impl.schema_version();
+sqlpipe_buf sqlpipe_master_schema_version(sqlpipe_master* m) {
+    return to_buf(Buf(m->impl.schema_version()));
 }
 
 // ── Replica ─────────────────────────────────────────────────────
@@ -558,8 +561,8 @@ int64_t sqlpipe_replica_current_seq(sqlpipe_replica* r) {
     return r->impl.current_seq();
 }
 
-int32_t sqlpipe_replica_schema_version(sqlpipe_replica* r) {
-    return r->impl.schema_version();
+sqlpipe_buf sqlpipe_replica_schema_version(sqlpipe_replica* r) {
+    return to_buf(Buf(r->impl.schema_version()));
 }
 
 // ── Peer ────────────────────────────────────────────────────────

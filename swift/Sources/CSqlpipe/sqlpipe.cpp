@@ -268,6 +268,12 @@ void put_string(std::vector<std::uint8_t>& buf, const std::string& s) {
     put_bytes(buf, s.data(), static_cast<std::uint32_t>(s.size()));
 }
 
+// Schema fingerprint: length-prefixed opaque bytes (algorithm-agnostic wire
+// format — the digest width may change without a wire/protocol change).
+void put_fingerprint(std::vector<std::uint8_t>& buf, const SchemaVersion& fp) {
+    put_bytes(buf, fp.data(), static_cast<std::uint32_t>(fp.size()));
+}
+
 void put_changeset(std::vector<std::uint8_t>& buf, const Changeset& cs) {
     constexpr std::size_t kCompressionThreshold = 64;
     if (cs.size() < kCompressionThreshold) {
@@ -352,6 +358,18 @@ public:
         return s;
     }
 
+    SchemaVersion read_fingerprint() {
+        auto len = read_u32();
+        if (len > kMaxMessageSize) {
+            throw Error(ErrorCode::ProtocolError,
+                        "schema fingerprint length exceeds limit");
+        }
+        check(len);
+        SchemaVersion fp(data_ + pos_, data_ + pos_ + len);
+        pos_ += len;
+        return fp;
+    }
+
     Changeset read_changeset() {
         auto len = read_u32();
         if (len == 0) return {};
@@ -426,7 +444,7 @@ std::vector<std::uint8_t> serialize(const Message& msg) {
         if constexpr (std::is_same_v<T, HelloMsg>) {
             put_u8(buf, static_cast<std::uint8_t>(MessageTag::Hello));
             put_u32(buf, m.protocol_version);
-            put_i32(buf, m.schema_version);
+            put_fingerprint(buf, m.schema_version);
             put_u32(buf, static_cast<std::uint32_t>(m.owned_tables.size()));
             for (const auto& t : m.owned_tables) {
                 put_string(buf, t);
@@ -446,14 +464,14 @@ std::vector<std::uint8_t> serialize(const Message& msg) {
             put_u8(buf, static_cast<std::uint8_t>(MessageTag::Error));
             put_i32(buf, static_cast<std::int32_t>(m.code));
             put_string(buf, m.detail);
-            put_i32(buf, m.remote_schema_version);
+            put_fingerprint(buf, m.remote_schema_version);
             put_string(buf, m.remote_schema_sql);
         }
         else if constexpr (std::is_same_v<T, BucketHashesMsg>) {
             put_u8(buf, static_cast<std::uint8_t>(MessageTag::BucketHashes));
             put_i64(buf, m.last_seq);
             put_u32(buf, m.protocol_version);
-            put_i32(buf, m.schema_version);
+            put_fingerprint(buf, m.schema_version);
             put_u32(buf, static_cast<std::uint32_t>(m.buckets.size()));
             for (const auto& b : m.buckets) {
                 put_string(buf, b.table);
@@ -544,7 +562,7 @@ Message deserialize(std::span<const std::uint8_t> buf) {
     case MessageTag::Hello: {
         HelloMsg m;
         m.protocol_version = r.read_u32();
-        m.schema_version = r.read_i32();
+        m.schema_version = r.read_fingerprint();
         {
             auto count = r.read_u32();
             check_count(count);
@@ -570,7 +588,7 @@ Message deserialize(std::span<const std::uint8_t> buf) {
         ErrorMsg m;
         m.code = static_cast<ErrorCode>(r.read_i32());
         m.detail = r.read_string();
-        m.remote_schema_version = r.read_i32();
+        m.remote_schema_version = r.read_fingerprint();
         m.remote_schema_sql = r.read_string();
         return m;
     }
@@ -578,7 +596,7 @@ Message deserialize(std::span<const std::uint8_t> buf) {
         BucketHashesMsg m;
         m.last_seq = r.read_i64();
         m.protocol_version = r.read_u32();
-        m.schema_version = r.read_i32();
+        m.schema_version = r.read_fingerprint();
         auto count = r.read_u32();
         check_count(count);
         m.buckets.resize(count);
@@ -727,14 +745,39 @@ SchemaVersion compute_schema_fingerprint(
                     "sqlift_schema_hash failed: " + msg);
     }
 
-    // FNV-1a 32-bit of the structural hash.
-    std::uint32_t hash = 2166136261u;
-    for (const char* p = hex; *p; ++p) {
-        hash ^= static_cast<std::uint8_t>(*p);
-        hash *= 16777619u;
+    // Carry the full structural hash as [algo_id][raw digest bytes]. sqlift
+    // returns a hex string of a SHA-256 digest; decode it to raw bytes rather
+    // than folding to a fixed-width integer (folding would reintroduce the
+    // collisions this fingerprint exists to prevent). The leading algo byte
+    // keeps the format open-ended: a future hash change bumps the id + digest
+    // and needs no wire/protocol change.
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return 0;
+    };
+    SchemaVersion fp;
+    fp.push_back(static_cast<std::uint8_t>(
+        SchemaFingerprintAlgo::SqliftSha256));
+    for (const char* p = hex; p[0] && p[1]; p += 2) {
+        fp.push_back(static_cast<std::uint8_t>(
+            (nibble(p[0]) << 4) | nibble(p[1])));
     }
     sqlift_free(hex);
-    return static_cast<SchemaVersion>(hash);
+    return fp;
+}
+
+// Lowercase-hex rendering of a schema fingerprint, for logs and error text.
+std::string fingerprint_hex(const SchemaVersion& fp) {
+    static const char digits[] = "0123456789abcdef";
+    std::string s;
+    s.reserve(fp.size() * 2);
+    for (auto b : fp) {
+        s.push_back(digits[b >> 4]);
+        s.push_back(digits[b & 0x0F]);
+    }
+    return s;
 }
 
 bool is_without_rowid(sqlite3* db, const std::string& table) {
@@ -1397,7 +1440,7 @@ struct Master::Impl {
     detail::SessionGuard     session;
     std::vector<std::string> tracked_tables;
     Seq                      seq = 0;
-    SchemaVersion            cached_sv = 0;
+    SchemaVersion            cached_sv;  // empty until first computed
 
     // Changeset queue for replay on reconnect.
     struct QueuedChangeset {
@@ -1566,11 +1609,12 @@ struct Master::Impl {
             if (hello.schema_version != my_sv) {
                 SQLPIPE_LOG(config.on_log, LogLevel::Info,
                             "schema mismatch (replica={}, master={})",
-                            hello.schema_version, my_sv);
+                            detail::fingerprint_hex(hello.schema_version),
+                            detail::fingerprint_hex(my_sv));
                 return {tagged(Message{ErrorMsg{ErrorCode::SchemaMismatch,
                     "schema mismatch: replica=" +
-                    std::to_string(hello.schema_version) +
-                    " master=" + std::to_string(my_sv),
+                    detail::fingerprint_hex(hello.schema_version) +
+                    " master=" + detail::fingerprint_hex(my_sv),
                     my_sv,
                     detail::get_schema_sql(db, filter())}})};
             }
@@ -1637,7 +1681,7 @@ struct Master::Impl {
         }
 
         // Schema check (if provided).
-        if (msg.schema_version != 0) {
+        if (!msg.schema_version.empty()) {
             auto my_sv = detail::compute_schema_fingerprint(db, filter());
             if (msg.schema_version != my_sv) {
                 if (config.on_schema_mismatch &&
@@ -1650,11 +1694,12 @@ struct Master::Impl {
                 if (msg.schema_version != my_sv) {
                     SQLPIPE_LOG(config.on_log, LogLevel::Info,
                                 "schema mismatch (replica={}, master={})",
-                                msg.schema_version, my_sv);
+                                detail::fingerprint_hex(msg.schema_version),
+                                detail::fingerprint_hex(my_sv));
                     return {tagged(Message{ErrorMsg{ErrorCode::SchemaMismatch,
                         "schema mismatch: replica=" +
-                        std::to_string(msg.schema_version) +
-                        " master=" + std::to_string(my_sv),
+                        detail::fingerprint_hex(msg.schema_version) +
+                        " master=" + detail::fingerprint_hex(my_sv),
                         my_sv,
                         detail::get_schema_sql(db, filter())}})};
                 }

@@ -69,13 +69,3 @@ func hashBucketEntry(rowid int64, rowHash uint64) uint64 {
 	h = fnv64Bytes(h, buf[:])
 	return h
 }
-
-// schemaFingerprint computes FNV-1a 32-bit hash of schema SQL.
-func schemaFingerprint(sql string) SchemaVersion {
-	h := uint32(2166136261) // FNV-1a 32-bit offset.
-	for i := 0; i < len(sql); i++ {
-		h ^= uint32(sql[i])
-		h *= 16777619 // FNV-1a 32-bit prime.
-	}
-	return SchemaVersion(int32(h))
-}

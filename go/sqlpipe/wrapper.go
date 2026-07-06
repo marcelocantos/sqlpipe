@@ -24,7 +24,7 @@ static int sqlpipe_bind_blob(sqlite3_stmt* s, int i, const void* v, int n) {
 
 // Forward-declare Go callback trampolines (defined in cgo_exports.go).
 extern void goProgressTrampoline(uintptr_t, uint8_t, const char*, int64_t, int64_t);
-extern int goSchemaMismatchTrampoline(uintptr_t, int32_t, int32_t, const char*);
+extern int goSchemaMismatchTrampoline(uintptr_t, const uint8_t*, size_t, const uint8_t*, size_t, const char*);
 extern uint8_t goConflictTrampoline(uintptr_t, uint8_t, const uint8_t*, size_t);
 extern int goApproveOwnershipTrampoline(uintptr_t, const char**, size_t);
 extern void goLogTrampoline(uintptr_t, uint8_t, const char*);
@@ -35,8 +35,8 @@ extern void goFlushTrampoline(uintptr_t, const uint8_t*, size_t);
 void cProgressTrampoline(void* ctx, uint8_t phase, const char* table, int64_t done, int64_t total) {
 	goProgressTrampoline((uintptr_t)ctx, phase, table, done, total);
 }
-int cSchemaMismatchTrampoline(void* ctx, int32_t remote_sv, int32_t local_sv, const char* remote_sql) {
-	return goSchemaMismatchTrampoline((uintptr_t)ctx, remote_sv, local_sv, remote_sql);
+int cSchemaMismatchTrampoline(void* ctx, const uint8_t* remote_sv, size_t remote_sv_len, const uint8_t* local_sv, size_t local_sv_len, const char* remote_sql) {
+	return goSchemaMismatchTrampoline((uintptr_t)ctx, remote_sv, remote_sv_len, local_sv, local_sv_len, remote_sql);
 }
 uint8_t cConflictTrampoline(void* ctx, uint8_t ct, const uint8_t* data, size_t len) {
 	return goConflictTrampoline((uintptr_t)ctx, ct, data, len);
@@ -886,9 +886,11 @@ func (m *Master) CurrentSeq() Seq {
 	return Seq(C.sqlpipe_master_current_seq(m.ptr))
 }
 
-// SchemaVersion returns the current schema fingerprint.
+// SchemaVersion returns the current schema fingerprint (opaque bytes).
 func (m *Master) SchemaVersion() SchemaVersion {
-	return SchemaVersion(C.sqlpipe_master_schema_version(m.ptr))
+	buf := C.sqlpipe_master_schema_version(m.ptr)
+	defer C.sqlpipe_free_buf(buf)
+	return SchemaVersion(C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len)))
 }
 
 // Close releases the Master.
@@ -1070,9 +1072,11 @@ func (r *Replica) CurrentSeq() Seq {
 	return Seq(C.sqlpipe_replica_current_seq(r.ptr))
 }
 
-// SchemaVersion returns the current schema fingerprint.
+// SchemaVersion returns the current schema fingerprint (opaque bytes).
 func (r *Replica) SchemaVersion() SchemaVersion {
-	return SchemaVersion(C.sqlpipe_replica_schema_version(r.ptr))
+	buf := C.sqlpipe_replica_schema_version(r.ptr)
+	defer C.sqlpipe_free_buf(buf)
+	return SchemaVersion(C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len)))
 }
 
 // Close releases the Replica.

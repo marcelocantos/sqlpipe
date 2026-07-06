@@ -99,9 +99,10 @@ export type ProgressCallback = (
 /** Log callback. */
 export type LogCallback = (level: LogLevel, message: string) => void;
 
-/** Schema mismatch callback. Return true to retry after ALTER. */
+/** Schema mismatch callback. Return true to retry after ALTER.
+ * The schema fingerprints are opaque bytes (algorithm-agnostic). */
 export type SchemaMismatchCallback = (
-  remoteSchemaVersion: number, localSchemaVersion: number,
+  remoteSchemaVersion: Uint8Array, localSchemaVersion: Uint8Array,
   remoteSchemaSQL: string
 ) => boolean;
 

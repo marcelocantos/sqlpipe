@@ -53,9 +53,12 @@ typedef void (*sqlpipe_progress_fn)(
     void* ctx, uint8_t phase, const char* table,
     int64_t done, int64_t total);
 
-// Schema mismatch callback. Return non-zero to retry after ALTER.
+// Schema mismatch callback. Return non-zero to retry after ALTER. The schema
+// fingerprints are opaque bytes (algorithm-agnostic), passed as pointer+length.
 typedef int (*sqlpipe_schema_mismatch_fn)(
-    void* ctx, int32_t remote_sv, int32_t local_sv,
+    void* ctx,
+    const uint8_t* remote_sv, size_t remote_sv_len,
+    const uint8_t* local_sv, size_t local_sv_len,
     const char* remote_schema_sql);
 
 // Conflict callback. event_data/event_len is an encoded ChangeEvent.
@@ -145,7 +148,7 @@ sqlpipe_error sqlpipe_master_handle_message(
 sqlpipe_error sqlpipe_master_exec(sqlpipe_master* m, const char* sql);
 
 int64_t sqlpipe_master_current_seq(sqlpipe_master* m);
-int32_t sqlpipe_master_schema_version(sqlpipe_master* m);
+sqlpipe_buf sqlpipe_master_schema_version(sqlpipe_master* m);
 
 // ── Replica ─────────────────────────────────────────────────────
 
@@ -181,7 +184,7 @@ sqlpipe_error sqlpipe_replica_converge(
 void sqlpipe_replica_reset(sqlpipe_replica* r);
 uint8_t sqlpipe_replica_state(sqlpipe_replica* r);
 int64_t sqlpipe_replica_current_seq(sqlpipe_replica* r);
-int32_t sqlpipe_replica_schema_version(sqlpipe_replica* r);
+sqlpipe_buf sqlpipe_replica_schema_version(sqlpipe_replica* r);
 
 // ── Peer ────────────────────────────────────────────────────────
 

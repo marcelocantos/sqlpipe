@@ -14,7 +14,7 @@ func Serialize(msg Message) []byte {
 	case HelloMsg:
 		buf = append(buf, byte(TagHello))
 		buf = putU32(buf, m.ProtocolVersion)
-		buf = putI32(buf, int32(m.SchemaVersion))
+		buf = putFingerprint(buf, m.SchemaVersion)
 		buf = putU32(buf, uint32(len(m.OwnedTables)))
 		for _, t := range m.OwnedTables {
 			buf = putString(buf, t)
@@ -34,14 +34,14 @@ func Serialize(msg Message) []byte {
 		buf = append(buf, byte(TagError))
 		buf = putI32(buf, int32(m.Code))
 		buf = putString(buf, m.Detail)
-		buf = putI32(buf, int32(m.RemoteSchemaVersion))
+		buf = putFingerprint(buf, m.RemoteSchemaVersion)
 		buf = putString(buf, m.RemoteSchemaSQL)
 
 	case BucketHashesMsg:
 		buf = append(buf, byte(TagBucketHashes))
 		buf = putI64(buf, int64(m.LastSeq))
 		buf = putU32(buf, m.ProtocolVersion)
-		buf = putI32(buf, int32(m.SchemaVersion))
+		buf = putFingerprint(buf, m.SchemaVersion)
 		buf = putU32(buf, uint32(len(m.Buckets)))
 		for _, b := range m.Buckets {
 			buf = putString(buf, b.Table)
@@ -140,4 +140,10 @@ func putU64(buf []byte, v uint64) []byte {
 func putString(buf []byte, s string) []byte {
 	buf = putU32(buf, uint32(len(s)))
 	return append(buf, s...)
+}
+
+// putFingerprint writes a schema fingerprint as length-prefixed opaque bytes.
+func putFingerprint(buf []byte, fp SchemaVersion) []byte {
+	buf = putU32(buf, uint32(len(fp)))
+	return append(buf, fp...)
 }

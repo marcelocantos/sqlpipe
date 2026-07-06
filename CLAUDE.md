@@ -139,10 +139,14 @@ Two sync modes:
 ### Key internals
 
 - **Schema fingerprinting** (`compute_schema_fingerprint`): Uses sqlift to
-  extract a structural schema, then hashes it (SHA-256 → FNV-1a 32-bit).
-  Structural hashing means logically equivalent schemas produce the same
-  fingerprint even after ALTER TABLE ADD COLUMN (which doesn't update
-  `sqlite_master.sql` text).
+  extract a structural schema, then carries its full SHA-256 hash as
+  `SchemaVersion` = `[algorithm-id byte][32-byte digest]` (opaque, variable
+  length; **not** folded to 32-bit — that fold, removed in v0.26.0, left a
+  ~2^-32 false-match in the compatibility gate). The algorithm-id byte keeps
+  the format open-ended: a future hash change bumps the id + digest with no
+  wire/protocol change. Structural hashing means logically equivalent schemas
+  produce the same fingerprint even after ALTER TABLE ADD COLUMN (which doesn't
+  update `sqlite_master.sql` text).
 - **Session extension**: `sqlite3session_create/attach/changeset` for change
   tracking. `sqlite3changeset_apply` on the replica side.
 - **Pimpl**: `Master`, `Replica`, and `Peer` use `struct Impl` behind
