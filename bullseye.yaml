@@ -630,7 +630,7 @@ targets:
     achieved: 2026-07-06
   T25:
     name: Swift package builds — deepparser sources vendored into CSqlpipe
-    status: identified
+    status: achieved
     value: 0.0
     cost: 0.0
     acceptance:
@@ -641,6 +641,7 @@ targets:
     context: 'Discovered during T24. The Swift CSqlpipe target compiles the bundled dist/sqlpipe.cpp, which #include <liteparser.h> since the v0.24.0 deepparser migration, but the Swift package never vendored deepparser sources — only the Go wrapper''s internal/c/deepparser was wired. `swift build` fails ''liteparser.h file not found'' from a clean state; prior green swift builds passed only via a stale cached sqlpipe.o. Swift is not in CI so it went unnoticed. Pre-existing and orthogonal to T24 (whose Swift-facing capi changes compile fine).'
     origin: manual
     discovered: 2026-07-06
+    achieved: 2026-07-06
   T3:
     name: sqlpipe runs in the browser via Emscripten + JS wrapper
     status: identified
