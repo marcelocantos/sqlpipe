@@ -20,15 +20,15 @@ CI master: last run success (2026-07-06, Swift deepparser vendoring #20).
 
 | Target | Status | Note |
 |---|---|---|
-| 🎯T13 Go: FTS5 + sqlift + sqldeep Database API | actionable | Unblocks mnemo 🎯T26 |
-| 🎯T14 bundle-deps syncs sqlift API block in headers | actionable | Hygiene; small |
 | 🎯T10 sqlpipe over tern dual-channel | actionable | Strategic; depends on tern |
 | 🎯T2 reaches 1.0 | time-gated | Eligible 2026-10-06 |
 
+Achieved this pass: 🎯T13 (Go FTS5/sqlift/sqldeep), 🎯T14 (bundle-deps sqlift header sync).
+
 ## Recommendation
 
-Work on: **🎯T13** (Go wrapper parity with C++ Database features).  
-Reason: only high-value unblocked work that unblocks another product (mnemo). 🎯T14 can ride the same PR if cheap. 🎯T2 cannot be forced. 🎯T10 is a multi-repo integration.
+Work on: **🎯T10** when tern is ready, otherwise hold for 🎯T2 settling (2026-10-06).  
+Optional follow-up: fix sqldeep FTS5 DDL rewrite (strips column list) so C++ can enable FTS5 the same way; Go skips transpile unless sqldeep syntax is present.
 
 ## Delivery
 
