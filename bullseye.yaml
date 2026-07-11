@@ -749,9 +749,10 @@ targets:
     discovered: 2026-07-11
   T28:
     name: Hub may materialize the multiplayer universe in Postgres while edges remain SQLite via sqlpipe-shaped sync
-    status: identified
+    status: set_aside
     value: 0.0
     cost: 0.0
+    set_aside_reason: 'Parked with 🎯T27: hub engine is secondary to edge projection research (docs/research/edge-projection-multiplayer.md). Re-open after projection direction is productized or a deployment forces Postgres SoR.'
     acceptance:
     - docs/research/edge-projection-multiplayer.md § hub engine options remains the decision frame until an implementation design supersedes it
     - Projection layer (🎯T27) is the interest policy; hub engine does not redefine U_P by ad hoc joins
