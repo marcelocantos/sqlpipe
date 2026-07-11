@@ -533,9 +533,10 @@ targets:
     discovered: 2026-04-29
   T14:
     name: scripts/bundle-deps.sh syncs the sqlift API block in dist/sqlpipe.h automatically
-    status: identified
+    status: achieved
     value: 5.0
     cost: 2.0
+    actual_cost: 2.0
     acceptance:
     - When sqlift's public API changes (new flag macros, new error codes, new struct fields in sqlift_apply_options, version macro bumps), running scripts/bundle-deps.sh updates the corresponding section of dist/sqlpipe.h without human intervention.
     - The sqlift block in dist/sqlpipe.h (currently lines ~70-130) reflects the SQLIFT_VERSION macros, the sqlift_error_type enum, the SQLIFT_ALLOW_* flag macros, and the sqlift_apply_options struct from vendor/include/sqlift.h verbatim.
@@ -544,6 +545,7 @@ targets:
     context: Discovered during v0.23.0 release (sqlift v0.13→v0.14). bundle-deps.sh copies sqlift into dist/sqlpipe.cpp but not the sqlift API block in dist/sqlpipe.h — hand-maintained and easy to desync. Prioritised 2026-07-11 ownership pass (value/cost restored from 0).
     origin: forked from v0.23.0 release — discovered while bumping sqlift v0.13.0 → v0.14.0
     discovered: 2026-05-09
+    achieved: 2026-07-11
   T15:
     name: Diff sync identifies rows by PRIMARY KEY, never conflating rowid identity across databases
     status: achieved
