@@ -832,3 +832,85 @@ func TestRowValueTypes(t *testing.T) {
 		}
 	}
 }
+
+func TestFTS5Enabled(t *testing.T) {
+	db := openMemory(t)
+	if err := db.Exec("CREATE VIRTUAL TABLE docs USING fts5(content)"); err != nil {
+		t.Fatalf("FTS5 not available: %v", err)
+	}
+	mustExec(t, db, "INSERT INTO docs(content) VALUES ('hello world')")
+	qr, err := db.Query("SELECT content FROM docs WHERE docs MATCH 'hello'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qr.Rows) != 1 {
+		t.Fatalf("expected 1 match, got %d", len(qr.Rows))
+	}
+	if qr.Rows[0][0] != "hello world" {
+		t.Errorf("content = %v", qr.Rows[0][0])
+	}
+}
+
+func TestOpenDatabaseWithSchema(t *testing.T) {
+	ddl := "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+	db, err := OpenDatabase(":memory:", ddl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	mustExec(t, db, "INSERT INTO items (id, name) VALUES (1, 'Widget')")
+	qr, err := db.Query("SELECT name FROM items WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qr.Rows) != 1 || qr.Rows[0][0] != "Widget" {
+		t.Fatalf("unexpected rows: %v", qr.Rows)
+	}
+
+	// Migrate adds a column.
+	if err := db.Migrate("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, qty INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, "UPDATE items SET qty = 10 WHERE id = 1")
+	qr, err = db.Query("SELECT qty FROM items WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qr.Rows) != 1 || qr.Rows[0][0] != int64(10) {
+		t.Fatalf("qty after migrate: %v", qr.Rows)
+	}
+}
+
+func TestSqldeepTranspileOnQuery(t *testing.T) {
+	db, err := OpenDatabase(":memory:",
+		"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	mustExec(t, db, "INSERT INTO items VALUES (1, 'Widget', 10)")
+	mustExec(t, db, "INSERT INTO items VALUES (2, 'Gadget', 25)")
+
+	qr, err := db.Query("SELECT {id, name, qty} FROM items ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qr.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(qr.Rows))
+	}
+	// Object literal becomes a JSON column (text or blob depending on SQLite).
+	raw := qr.Rows[0][0]
+	var s string
+	switch v := raw.(type) {
+	case string:
+		s = v
+	case []byte:
+		s = string(v)
+	default:
+		t.Fatalf("expected JSON text/blob, got %T %v", raw, raw)
+	}
+	if !bytes.Contains([]byte(s), []byte("Widget")) {
+		t.Errorf("json missing Widget: %s", s)
+	}
+}
