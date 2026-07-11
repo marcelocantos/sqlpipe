@@ -4,12 +4,43 @@
 package sqlpipe
 
 /*
-#cgo CXXFLAGS: -std=c++23 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE -I${SRCDIR}/internal/c -I${SRCDIR}/internal/c/deepparser
-#cgo CFLAGS: -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE -I${SRCDIR}/internal/c -I${SRCDIR}/internal/c/deepparser
+#cgo CXXFLAGS: -std=c++23 -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE -DSQLITE_ENABLE_FTS5 -I${SRCDIR}/internal/c -I${SRCDIR}/internal/c/deepparser
+#cgo CFLAGS: -DSQLITE_ENABLE_SESSION -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_ENABLE_DESERIALIZE -DSQLITE_ENABLE_FTS5 -I${SRCDIR}/internal/c -I${SRCDIR}/internal/c/deepparser
 
 #include <stdlib.h>
+#include <stdint.h>
 #include "internal/c/sqlite3.h"
 #include "sqlpipe_capi.h"
+
+// Bundled C APIs from dist/sqlpipe (linked via sqlpipe_impl.cpp). Declared
+// here rather than #include "sqlpipe.h" because that header continues into
+// C++ after the sqldeep/sqlift extern "C" blocks.
+char* sqldeep_transpile(const char* input, char** err_msg, int* err_line, int* err_col);
+void sqldeep_free(void* ptr);
+int sqldeep_register_sqlite(sqlite3* db);
+
+typedef struct sqlift_db sqlift_db;
+typedef struct sqlift_apply_options {
+	unsigned int allow;
+} sqlift_apply_options;
+
+#define SQLIFT_ALLOW_REBUILD        (1u << 0)
+#define SQLIFT_ALLOW_DESTRUCTIVE    (1u << 1)
+#define SQLIFT_ALLOW_LOOSEN         (1u << 2)
+#define SQLIFT_ALLOW_DATA_DEPENDENT (1u << 3)
+#define SQLIFT_ALLOW_ALL            (SQLIFT_ALLOW_REBUILD | SQLIFT_ALLOW_DESTRUCTIVE \
+                                     | SQLIFT_ALLOW_LOOSEN | SQLIFT_ALLOW_DATA_DEPENDENT)
+
+sqlift_db* sqlift_db_wrap(sqlite3* handle);
+void sqlift_db_close(sqlift_db* db);
+char* sqlift_parse(const char* ddl, int* err_type, char** err_msg);
+char* sqlift_extract(sqlift_db* db, int* err_type, char** err_msg);
+char* sqlift_diff(const char* current_json, const char* desired_json,
+                  int* err_type, char** err_msg);
+int sqlift_apply(sqlift_db* db, const char* plan_json,
+                 const sqlift_apply_options opts,
+                 int* err_type, char** err_msg);
+void sqlift_free(void* ptr);
 
 // SQLITE_TRANSIENT is a macro casting -1 to a function pointer,
 // which CGo can't handle. Provide a C wrapper.
@@ -66,13 +97,19 @@ import (
 
 // Database wraps a raw sqlite3* handle. It provides a self-contained
 // SQLite connection without depending on database/sql or mattn/go-sqlite3.
+// Exec/Query/Rows transpile sqldeep syntax automatically (mirroring C++
+// Database). Optional schema_ddl on open (or Migrate) applies sqlift.
 type Database struct {
 	db *C.sqlite3
 }
 
 // OpenDatabase opens a SQLite database at the given path.
 // Use ":memory:" for an in-memory database.
-func OpenDatabase(path string) (*Database, error) {
+//
+// If schemaDDL is non-empty (optional second argument), applies a sqlift
+// structural migration so the on-disk schema matches the desired DDL —
+// same behaviour as C++ Database(path, schema_ddl).
+func OpenDatabase(path string, schemaDDL ...string) (*Database, error) {
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))
 	var db *C.sqlite3
@@ -82,7 +119,20 @@ func OpenDatabase(path string) (*Database, error) {
 		C.sqlite3_close(db)
 		return nil, &Error{Code: ErrSqlite, Msg: msg}
 	}
-	return &Database{db: db}, nil
+	d := &Database{db: db}
+	// Register sqldeep runtime helpers (xml_*, sqldeep_json*) for queries
+	// that need them after transpilation.
+	if C.sqldeep_register_sqlite(db) != C.SQLITE_OK {
+		_ = d.Close()
+		return nil, &Error{Code: ErrSqlite, Msg: "sqldeep_register_sqlite failed"}
+	}
+	if len(schemaDDL) > 0 && schemaDDL[0] != "" {
+		if err := d.Migrate(schemaDDL[0]); err != nil {
+			_ = d.Close()
+			return nil, err
+		}
+	}
+	return d, nil
 }
 
 // Close closes the database connection.
@@ -97,15 +147,132 @@ func (d *Database) Close() error {
 	return nil
 }
 
+// Migrate brings the open database's schema in line with schemaDDL using
+// sqlift (extract → parse → diff → apply). Matches C++ Database open-time
+// migration: allows rebuild, not destructive drops.
+func (d *Database) Migrate(schemaDDL string) error {
+	if schemaDDL == "" {
+		return nil
+	}
+	sdb := C.sqlift_db_wrap(d.db)
+	if sdb == nil {
+		return &Error{Code: ErrSqlite, Msg: "sqlift_db_wrap failed"}
+	}
+	defer C.sqlift_db_close(sdb)
+
+	var errType C.int
+	var errMsg *C.char
+
+	currentJSON := C.sqlift_extract(sdb, &errType, &errMsg)
+	if currentJSON == nil {
+		msg := "failed to extract schema"
+		if errMsg != nil {
+			msg = msg + ": " + C.GoString(errMsg)
+			C.sqlift_free(unsafe.Pointer(errMsg))
+		}
+		return &Error{Code: ErrSqlite, Msg: msg}
+	}
+	defer C.sqlift_free(unsafe.Pointer(currentJSON))
+
+	cddl := C.CString(schemaDDL)
+	defer C.free(unsafe.Pointer(cddl))
+	errMsg = nil
+	desiredJSON := C.sqlift_parse(cddl, &errType, &errMsg)
+	if desiredJSON == nil {
+		msg := "failed to parse schema DDL"
+		if errMsg != nil {
+			msg = msg + ": " + C.GoString(errMsg)
+			C.sqlift_free(unsafe.Pointer(errMsg))
+		}
+		return &Error{Code: ErrSqlite, Msg: msg}
+	}
+	defer C.sqlift_free(unsafe.Pointer(desiredJSON))
+
+	errMsg = nil
+	planJSON := C.sqlift_diff(currentJSON, desiredJSON, &errType, &errMsg)
+	if planJSON == nil {
+		msg := "failed to diff schemas"
+		if errMsg != nil {
+			msg = msg + ": " + C.GoString(errMsg)
+			C.sqlift_free(unsafe.Pointer(errMsg))
+		}
+		return &Error{Code: ErrSqlite, Msg: msg}
+	}
+	defer C.sqlift_free(unsafe.Pointer(planJSON))
+
+	opts := C.sqlift_apply_options{allow: C.SQLIFT_ALLOW_REBUILD}
+	errMsg = nil
+	rc := C.sqlift_apply(sdb, planJSON, opts, &errType, &errMsg)
+	if rc != 0 {
+		msg := "failed to apply migration"
+		if errMsg != nil {
+			msg = msg + ": " + C.GoString(errMsg)
+			C.sqlift_free(unsafe.Pointer(errMsg))
+		}
+		return &Error{Code: ErrSqlite, Msg: msg}
+	}
+	return nil
+}
+
+// looksLikeSqldeep reports whether sql likely uses sqldeep extended syntax.
+// sqldeep currently rewrites some plain DDL (e.g. FTS5 virtual tables) into
+// broken SQL; skip the transpiler unless extended syntax is present.
+// Markers: `{...}` object/set literals, and XML-ish `<ident` tags (not `<=`/`<>`).
+func looksLikeSqldeep(sql string) bool {
+	for i := 0; i < len(sql); i++ {
+		switch sql[i] {
+		case '{':
+			return true
+		case '<':
+			if i+1 < len(sql) {
+				c := sql[i+1]
+				if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '/' || c == '!' {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// transpile runs sqldeep over sql. Plain SQL is returned unchanged.
+func transpile(sql string) (string, error) {
+	if !looksLikeSqldeep(sql) {
+		return sql, nil
+	}
+	csql := C.CString(sql)
+	defer C.free(unsafe.Pointer(csql))
+	var errMsg *C.char
+	var errLine, errCol C.int
+	result := C.sqldeep_transpile(csql, &errMsg, &errLine, &errCol)
+	if result != nil {
+		out := C.GoString(result)
+		C.sqldeep_free(unsafe.Pointer(result))
+		return out, nil
+	}
+	if errMsg != nil {
+		msg := fmt.Sprintf("%s (line %d, col %d)", C.GoString(errMsg), int(errLine), int(errCol))
+		C.sqldeep_free(unsafe.Pointer(errMsg))
+		return "", &Error{Code: ErrSqlite, Msg: msg}
+	}
+	// No result and no error → plain SQL.
+	return sql, nil
+}
+
 // Exec executes one or more SQL statements without returning results.
 // Use ? placeholders for parameters to avoid SQL injection.
+// sqldeep syntax is transpiled automatically.
 func (d *Database) Exec(sql string, args ...any) error {
+	tsql, err := transpile(sql)
+	if err != nil {
+		return err
+	}
 	if len(args) == 0 {
-		csql := C.CString(sql)
+		csql := C.CString(tsql)
 		defer C.free(unsafe.Pointer(csql))
 		return convertError(C.sqlpipe_db_exec(d.db, csql))
 	}
-	stmt, err := d.prepare(sql)
+	stmt, err := d.prepareTranspiled(tsql)
 	if err != nil {
 		return err
 	}
@@ -122,9 +289,14 @@ func (d *Database) Exec(sql string, args ...any) error {
 
 // Query executes a SQL query and returns the full result set in memory.
 // Use ? placeholders for parameters. Suitable for small result sets.
+// sqldeep syntax is transpiled automatically.
 func (d *Database) Query(sql string, args ...any) (QueryResult, error) {
+	tsql, err := transpile(sql)
+	if err != nil {
+		return QueryResult{}, err
+	}
 	if len(args) == 0 {
-		csql := C.CString(sql)
+		csql := C.CString(tsql)
 		defer C.free(unsafe.Pointer(csql))
 		var buf C.sqlpipe_buf
 		if err := convertError(C.sqlpipe_db_query(d.db, csql, &buf)); err != nil {
@@ -136,7 +308,7 @@ func (d *Database) Query(sql string, args ...any) (QueryResult, error) {
 		return decodeQueryResult(dec), nil
 	}
 	// Parameterized query — use prepared statement.
-	stmt, err := d.prepare(sql)
+	stmt, err := d.prepareTranspiled(tsql)
 	if err != nil {
 		return QueryResult{}, err
 	}
@@ -157,9 +329,16 @@ func (d *Database) Query(sql string, args ...any) (QueryResult, error) {
 //	for row := range db.Rows("SELECT id, name FROM t WHERE score > ?", 90) {
 //	    fmt.Println(row.Int64(0), row.Text(1))
 //	}
+//
+// sqldeep syntax is transpiled automatically.
 func (d *Database) Rows(sql string, args ...any) iter.Seq[*Row] {
 	return func(yield func(*Row) bool) {
-		stmt, err := d.prepare(sql)
+		tsql, err := transpile(sql)
+		if err != nil {
+			yield(&Row{err: err})
+			return
+		}
+		stmt, err := d.prepareTranspiled(tsql)
 		if err != nil {
 			yield(&Row{err: err})
 			return
@@ -221,6 +400,14 @@ func (d *Database) Handle() unsafe.Pointer {
 }
 
 func (d *Database) prepare(sql string) (*C.sqlite3_stmt, error) {
+	tsql, err := transpile(sql)
+	if err != nil {
+		return nil, err
+	}
+	return d.prepareTranspiled(tsql)
+}
+
+func (d *Database) prepareTranspiled(sql string) (*C.sqlite3_stmt, error) {
 	csql := C.CString(sql)
 	defer C.free(unsafe.Pointer(csql))
 	var stmt *C.sqlite3_stmt

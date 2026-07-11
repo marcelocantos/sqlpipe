@@ -137,3 +137,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: (pending)
 - **Outcome**: Released v0.27.0. Fixed the Swift package build (🎯T25). The CSqlpipe target compiles the bundled sqlpipe.cpp, which #include <liteparser.h> since the v0.24.0 deepparser migration, but the Swift package never vendored deepparser sources — broken since v0.24.0, unnoticed because Swift wasn't in CI. Vendored deepparser into swift/Sources/CSqlpipe/deepparser/ with a header search path; excluded the redundant standalone sqldeep.cpp/sqlift.cpp (already bundled into sqlpipe.cpp) and the lp_lempar.c lemon template from compilation. scripts/bundle-deps.sh now syncs deepparser into the Swift package too, and a Swift build job was added to CI. Non-breaking build fix; settling clock unchanged (last breaking change remains v0.26.0). Verified: swift build succeeds from clean state; cv test / go test / cv wasm unaffected.
+
+## 2026-07-11 — /release v0.28.0
+
+- **Commit**: (pending)
+- **Outcome**: Released v0.28.0. Ownership pass + Go Database parity (🎯T13): FTS5 enabled in CGo flags; `OpenDatabase(path, schemaDDL...)` and `Migrate` via sqlift; sqldeep transpile on Exec/Query/Rows (skipped unless extended syntax is present — sqldeep currently rewrites FTS5 DDL). 🎯T14: `scripts/bundle-deps.sh` auto-syncs the sqlift C API block in `dist/sqlpipe.h`. Target graph reconciled: retired 🎯T11 (unified product already shipped), 🎯T3 (Wasm path), 🎯T12 (diff-sync benches + baselines); set aside 🎯T11.4 (transport-agnostic design) and 🎯T3.4 (npm deferred). Non-breaking; settling clock unchanged (last break v0.26.0, eligible 2026-10-06). Verified: `cv test`, `go test ./...`, CI matrix.

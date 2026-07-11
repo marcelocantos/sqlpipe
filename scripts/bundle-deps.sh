@@ -1,11 +1,22 @@
 #!/bin/bash
-# Bundle sqlift and sqldeep implementations into dist/sqlpipe.cpp.
+# Bundle sqlift and sqldeep implementations into dist/sqlpipe.cpp and keep the
+# sqlift C API block in dist/sqlpipe.h in lockstep with vendor/include/sqlift.h.
 #
 # This script:
 # 1. Copies dist files from vendored submodules into vendor/{include,src}/
-# 2. Truncates dist/sqlpipe.cpp at the bundle marker
-# 3. Appends sqlift.cpp and sqldeep.cpp (stripped of their own includes)
-# 4. Copies updated dist files to Go and Swift wrappers
+# 2. Regenerates the sqlift API block in dist/sqlpipe.h (markers below)
+# 3. Truncates dist/sqlpipe.cpp at the bundle marker
+# 4. Appends sqlift.cpp and sqldeep.cpp (stripped of their own includes)
+# 5. Copies updated dist files to Go and Swift wrappers
+# 6. Syncs deepparser sources into Go/Swift wrappers
+#
+# Header sections managed by this script:
+#   dist/sqlpipe.h — between
+#     "// ── Bundled: sqlift (schema migration) ──────────────────────────"
+#     and
+#     "// ── sqlpipe ────────────────────────────────────────────────────"
+#   (version macros, error enum, SQLIFT_ALLOW_* flags, sqlift_apply_options,
+#    function prototypes from vendor/include/sqlift.h, plus sqlift_db_wrap)
 #
 # Usage: scripts/bundle-deps.sh
 
@@ -37,6 +48,117 @@ else
     echo "Error: $SQLIFT_SUB not found — run 'git submodule update --init'" >&2
     exit 1
 fi
+
+# ── 1b. Sync sqlift C API block into dist/sqlpipe.h ─────────────
+# Mirrors version macros, error enum, allow flags, apply_options, and
+# function prototypes from vendor/include/sqlift.h so a submodule bump
+# cannot leave dist/sqlpipe.h missing new SQLIFT_ALLOW_* identifiers.
+SQLIFT_H_BEGIN='// ── Bundled: sqlift (schema migration) ──────────────────────────'
+SQLIFT_H_END='// ── sqlpipe ────────────────────────────────────────────────────'
+python3 - "$SQLIFT_H_BEGIN" "$SQLIFT_H_END" <<'PY'
+import re, sys
+from pathlib import Path
+
+begin, end = sys.argv[1], sys.argv[2]
+src = Path("vendor/include/sqlift.h").read_text()
+header = Path("dist/sqlpipe.h").read_text()
+
+# Version macros
+ver = re.search(
+    r"(#define SQLIFT_VERSION\s+\".*?\"\n"
+    r"#define SQLIFT_VERSION_MAJOR\s+\d+\n"
+    r"#define SQLIFT_VERSION_MINOR\s+\d+\n"
+    r"#define SQLIFT_VERSION_PATCH\s+\d+\n)",
+    src,
+)
+if not ver:
+    sys.exit("Error: SQLIFT_VERSION macros not found in vendor/include/sqlift.h")
+
+# Error enum
+enum = re.search(r"enum sqlift_error_type \{.*?\};", src, re.S)
+if not enum:
+    sys.exit("Error: sqlift_error_type enum not found")
+
+# All SQLIFT_ALLOW_* macros (single- and multi-line)
+allows = re.findall(
+    r"#define SQLIFT_ALLOW_\w+\s+(?:\(\d+u\s*<<\s*\d+\)|\d+u|"
+    r"\([^)]*(?:\\?\n[^)]*)*\))",
+    src,
+)
+if not allows:
+    sys.exit("Error: SQLIFT_ALLOW_* macros not found")
+
+opts = re.search(
+    r"typedef struct sqlift_apply_options \{.*?\}\s*sqlift_apply_options;",
+    src,
+    re.S,
+)
+if not opts:
+    sys.exit("Error: sqlift_apply_options not found")
+
+# Function prototypes: keep them compact (strip // comments between decls).
+body = src.split("typedef struct sqlift_db sqlift_db;")[1]
+body = body.split("#ifdef __cplusplus")[0]
+# Drop pure comment lines and collapse blank runs.
+lines = []
+for line in body.splitlines():
+    s = line.strip()
+    if not s or s.startswith("//"):
+        continue
+    lines.append(line.rstrip())
+funcs = "\n".join(lines).strip()
+
+allow_block = "\n".join(allows)
+# Normalise multi-line ALLOW_ALL to a stable wrap
+allow_block = re.sub(
+    r"#define SQLIFT_ALLOW_ALL\s+\(([^)]+)\)",
+    lambda m: "#define SQLIFT_ALLOW_ALL            ("
+    + " ".join(m.group(1).split())
+    + ")",
+    allow_block,
+    flags=re.S,
+)
+
+block = f"""{begin}
+// Declarative SQLite schema diffing and migration.
+// Auto-synced from vendor/include/sqlift.h by scripts/bundle-deps.sh —
+// do not edit this block by hand.
+
+{ver.group(1).rstrip()}
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {{
+#endif
+
+{enum.group(0)}
+
+// Atomic permission bits for sqlift_apply_options.allow.
+{allow_block}
+
+{opts.group(0)}
+
+typedef struct sqlift_db sqlift_db;
+
+{funcs}
+// sqlpipe shim: wrap an existing sqlite3* (not owned). Implemented in the
+// bundled sqlift section of dist/sqlpipe.cpp by scripts/bundle-deps.sh.
+sqlift_db* sqlift_db_wrap(sqlite3* handle);
+
+#ifdef __cplusplus
+}}
+#endif
+
+"""
+
+if begin not in header or end not in header:
+    sys.exit("Error: sqlift block markers not found in dist/sqlpipe.h")
+pre, rest = header.split(begin, 1)
+_, post = rest.split(end, 1)
+Path("dist/sqlpipe.h").write_text(pre + block + end + post)
+print("Synced sqlift API block into dist/sqlpipe.h")
+PY
 
 # ── 2. Truncate at marker ──────────────────────────────────────
 MARKER_LINE=$(grep -n "^${MARKER}\$" dist/sqlpipe.cpp | head -1 | cut -d: -f1)
