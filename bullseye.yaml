@@ -507,9 +507,10 @@ targets:
     achieved: 2026-07-11
   T13:
     name: sqlpipe Go wrapper exposes FTS5, sqlift Go bindings, and automatic sqldeep transpilation so Go consumers can use the same Database API the C++ side already provides
-    status: identified
+    status: achieved
     value: 13.0
     cost: 5.0
+    actual_cost: 5.0
     acceptance:
     - 'go/sqlpipe/wrapper.go cgo CFLAGS/CXXFLAGS include -DSQLITE_ENABLE_FTS5; a test creates a virtual FTS5 table via OpenDatabase and inserts/queries successfully (currently fails with ''no such module: fts5'').'
     - 'Go-level sqlift binding exists: OpenDatabase(path, schemaDDL) constructor that mirrors the C++ Database(path, schema_ddl) sqlift-driven migration, or an explicit (*Database).Migrate(schemaDDL string) error method calling sqlift_db_wrap → sqlift_extract → sqlift_parse(desired) → sqlift_diff → sqlift_apply with the destructive-op guard exposed.'
@@ -531,6 +532,7 @@ targets:
     - downstream:mnemo
     origin: Discovered 2026-04-29 during mnemo 🎯T26 survey — sqlpipe Go wrapper missing FTS5, sqlift, sqldeep auto-transpile that mnemo needs to adopt sqlpipe.Database
     discovered: 2026-04-29
+    achieved: 2026-07-11
   T14:
     name: scripts/bundle-deps.sh syncs the sqlift API block in dist/sqlpipe.h automatically
     status: achieved

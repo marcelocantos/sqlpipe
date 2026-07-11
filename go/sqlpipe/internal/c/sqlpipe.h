@@ -74,8 +74,10 @@ int sqldeep_register_sqlite(sqlite3* db);
 
 // ── Bundled: sqlift (schema migration) ──────────────────────────
 // Declarative SQLite schema diffing and migration.
+// Auto-synced from vendor/include/sqlift.h by scripts/bundle-deps.sh —
+// do not edit this block by hand.
 
-#define SQLIFT_VERSION       "0.14.0"
+#define SQLIFT_VERSION "0.14.0"
 #define SQLIFT_VERSION_MAJOR 0
 #define SQLIFT_VERSION_MINOR 14
 #define SQLIFT_VERSION_PATCH 0
@@ -101,15 +103,15 @@ enum sqlift_error_type {
 };
 
 // Atomic permission bits for sqlift_apply_options.allow.
-#define SQLIFT_ALLOW_REBUILD        (1u << 0)
-#define SQLIFT_ALLOW_DESTRUCTIVE    (1u << 1)
-#define SQLIFT_ALLOW_LOOSEN         (1u << 2)
+#define SQLIFT_ALLOW_REBUILD     (1u << 0)
+#define SQLIFT_ALLOW_DESTRUCTIVE (1u << 1)
+#define SQLIFT_ALLOW_LOOSEN      (1u << 2)
 #define SQLIFT_ALLOW_DATA_DEPENDENT (1u << 3)
-#define SQLIFT_ALLOW_NONE           0u
-#define SQLIFT_ALLOW_ALL            (SQLIFT_ALLOW_REBUILD | SQLIFT_ALLOW_DESTRUCTIVE \
-                                     | SQLIFT_ALLOW_LOOSEN | SQLIFT_ALLOW_DATA_DEPENDENT)
+#define SQLIFT_ALLOW_NONE        0u
+#define SQLIFT_ALLOW_ALL            (SQLIFT_ALLOW_REBUILD | SQLIFT_ALLOW_DESTRUCTIVE | SQLIFT_ALLOW_LOOSEN | SQLIFT_ALLOW_DATA_DEPENDENT)
 
 typedef struct sqlift_apply_options {
+    // Bitmask of SQLIFT_ALLOW_* flags. 0 = deny everything (strictest).
     unsigned int allow;
 } sqlift_apply_options;
 
@@ -117,7 +119,6 @@ typedef struct sqlift_db sqlift_db;
 
 sqlift_db* sqlift_db_open(const char* path, int flags,
                           int* err_type, char** err_msg);
-sqlift_db* sqlift_db_wrap(sqlite3* handle);
 void sqlift_db_close(sqlift_db* db);
 int sqlift_db_exec(sqlift_db* db, const char* sql, char** err_msg);
 char* sqlift_parse(const char* ddl, int* err_type, char** err_msg);
@@ -136,6 +137,9 @@ int sqlift_db_query_int64(sqlift_db* db, const char* sql,
                           int64_t* result, char** err_msg);
 char* sqlift_db_query_text(sqlift_db* db, const char* sql, char** err_msg);
 void sqlift_free(void* ptr);
+// sqlpipe shim: wrap an existing sqlite3* (not owned). Implemented in the
+// bundled sqlift section of dist/sqlpipe.cpp by scripts/bundle-deps.sh.
+sqlift_db* sqlift_db_wrap(sqlite3* handle);
 
 #ifdef __cplusplus
 }
