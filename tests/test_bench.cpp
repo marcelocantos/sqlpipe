@@ -92,6 +92,30 @@ std::vector<Message> deliver_to_master(const std::vector<Message>& msgs,
 
 } // namespace
 
+TEST_CASE("bench: diff sync 1k rows already in sync") {
+    DB master_db, replica_db;
+    const char* schema =
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    populate(master_db, replica_db, master, 1000);
+
+    CHECK(master_db.count("t1") == 1000);
+    CHECK(replica_db.count("t1") == 1000);
+
+    Replica replica(replica_db.db);
+
+    auto start = Clock::now();
+    sync_handshake(master, replica);
+    double ms = elapsed_ms(start);
+
+    MESSAGE("diff sync (1k rows, in sync): " << ms << " ms");
+    CHECK(ms < 1000.0);
+    CHECK(replica_db.count("t1") == 1000);
+}
+
 TEST_CASE("bench: diff sync 10k rows already in sync") {
     DB master_db, replica_db;
     const char* schema =
