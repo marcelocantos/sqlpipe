@@ -559,8 +559,11 @@ recv(socket, buf.data() + 4, len);
 auto msg = sqlpipe::deserialize(buf);    // or deserialize_peer(buf)
 ```
 
-The Go wrapper provides a `Transport` interface in
-`go/sqlpipe/transport` for pluggable transport implementations.
+The Go wrapper provides a dual-channel `Transport` interface in
+`go/sqlpipe/transport` for pluggable implementations: `Delivery::Reliable`
+maps to `Send`/`Recv`, `Delivery::BestEffort` to `SendDatagram`/`RecvDatagram`.
+In-memory tests cover lossy datagrams (re-converge until Live); real network
+wiring is the caller's responsibility.
 
 ## Thread safety
 

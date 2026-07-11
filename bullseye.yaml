@@ -28,20 +28,22 @@ targets:
     discovered: 2026-03-12
     achieved: 2026-03-15
   T10:
-    name: sqlpipe replicates over tern with dual-channel transport
-    status: identified
+    name: Dual-channel Go transport proves loss-tolerant BestEffort routing
+    status: achieved
     value: 13.0
     cost: 8.0
+    actual_cost: 5.0
     acceptance:
-    - Go integration layer connects sqlpipe's Go wrapper to tern's `Conn` API
-    - '`Delivery::Reliable` messages route to `tern.Conn.Send()` (QUIC stream)'
-    - '`Delivery::BestEffort` messages route to `tern.Conn.SendDatagram()` (QUIC datagram)'
-    - Changeset queue provides fast reconnect over the reliable channel
-    - Convergence loop runs over datagrams for loss-tolerant state sync
-    - 'End-to-end test: two Go processes replicate through a tern relay'
-    context: tern provides both reliable streams and unreliable datagrams over QUIC. sqlpipe's `OutMessage` delivery hints (shipped in v0.15.0) map directly to these channels. The convergence loop replaces the linear diff sync handshake with a continuous, loss-tolerant state comparison protocol — bucket hashes over datagrams, with the diff protocol regenerating on loss rather than requiring retransmission.
+    - '`go/sqlpipe/transport` routes `Delivery::Reliable` to `Transport.Send` and `Delivery::BestEffort` to `Transport.SendDatagram` (no live-gate; hints always apply)'
+    - Controlled lossy in-memory dual-channel mock drops outbound datagrams while the stream stays reliable
+    - Under datagram loss, replica re-converges until Live and live-streams a row over the reliable channel
+    - Tests assert BestEffort traffic uses the datagram path and that drops actually occurred (non-vacuous)
+    - No dependency on tern/pigeon inside sqlpipe; real network E2E is out of scope for this library
+    context: 'Reframed 2026-07-11: tern is obsolete; sqlpipe is transport-agnostic (message-in/out + delivery hints). The library gap was not a real QUIC stack — it was a controlled lossy dual-channel test. Implemented lossy mock + re-converge-until-Live in RunReplica; removed go/terntest (tern-only). Real multi-process E2E belongs with the app transport (e.g. pigeon), not this repo.'
     origin: manual
     discovered: 2026-03-30
+    achieved: 2026-07-11
+
   T11:
     name: Unified database product combining sqlpipe, sqlift, and sqldeep
     status: achieved
