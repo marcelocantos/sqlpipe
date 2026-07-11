@@ -217,6 +217,31 @@ for (auto& m : peer_msgs) {
 `SqliteError`, `ProtocolError`, `SchemaMismatch`, `InvalidState`,
 `OwnershipRejected`, `WithoutRowidTable`.
 
+### Go wrapper (`go/sqlpipe`)
+
+```
+go get github.com/marcelocantos/sqlpipe/go/sqlpipe@v0.28.0
+```
+
+Self-contained CGo module (vendored SQLite with session/preupdate + FTS5).
+`Database` mirrors the C++ surface:
+
+```go
+db, err := sqlpipe.OpenDatabase(":memory:",
+    "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+// optional second arg: sqlift schema migration on open
+_ = db.Migrate("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)")
+_ = db.Exec("INSERT INTO items VALUES (1, 'Widget', 10)")
+// sqldeep syntax is transpiled on Exec/Query/Rows when extended markers
+// are present (e.g. SELECT {id, name}). Plain DDL is left alone so FTS5
+// CREATE VIRTUAL TABLE … works.
+qr, _ := db.Query("SELECT {id, name} FROM items")
+_ = db.Exec("CREATE VIRTUAL TABLE docs USING fts5(content)")
+```
+
+Also: `Master` / `Replica` / `Peer` with the same wire protocol as C++.
+Use `go/sqlpipe/vX.Y.0` path-prefixed tags (created alongside root tags).
+
 ## Gotchas
 
 - `Database` owns the `sqlite3*` handle. `Master`, `Replica`, and `Peer` do
