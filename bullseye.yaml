@@ -28,20 +28,21 @@ targets:
     discovered: 2026-03-12
     achieved: 2026-03-15
   T10:
-    name: sqlpipe replicates over tern with dual-channel transport
-    status: identified
+    name: Dual-channel Go transport proves loss-tolerant BestEffort routing
+    status: achieved
     value: 13.0
     cost: 8.0
+    actual_cost: 5.0
     acceptance:
-    - Go integration layer connects sqlpipe's Go wrapper to tern's `Conn` API
-    - '`Delivery::Reliable` messages route to `tern.Conn.Send()` (QUIC stream)'
-    - '`Delivery::BestEffort` messages route to `tern.Conn.SendDatagram()` (QUIC datagram)'
-    - Changeset queue provides fast reconnect over the reliable channel
-    - Convergence loop runs over datagrams for loss-tolerant state sync
-    - 'End-to-end test: two Go processes replicate through a tern relay'
-    context: tern provides both reliable streams and unreliable datagrams over QUIC. sqlpipe's `OutMessage` delivery hints (shipped in v0.15.0) map directly to these channels. The convergence loop replaces the linear diff sync handshake with a continuous, loss-tolerant state comparison protocol — bucket hashes over datagrams, with the diff protocol regenerating on loss rather than requiring retransmission.
+    - '`go/sqlpipe/transport` routes `Delivery::Reliable` to `Transport.Send` and `Delivery::BestEffort` to `Transport.SendDatagram` (no live-gate; hints always apply)'
+    - Controlled lossy in-memory dual-channel mock drops outbound datagrams while the stream stays reliable
+    - Under datagram loss, replica re-converges until Live and live-streams a row over the reliable channel
+    - Tests assert BestEffort traffic uses the datagram path and that drops actually occurred (non-vacuous)
+    - No dependency on tern/pigeon inside sqlpipe; real network E2E is out of scope for this library
+    context: 'Reframed 2026-07-11: tern is obsolete; sqlpipe is transport-agnostic (message-in/out + delivery hints). The library gap was not a real QUIC stack — it was a controlled lossy dual-channel test. Implemented lossy mock + re-converge-until-Live in RunReplica; removed go/terntest (tern-only). Real multi-process E2E belongs with the app transport (e.g. pigeon), not this repo.'
     origin: manual
     discovered: 2026-03-30
+    achieved: 2026-07-11
   T11:
     name: Unified database product combining sqlpipe, sqlift, and sqldeep
     status: achieved
@@ -702,6 +703,74 @@ targets:
     origin: manual
     discovered: 2026-07-06
     achieved: 2026-07-06
+  T26:
+    name: Schema evolution is structural state, not replicated DDL history
+    status: set_aside
+    value: 0.0
+    cost: 0.0
+    set_aside_reason: 'Parked: design direction captured; not scheduled for implementation during 1.0 settling. Re-open when productizing structural schema convergence helpers (beyond on_schema_mismatch + generate_migration) or when market pressure forces a clearer schema UX — never as raw DDL propagation.'
+    acceptance:
+    - 'Public docs state the doctrine: schema is structural state (sqlift extract/diff/apply); DDL is notation for authoring/display, not replicated history'
+    - No wire message that executes opaque DDL SQL on the peer (no DdlMsg / raw-SQL-down-the-pipe)
+    - 'Batteries-included structural convergence path exists (or is the documented default): on mismatch, plan = diff(extract(local), extract(remote|desired)), apply with policy, re-handshake; success gated by fingerprint equality'
+    - on_schema_mismatch remains an app-owned escape hatch for non-structural policy without becoming the recommended default
+    - Database desired-schema open path stays the happy path for new apps (declarative want-state, open = converge)
+    - Roadmap/docs never advertise "DDL propagation" as a feature; name work "schema convergence" if automated later
+    context: 'Parked 2026-07-11 from product-direction discussion. Opinion: traditional DDL-as-history is a root cause of data-management pain — you cannot establish current schema by inspecting a DDL stream; equivalence and identity are structural. sqlift exists for this reason; sqlpipe already fingerprints via structural hash and exposes generate_migration / Database auto-migrate. Product conundrum: popularity may demand DDL-shaped UX without forcing the bad ontology. Resolution: keep structural schema as sole source of truth on the wire and in identity; offer DDL only as input notation and optional projected CREATE text for humans; refuse raw statement replication. Three-tier packaging when unparked: (1) mismatch callback escape hatch, (2) structural converge helper as magic path, (3) opinionated Database desired-schema default. Explicit non-goals: DdlMsg, distributed DDL logs, APIs that imply schema = ordered statement list. Re-open when productizing schema UX beyond the current callback + generate_migration surface (likely post-1.0 settling or when demand forces a converge helper).'
+    tags:
+    - schema
+    - sqlift
+    - product
+    - parked
+    origin: session discussion 2026-07-11 (DDL ontology / product packaging)
+    discovered: 2026-07-11
+  T27:
+    name: Edge projection spec defines U_P for multiplayer players (global ∪ private ∪ scoped membership)
+    status: set_aside
+    value: 0.0
+    cost: 0.0
+    set_aside_reason: 'Parked: research captured in docs/research/edge-projection-multiplayer.md. Not scheduled during 1.0 settling. Re-open when productizing partial sync / multiplayer edge projection (scope membership model).'
+    acceptance:
+    - Design doc docs/research/edge-projection-multiplayer.md remains the canonical research capture until superseded by an implementation design
+    - 'A projection specification model is documented and (when implemented) executable: table classes global|private|scoped|do_not_sync; scope kinds with membership + contents; private key; write policy sketched'
+    - Co-interest is expressed as scope membership (e.g. match_players), not as ad hoc join inference over the full schema FK graph
+    - U_P for player P = Global ∪ Private(P) ∪ Scoped(ActiveScopes(P)); edges never receive U \ U_P
+    - 'Spike or implementation can demonstrate: two players join a match → both edges sync shared match contents; private inventory of opponent does not appear on edge'
+    - sqlpipe table_filter / owned_tables / subscriptions are positioned correctly (filters, write ownership, UI) — projection is a layer above the replication core
+    - Hub engine choice (SQLite vs Postgres adapter) is explicit and secondary to the projection model
+    context: 'Parked 2026-07-11. Primary use case: casual turn-based multiplayer. Hub holds a large multi-tenant universe; each player edge holds SQLite materialization of a declared slice. Hard tenancy is the outer shell; gameplay co-interest (two players in one match) is the hard shell — pure player_id stamps and raw FK closure fail for shared instance data. Preferred model: versioned global catalog + private rows + scope membership (match/party/…). "Stall once and figure out both players" = membership transaction at matchmaking, then both edges diff-sync contents(scope). Orthogonal to IVM/subscriptions (UI over local U_P). Related research: docs/research/edge-projection-multiplayer.md. Broader "SQLite edge, Postgres hub" is an engine/deployment option under this interest model, not a substitute for it. Re-open when productizing partial sync / shapes / multi-edge hub for games.'
+    tags:
+    - multiplayer
+    - projection
+    - partial-sync
+    - product
+    - parked
+    origin: session discussion 2026-07-11 (multiplayer edge projection)
+    discovered: 2026-07-11
+  T28:
+    name: Hub may materialize the multiplayer universe in Postgres while edges remain SQLite via sqlpipe-shaped sync
+    status: set_aside
+    value: 0.0
+    cost: 0.0
+    set_aside_reason: 'Parked with 🎯T27: hub engine is secondary to edge projection research (docs/research/edge-projection-multiplayer.md). Re-open after projection direction is productized or a deployment forces Postgres SoR.'
+    acceptance:
+    - docs/research/edge-projection-multiplayer.md § hub engine options remains the decision frame until an implementation design supersedes it
+    - Projection layer (🎯T27) is the interest policy; hub engine does not redefine U_P by ad hoc joins
+    - 'Chosen path is one of: (B) SQLite hub + optional Postgres mirror, or (D) sqlpipe message ↔ Postgres DML adapter — documented with tradeoffs'
+    - 'If (D): type mapping, INTEGER PK identity, change capture (logical decoding or outbox), and structural schema dual-emit are specified before coding'
+    - sqldeep SQLDEEP_POSTGRES remains the shared query-language wedge, not a substitute for the data plane
+    - No claim of full Electric/PowerSync parity without scoped membership + ownership differentiation
+    context: Parked 2026-07-11. Secondary to 🎯T27 edge projection. "SQLite edge, Postgres hub" is attractive for ops and for sqldeep's dual backend, but change capture is asymmetric (SQLite session vs Postgres logical decoding), identity and types differ, and multi-edge fan-in needs the scope model first. Prefer not porting Master into libpq inside core; keep message-in/out + adapter process. Re-open after projection spike or when hub engine choice blocks a game deployment.
+    depends_on:
+    - T27
+    tags:
+    - postgres
+    - hub
+    - multiplayer
+    - product
+    - parked
+    origin: session discussion 2026-07-11 (SQLite edge / Postgres hub)
+    discovered: 2026-07-11
   T3:
     name: sqlpipe runs in the browser via Emscripten + JS wrapper
     status: achieved

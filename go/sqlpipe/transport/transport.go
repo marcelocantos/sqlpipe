@@ -3,35 +3,40 @@
 
 // Package transport provides a dual-channel transport adapter for sqlpipe
 // replication over network connections that support both reliable streams
-// and unreliable datagrams (e.g., QUIC via tern).
+// and unreliable datagrams (e.g. QUIC).
 //
 // The adapter routes outgoing messages based on their Delivery hint:
 // Reliable messages go to the stream channel, BestEffort messages go
 // to the datagram channel. Incoming messages from both channels are
 // merged and delivered to the sqlpipe message handler.
 //
-// During the handshake phase (before both sides reach Live), all messages
-// are sent on the reliable stream regardless of delivery hint, because
-// the handshake protocol requires ordered, sequential message exchange.
-// Once live, BestEffort messages use the datagram channel.
+// BestEffort traffic is always routed to the datagram channel. The
+// convergence loop is regenerable: if a BestEffort probe is lost, the
+// replica re-converges until it reaches Live (or the context ends).
 //
-// Usage with tern:
+// Usage:
 //
-//	conn, _ := tern.Connect(ctx, relayURL, instanceID)
-//	link := transport.NewLink(conn) // tern.Conn satisfies Transport
-//	link.RunMaster(ctx, master)     // or RunReplica, RunPeer
+//	link := transport.NewLink(conn) // any Transport implementation
+//	link.RunMaster(ctx, master, flushCh)
+//	// or link.RunReplica(ctx, replica, handler)
 package transport
 
 import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	sqlpipe "github.com/marcelocantos/sqlpipe/go/sqlpipe"
 )
 
+// DefaultReConvergeInterval is how often RunReplica re-issues Converge
+// while the replica is not yet Live. Zero on Link means use this default.
+const DefaultReConvergeInterval = 50 * time.Millisecond
+
 // Transport is the interface for a dual-channel connection.
-// tern.Conn satisfies this interface directly.
+// Any stack with ordered reliable send/recv plus a datagram path
+// (QUIC, a test mock, etc.) can implement this.
 type Transport interface {
 	// Send writes data on the reliable ordered channel.
 	Send(ctx context.Context, data []byte) error
@@ -49,9 +54,11 @@ type Transport interface {
 // Link connects a sqlpipe instance to a Transport, routing messages
 // by delivery hint and merging incoming messages from both channels.
 type Link struct {
-	t    Transport
-	mu   sync.Mutex
-	live bool // true once handshake completes — enables datagram routing
+	t Transport
+
+	// ReConvergeInterval controls how often the replica re-probes while
+	// not Live. Zero means DefaultReConvergeInterval.
+	ReConvergeInterval time.Duration
 }
 
 // NewLink creates a Link over the given Transport.
@@ -59,25 +66,17 @@ func NewLink(t Transport) *Link {
 	return &Link{t: t}
 }
 
-// setLive transitions to live mode, enabling datagram routing.
-func (l *Link) setLive() {
-	l.mu.Lock()
-	l.live = true
-	l.mu.Unlock()
+func (l *Link) reConvergeInterval() time.Duration {
+	if l.ReConvergeInterval > 0 {
+		return l.ReConvergeInterval
+	}
+	return DefaultReConvergeInterval
 }
 
-// isLive returns whether the link is in live mode.
-func (l *Link) isLive() bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.live
-}
-
-// send routes an OutMessage to the appropriate channel.
-// During handshake (not live), all messages use the reliable stream.
+// send routes an OutMessage to the appropriate channel by delivery hint.
 func (l *Link) send(ctx context.Context, om sqlpipe.OutMessage) error {
 	wire := sqlpipe.Serialize(om.Msg)
-	if l.isLive() && om.Delivery == sqlpipe.DeliveryBestEffort {
+	if om.Delivery == sqlpipe.DeliveryBestEffort {
 		return l.t.SendDatagram(wire)
 	}
 	return l.t.Send(ctx, wire)
@@ -86,7 +85,7 @@ func (l *Link) send(ctx context.Context, om sqlpipe.OutMessage) error {
 // sendPeer routes a PeerOutMessage to the appropriate channel.
 func (l *Link) sendPeer(ctx context.Context, pom sqlpipe.PeerOutMessage) error {
 	wire := sqlpipe.SerializePeer(pom.Msg)
-	if l.isLive() && pom.Delivery == sqlpipe.DeliveryBestEffort {
+	if pom.Delivery == sqlpipe.DeliveryBestEffort {
 		return l.t.SendDatagram(wire)
 	}
 	return l.t.Send(ctx, wire)
@@ -185,13 +184,14 @@ func (l *Link) RunMaster(ctx context.Context, m *sqlpipe.Master, flushCh <-chan 
 }
 
 // RunReplica runs the replica side of the replication protocol over the
-// transport. It initiates the handshake, receives messages from the
-// remote master, and sends responses back.
+// transport. It initiates convergence, re-probes while not Live (so
+// BestEffort loss is recoverable), receives messages from the remote
+// master, and sends responses back.
 //
 // handler is called for each HandleResult that contains changes or
 // subscription updates. Cancel ctx to stop the link.
 func (l *Link) RunReplica(ctx context.Context, r *sqlpipe.Replica, handler ReplicaHandler) error {
-	// Initiate convergence (replaces the hello handshake).
+	// Initial converge probe (BestEffort → datagram).
 	probe, err := r.Converge()
 	if err != nil {
 		return err
@@ -200,7 +200,7 @@ func (l *Link) RunReplica(ctx context.Context, r *sqlpipe.Replica, handler Repli
 		return err
 	}
 
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
 	var once sync.Once
 	fail := func(err error) { once.Do(func() { errc <- err }) }
 
@@ -227,10 +227,6 @@ func (l *Link) RunReplica(ctx context.Context, r *sqlpipe.Replica, handler Repli
 				return
 			}
 		}
-		// Transition to live when replica reaches Live state.
-		if r.State() == sqlpipe.ReplicaLive {
-			l.setLive()
-		}
 		if handler != nil && (len(hr.Changes) > 0 || len(hr.Subscriptions) > 0) {
 			if err := handler(hr); err != nil {
 				fail(err)
@@ -238,6 +234,34 @@ func (l *Link) RunReplica(ctx context.Context, r *sqlpipe.Replica, handler Repli
 			}
 		}
 	}
+
+	// Re-converge while not Live so lost BestEffort probes recover.
+	go func() {
+		ticker := time.NewTicker(l.reConvergeInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				fail(ctx.Err())
+				return
+			case <-ticker.C:
+				if r.State() == sqlpipe.ReplicaLive {
+					// Stay running until ctx ends so the stream/datagram
+					// receivers remain the exit path; just stop probing.
+					return
+				}
+				probe, err := r.Converge()
+				if err != nil {
+					fail(err)
+					return
+				}
+				if err := l.send(ctx, probe); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}
+	}()
 
 	// Stream receiver.
 	go func() {
@@ -317,9 +341,6 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 				fail(err)
 				return
 			}
-		}
-		if p.State() == sqlpipe.PeerLive {
-			l.setLive()
 		}
 		if handler != nil && (len(hr.Changes) > 0 || len(hr.Subscriptions) > 0) {
 			if err := handler(hr); err != nil {
