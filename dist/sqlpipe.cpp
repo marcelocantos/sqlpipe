@@ -917,18 +917,22 @@ bool auto_migrate_schema(sqlite3* db, const std::string& remote_schema_sql,
 
     // Apply the migration plan (allow rebuilds + destructive — master is authoritative).
     sqlift_db* sdb = sqlift_db_wrap(db);
-    sqlift_apply_options opts = { .allow = SQLIFT_ALLOW_ALL };
-    int rc = sqlift_apply(sdb, plan_json, opts, &err_type, &err_msg);
-    sqlift_free(plan_json);
-    sqlift_db_close(sdb);
-
+    int rc = sqlift_apply(sdb, plan_json, {.allow = SQLIFT_ALLOW_ALL},
+                          &err_type, &err_msg);
     if (rc != 0) {
+        // format_sqlift_failure is defined later in this TU (with Database).
+        // Inline the same shape here for log-only auto-migrate failures.
+        std::string detail = err_msg ? err_msg : "unknown";
         SQLPIPE_LOG(on_log, LogLevel::Error,
-                    "auto_migrate: failed to apply migration: {}",
-                    err_msg ? err_msg : "unknown");
+                    "auto_migrate: failed to apply migration [sqlift err_type={}]: {} | plan={}",
+                    err_type, detail, plan_json ? plan_json : "");
         sqlift_free(err_msg);
+        sqlift_free(plan_json);
+        sqlift_db_close(sdb);
         return false;
     }
+    sqlift_free(plan_json);
+    sqlift_db_close(sdb);
 
     SQLPIPE_LOG(on_log, LogLevel::Info,
                 "auto_migrate: schema migrated to match master");
@@ -4512,6 +4516,57 @@ Subscription::~Subscription() {
 Subscription::Subscription(Subscription&&) noexcept = default;
 Subscription& Subscription::operator=(Subscription&&) noexcept = default;
 
+namespace {
+
+// Map sqlift_error_type to a stable token for crash reports / log scraping.
+const char* sqlift_error_name(int err_type) {
+    switch (err_type) {
+    case SQLIFT_OK: return "OK";
+    case SQLIFT_ERROR: return "ERROR";
+    case SQLIFT_PARSE_ERROR: return "PARSE_ERROR";
+    case SQLIFT_EXTRACT_ERROR: return "EXTRACT_ERROR";
+    case SQLIFT_DIFF_ERROR: return "DIFF_ERROR";
+    case SQLIFT_APPLY_ERROR: return "APPLY_ERROR";
+    case SQLIFT_DRIFT_ERROR: return "DRIFT_ERROR";
+    case SQLIFT_DESTRUCTIVE_ERROR: return "DESTRUCTIVE_ERROR";
+    case SQLIFT_BREAKING_CHANGE_ERROR: return "BREAKING_CHANGE_ERROR";
+    case SQLIFT_JSON_ERROR: return "JSON_ERROR";
+    case SQLIFT_REBUILD_ERROR: return "REBUILD_ERROR";
+    default: return "UNKNOWN";
+    }
+}
+
+// Build a migration-failure message rich enough to diagnose on-device without
+// re-diffing offline. Includes sqlift error class and (when provided) the
+// migration plan JSON, truncated if huge so crash logs stay usable.
+std::string format_sqlift_failure(const char* stage, int err_type,
+                                  const char* err_msg,
+                                  const char* plan_json = nullptr) {
+    std::string msg;
+    msg.reserve(256);
+    msg.append(stage);
+    msg.append(" [sqlift:");
+    msg.append(sqlift_error_name(err_type));
+    msg.append("] ");
+    msg.append(err_msg && err_msg[0] ? err_msg : "unknown error");
+    if (plan_json && plan_json[0]) {
+        constexpr std::size_t kMaxPlanBytes = 8192;
+        const std::size_t n = std::strlen(plan_json);
+        msg.append(" | plan=");
+        if (n <= kMaxPlanBytes) {
+            msg.append(plan_json);
+        } else {
+            msg.append(plan_json, kMaxPlanBytes);
+            msg.append("…[truncated, total ");
+            msg.append(std::to_string(n));
+            msg.append(" bytes]");
+        }
+    }
+    return msg;
+}
+
+} // namespace
+
 Database::Database(const std::string& path, const std::string& schema_ddl)
     : impl_(nullptr) {
     sqlite3* db = nullptr;
@@ -4536,28 +4591,28 @@ Database::Database(const std::string& path, const std::string& schema_ddl)
     if (!schema_ddl.empty()) {
         // Extract current schema from the database.
         auto* sdb = sqlift_db_wrap(db);
-        int err_type;
+        int err_type = 0;
         char* err_msg = nullptr;
 
         char* current_json = sqlift_extract(sdb, &err_type, &err_msg);
         if (!current_json) {
-            std::string error = err_msg ? err_msg : "unknown error";
+            std::string error = format_sqlift_failure(
+                "failed to extract schema", err_type, err_msg);
             sqlift_free(err_msg);
             sqlift_db_close(sdb);
-            throw Error(ErrorCode::SqliteError,
-                        "failed to extract schema: " + error);
+            throw Error(ErrorCode::SqliteError, std::move(error));
         }
 
         // Parse the desired schema.
         char* desired_json = sqlift_parse(schema_ddl.c_str(),
                                           &err_type, &err_msg);
         if (!desired_json) {
-            std::string error = err_msg ? err_msg : "unknown error";
+            std::string error = format_sqlift_failure(
+                "failed to parse schema DDL", err_type, err_msg);
             sqlift_free(err_msg);
             sqlift_free(current_json);
             sqlift_db_close(sdb);
-            throw Error(ErrorCode::SqliteError,
-                        "failed to parse schema DDL: " + error);
+            throw Error(ErrorCode::SqliteError, std::move(error));
         }
 
         // Diff and apply.
@@ -4567,25 +4622,28 @@ Database::Database(const std::string& path, const std::string& schema_ddl)
         sqlift_free(desired_json);
 
         if (!plan_json) {
-            std::string error = err_msg ? err_msg : "unknown error";
+            std::string error = format_sqlift_failure(
+                "failed to diff schemas", err_type, err_msg);
             sqlift_free(err_msg);
             sqlift_db_close(sdb);
-            throw Error(ErrorCode::SqliteError,
-                        "failed to diff schemas: " + error);
+            throw Error(ErrorCode::SqliteError, std::move(error));
         }
 
         // Allow rebuilds (e.g. column type changes) but not destructive drops.
-        sqlift_apply_options opts = { .allow = SQLIFT_ALLOW_REBUILD };
-        rc = sqlift_apply(sdb, plan_json, opts, &err_type, &err_msg);
+        rc = sqlift_apply(sdb, plan_json, {.allow = SQLIFT_ALLOW_REBUILD},
+                          &err_type, &err_msg);
+        if (rc != 0) {
+            // Keep plan_json in the exception so mobile crash reports include
+            // the full op list / SQL without an offline re-diff.
+            std::string error = format_sqlift_failure(
+                "failed to apply migration", err_type, err_msg, plan_json);
+            sqlift_free(err_msg);
+            sqlift_free(plan_json);
+            sqlift_db_close(sdb);
+            throw Error(ErrorCode::SqliteError, std::move(error));
+        }
         sqlift_free(plan_json);
         sqlift_db_close(sdb);
-
-        if (rc != 0) {
-            std::string error = err_msg ? err_msg : "unknown error";
-            sqlift_free(err_msg);
-            throw Error(ErrorCode::SqliteError,
-                        "failed to apply migration: " + error);
-        }
     }
 
     detail::ensure_meta_table(db);
@@ -7831,6 +7889,8 @@ void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts) {
     // when allow_rebuild is set, OR when it is pure loosening and
     // allow_loosen is set. A data-dependent op also requires
     // allow_data_dependent. Drops require allow_destructive.
+    // Messages always include op.description so on-device crash reports
+    // can diagnose without re-diffing offline.
     for (const auto& op : plan.operations()) {
         if (op.requires_rebuild) {
             bool rebuild_ok = opts.allow_rebuild ||
@@ -7838,8 +7898,8 @@ void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts) {
             if (!rebuild_ok) {
                 throw RebuildError(
                     "Migration plan requires a table rebuild for '" +
-                    op.object_name +
-                    "'. Set SQLIFT_ALLOW_REBUILD in opts.allow" +
+                    op.object_name + "': " + op.description +
+                    ". Set SQLIFT_ALLOW_REBUILD in opts.allow" +
                     (op.loosens_only
                         ? " (or SQLIFT_ALLOW_LOOSEN -- this rebuild is pure loosening)"
                         : "") +
@@ -7856,8 +7916,8 @@ void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts) {
         if (op.destructive && !opts.allow_destructive) {
             throw DestructiveError(
                 "Migration plan contains destructive operation on '" +
-                op.object_name +
-                "'. Set SQLIFT_ALLOW_DESTRUCTIVE in opts.allow to proceed.");
+                op.object_name + "': " + op.description +
+                ". Set SQLIFT_ALLOW_DESTRUCTIVE in opts.allow to proceed.");
         }
     }
 
@@ -7884,27 +7944,37 @@ void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts) {
     try {
         for (const auto& op : plan.operations()) {
             for (const auto& sql : op.sql) {
-                // PRAGMA foreign_key_check returns rows if there are violations.
-                // We need to handle this specially. The prefix match is safe
-                // because this SQL is generated by rebuild_table_sql() — plans
-                // from from_json() are trusted input (same as schema DDL).
-                if (sql.find("PRAGMA foreign_key_check") == 0) {
-                    Statement stmt(db, sql);
-                    if (stmt.step()) {
-                        std::string table = stmt.column_text(0);
-                        int64_t rowid = stmt.column_int(1);
-                        std::string parent = stmt.column_text(2);
-                        throw ApplyError(
-                            "Foreign key violation in table '" + table +
-                            "' (rowid " + std::to_string(rowid) +
-                            "): references missing row in parent table '" +
-                            parent + "'");
+                try {
+                    // PRAGMA foreign_key_check returns rows if there are violations.
+                    // We need to handle this specially. The prefix match is safe
+                    // because this SQL is generated by rebuild_table_sql() — plans
+                    // from from_json() are trusted input (same as schema DDL).
+                    if (sql.find("PRAGMA foreign_key_check") == 0) {
+                        Statement stmt(db, sql);
+                        if (stmt.step()) {
+                            std::string table = stmt.column_text(0);
+                            int64_t rowid = stmt.column_int(1);
+                            std::string parent = stmt.column_text(2);
+                            throw ApplyError(
+                                "Foreign key violation in table '" + table +
+                                "' (rowid " + std::to_string(rowid) +
+                                "): references missing row in parent table '" +
+                                parent + "'; during '" + op.object_name +
+                                "' (" + op.description + "); SQL: " + sql);
+                        }
+                        continue;
                     }
-                    continue;
-                }
 
-                Statement stmt(db, sql);
-                stmt.step();
+                    Statement stmt(db, sql);
+                    stmt.step();
+                } catch (const ApplyError&) {
+                    throw;
+                } catch (const std::exception& e) {
+                    throw ApplyError(
+                        std::string("Failed applying '") + op.object_name +
+                        "' (" + op.description + "): " + e.what() +
+                        "; SQL: " + sql);
+                }
             }
         }
     } catch (...) {

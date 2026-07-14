@@ -24,6 +24,20 @@ typedef struct sqlift_apply_options {
 	unsigned int allow;
 } sqlift_apply_options;
 
+enum sqlift_error_type {
+	SQLIFT_OK = 0,
+	SQLIFT_ERROR = 1,
+	SQLIFT_PARSE_ERROR = 2,
+	SQLIFT_EXTRACT_ERROR = 3,
+	SQLIFT_DIFF_ERROR = 4,
+	SQLIFT_APPLY_ERROR = 5,
+	SQLIFT_DRIFT_ERROR = 6,
+	SQLIFT_DESTRUCTIVE_ERROR = 7,
+	SQLIFT_BREAKING_CHANGE_ERROR = 8,
+	SQLIFT_JSON_ERROR = 9,
+	SQLIFT_REBUILD_ERROR = 10,
+};
+
 #define SQLIFT_ALLOW_REBUILD        (1u << 0)
 #define SQLIFT_ALLOW_DESTRUCTIVE    (1u << 1)
 #define SQLIFT_ALLOW_LOOSEN         (1u << 2)
@@ -90,6 +104,7 @@ import (
 	"iter"
 	"math"
 	"runtime/cgo"
+	"strconv"
 	"unsafe"
 )
 
@@ -165,12 +180,7 @@ func (d *Database) Migrate(schemaDDL string) error {
 
 	currentJSON := C.sqlift_extract(sdb, &errType, &errMsg)
 	if currentJSON == nil {
-		msg := "failed to extract schema"
-		if errMsg != nil {
-			msg = msg + ": " + C.GoString(errMsg)
-			C.sqlift_free(unsafe.Pointer(errMsg))
-		}
-		return &Error{Code: ErrSqlite, Msg: msg}
+		return &Error{Code: ErrSqlite, Msg: formatSqliftFailure("failed to extract schema", errType, errMsg, nil)}
 	}
 	defer C.sqlift_free(unsafe.Pointer(currentJSON))
 
@@ -179,39 +189,75 @@ func (d *Database) Migrate(schemaDDL string) error {
 	errMsg = nil
 	desiredJSON := C.sqlift_parse(cddl, &errType, &errMsg)
 	if desiredJSON == nil {
-		msg := "failed to parse schema DDL"
-		if errMsg != nil {
-			msg = msg + ": " + C.GoString(errMsg)
-			C.sqlift_free(unsafe.Pointer(errMsg))
-		}
-		return &Error{Code: ErrSqlite, Msg: msg}
+		return &Error{Code: ErrSqlite, Msg: formatSqliftFailure("failed to parse schema DDL", errType, errMsg, nil)}
 	}
 	defer C.sqlift_free(unsafe.Pointer(desiredJSON))
 
 	errMsg = nil
 	planJSON := C.sqlift_diff(currentJSON, desiredJSON, &errType, &errMsg)
 	if planJSON == nil {
-		msg := "failed to diff schemas"
-		if errMsg != nil {
-			msg = msg + ": " + C.GoString(errMsg)
-			C.sqlift_free(unsafe.Pointer(errMsg))
-		}
-		return &Error{Code: ErrSqlite, Msg: msg}
+		return &Error{Code: ErrSqlite, Msg: formatSqliftFailure("failed to diff schemas", errType, errMsg, nil)}
 	}
 	defer C.sqlift_free(unsafe.Pointer(planJSON))
 
-	opts := C.sqlift_apply_options{allow: C.SQLIFT_ALLOW_REBUILD}
 	errMsg = nil
-	rc := C.sqlift_apply(sdb, planJSON, opts, &errType, &errMsg)
+	rc := C.sqlift_apply(sdb, planJSON,
+		C.sqlift_apply_options{allow: C.SQLIFT_ALLOW_REBUILD},
+		&errType, &errMsg)
 	if rc != 0 {
-		msg := "failed to apply migration"
-		if errMsg != nil {
-			msg = msg + ": " + C.GoString(errMsg)
-			C.sqlift_free(unsafe.Pointer(errMsg))
-		}
-		return &Error{Code: ErrSqlite, Msg: msg}
+		// Include plan JSON so on-device reports can diagnose without re-diff.
+		return &Error{Code: ErrSqlite, Msg: formatSqliftFailure("failed to apply migration", errType, errMsg, planJSON)}
 	}
 	return nil
+}
+
+// formatSqliftFailure mirrors C++ format_sqlift_failure: stage, sqlift class,
+// message, and optional plan JSON (truncated) for mobile crash diagnosis.
+func formatSqliftFailure(stage string, errType C.int, errMsg *C.char, planJSON *C.char) string {
+	detail := "unknown error"
+	if errMsg != nil {
+		detail = C.GoString(errMsg)
+		C.sqlift_free(unsafe.Pointer(errMsg))
+	}
+	msg := stage + " [sqlift:" + sqliftErrorName(errType) + "] " + detail
+	if planJSON != nil {
+		plan := C.GoString(planJSON)
+		const maxPlan = 8192
+		if n := len(plan); n > maxPlan {
+			plan = plan[:maxPlan] + "…[truncated, total " + strconv.Itoa(n) + " bytes]"
+		}
+		msg += " | plan=" + plan
+	}
+	return msg
+}
+
+func sqliftErrorName(t C.int) string {
+	switch t {
+	case C.SQLIFT_OK:
+		return "OK"
+	case C.SQLIFT_ERROR:
+		return "ERROR"
+	case C.SQLIFT_PARSE_ERROR:
+		return "PARSE_ERROR"
+	case C.SQLIFT_EXTRACT_ERROR:
+		return "EXTRACT_ERROR"
+	case C.SQLIFT_DIFF_ERROR:
+		return "DIFF_ERROR"
+	case C.SQLIFT_APPLY_ERROR:
+		return "APPLY_ERROR"
+	case C.SQLIFT_DRIFT_ERROR:
+		return "DRIFT_ERROR"
+	case C.SQLIFT_DESTRUCTIVE_ERROR:
+		return "DESTRUCTIVE_ERROR"
+	case C.SQLIFT_BREAKING_CHANGE_ERROR:
+		return "BREAKING_CHANGE_ERROR"
+	case C.SQLIFT_JSON_ERROR:
+		return "JSON_ERROR"
+	case C.SQLIFT_REBUILD_ERROR:
+		return "REBUILD_ERROR"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 // looksLikeSqldeep reports whether sql likely uses sqldeep extended syntax.

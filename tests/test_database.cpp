@@ -1,7 +1,9 @@
 // Copyright 2026 The sqlpipe Authors
 // SPDX-License-Identifier: Apache-2.0
+#include <cstdio>
 #include <doctest.h>
 #include <sqlpipe.h>
+#include <string>
 
 using namespace sqlpipe;
 
@@ -23,6 +25,33 @@ TEST_CASE("database: schema migration creates tables") {
     Database db2(":memory:", "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
     auto r2 = db2.query("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='t'");
     CHECK(std::get<int64_t>(r2.rows[0][0]) == 1);
+}
+
+TEST_CASE("database: failed destructive migration error is diagnostic") {
+    // Database apply allows rebuild but not destructive drops. Opening an
+    // existing file DB with a schema that drops a column must throw a message
+    // rich enough for on-device crash reports (no offline re-diff).
+    const char* path = "test_mig_diag.db";
+    std::remove(path);
+    {
+        Database setup(path,
+                       "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, doomed TEXT)");
+        setup.exec("INSERT INTO t VALUES (1, 'a', 'x')");
+    }
+    try {
+        Database reopen(path, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+        FAIL("expected destructive migration to throw");
+    } catch (const Error& e) {
+        std::string msg = e.what();
+        CHECK(e.code() == ErrorCode::SqliteError);
+        CHECK(msg.find("failed to apply migration") != std::string::npos);
+        CHECK(msg.find("[sqlift:DESTRUCTIVE_ERROR]") != std::string::npos);
+        CHECK(msg.find("doomed") != std::string::npos);  // column / description
+        CHECK(msg.find("SQLIFT_ALLOW_DESTRUCTIVE") != std::string::npos);
+        CHECK(msg.find("| plan=") != std::string::npos);
+        CHECK(msg.find("\"description\"") != std::string::npos);
+    }
+    std::remove(path);
 }
 
 TEST_CASE("database: subscription fires on change") {
