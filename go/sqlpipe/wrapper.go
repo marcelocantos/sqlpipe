@@ -200,9 +200,10 @@ func (d *Database) Migrate(schemaDDL string) error {
 	}
 	defer C.sqlift_free(unsafe.Pointer(planJSON))
 
-	opts := C.sqlift_apply_options{allow: C.SQLIFT_ALLOW_REBUILD}
 	errMsg = nil
-	rc := C.sqlift_apply(sdb, planJSON, opts, &errType, &errMsg)
+	rc := C.sqlift_apply(sdb, planJSON,
+		C.sqlift_apply_options{allow: C.SQLIFT_ALLOW_REBUILD},
+		&errType, &errMsg)
 	if rc != 0 {
 		msg := "failed to apply migration"
 		if errMsg != nil {

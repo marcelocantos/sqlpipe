@@ -917,8 +917,8 @@ bool auto_migrate_schema(sqlite3* db, const std::string& remote_schema_sql,
 
     // Apply the migration plan (allow rebuilds + destructive — master is authoritative).
     sqlift_db* sdb = sqlift_db_wrap(db);
-    sqlift_apply_options opts = { .allow = SQLIFT_ALLOW_ALL };
-    int rc = sqlift_apply(sdb, plan_json, opts, &err_type, &err_msg);
+    int rc = sqlift_apply(sdb, plan_json, {.allow = SQLIFT_ALLOW_ALL},
+                          &err_type, &err_msg);
     sqlift_free(plan_json);
     sqlift_db_close(sdb);
 
@@ -4575,8 +4575,8 @@ Database::Database(const std::string& path, const std::string& schema_ddl)
         }
 
         // Allow rebuilds (e.g. column type changes) but not destructive drops.
-        sqlift_apply_options opts = { .allow = SQLIFT_ALLOW_REBUILD };
-        rc = sqlift_apply(sdb, plan_json, opts, &err_type, &err_msg);
+        rc = sqlift_apply(sdb, plan_json, {.allow = SQLIFT_ALLOW_REBUILD},
+                          &err_type, &err_msg);
         sqlift_free(plan_json);
         sqlift_db_close(sdb);
 
