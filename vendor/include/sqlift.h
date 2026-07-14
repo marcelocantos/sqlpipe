@@ -7,9 +7,9 @@
 // C API for FFI consumers (cgo, etc.). Data interchange is JSON strings.
 // Callers must free returned strings with sqlift_free().
 
-#define SQLIFT_VERSION "0.14.0"
+#define SQLIFT_VERSION "0.18.0"
 #define SQLIFT_VERSION_MAJOR 0
-#define SQLIFT_VERSION_MINOR 14
+#define SQLIFT_VERSION_MINOR 18
 #define SQLIFT_VERSION_PATCH 0
 
 #include <stdint.h>

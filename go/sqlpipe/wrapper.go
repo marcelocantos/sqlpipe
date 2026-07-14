@@ -105,6 +105,7 @@ import (
 	"math"
 	"runtime/cgo"
 	"strconv"
+	"strings"
 	"unsafe"
 )
 
@@ -163,8 +164,13 @@ func (d *Database) Close() error {
 }
 
 // Migrate brings the open database's schema in line with schemaDDL using
-// sqlift (extract → parse → diff → apply). Matches C++ Database open-time
+// sqlift (app-schema parse → diff → apply). Matches C++ Database open-time
 // migration: allows rebuild, not destructive drops.
+//
+// Current schema is built from app tables only (not sqlift_extract of the
+// whole DB), so sqlpipe/sqlift internal tables are never planned for drop.
+// sqlift stays product-agnostic; sqlpipe preserves its meta by controlling
+// what is presented as "current".
 func (d *Database) Migrate(schemaDDL string) error {
 	if schemaDDL == "" {
 		return nil
@@ -178,9 +184,15 @@ func (d *Database) Migrate(schemaDDL string) error {
 	var errType C.int
 	var errMsg *C.char
 
-	currentJSON := C.sqlift_extract(sdb, &errType, &errMsg)
+	currentSQL, err := appSchemaSQL(d.db)
+	if err != nil {
+		return err
+	}
+	ccur := C.CString(currentSQL)
+	defer C.free(unsafe.Pointer(ccur))
+	currentJSON := C.sqlift_parse(ccur, &errType, &errMsg)
 	if currentJSON == nil {
-		return &Error{Code: ErrSqlite, Msg: formatSqliftFailure("failed to extract schema", errType, errMsg, nil)}
+		return &Error{Code: ErrSqlite, Msg: formatSqliftFailure("failed to parse current app schema", errType, errMsg, nil)}
 	}
 	defer C.sqlift_free(unsafe.Pointer(currentJSON))
 
@@ -209,6 +221,41 @@ func (d *Database) Migrate(schemaDDL string) error {
 		return &Error{Code: ErrSqlite, Msg: formatSqliftFailure("failed to apply migration", errType, errMsg, planJSON)}
 	}
 	return nil
+}
+
+// appSchemaSQL returns CREATE statements for app tables only, matching C++
+// detail::get_schema_sql filters: not _sqlpipe_%, _sqlift_%, or sqlite_%.
+func appSchemaSQL(db *C.sqlite3) (string, error) {
+	const q = `SELECT sql FROM sqlite_master
+WHERE type='table'
+  AND name NOT LIKE '_sqlpipe_%'
+  AND name NOT LIKE '_sqlift_%'
+  AND name NOT LIKE 'sqlite_%'
+  AND sql IS NOT NULL
+ORDER BY name`
+	cq := C.CString(q)
+	defer C.free(unsafe.Pointer(cq))
+	var stmt *C.sqlite3_stmt
+	if C.sqlite3_prepare_v2(db, cq, -1, &stmt, nil) != C.SQLITE_OK {
+		return "", &Error{Code: ErrSqlite, Msg: C.GoString(C.sqlite3_errmsg(db))}
+	}
+	defer C.sqlite3_finalize(stmt)
+
+	var b strings.Builder
+	for C.sqlite3_step(stmt) == C.SQLITE_ROW {
+		p := C.sqlite3_column_text(stmt, 0)
+		if p == nil {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(";\n")
+		}
+		b.WriteString(C.GoString((*C.char)(unsafe.Pointer(p))))
+	}
+	if b.Len() > 0 {
+		b.WriteByte(';')
+	}
+	return b.String(), nil
 }
 
 // formatSqliftFailure mirrors C++ format_sqlift_failure: stage, sqlift class,

@@ -43,18 +43,18 @@ Eligible: 2026-10-06.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.29.0. Items annotated with stability assessments.
+Snapshot as of v0.30.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.29.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.30.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `29` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `30` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 | `SQLDEEP_VERSION` | `"0.23.0"` | **Stable** (bundled) |
-| `SQLIFT_VERSION` | `"0.14.0"` | **Stable** (bundled) |
+| `SQLIFT_VERSION` | `"0.18.0"` | **Stable** (bundled) |
 
 ### Type aliases
 
@@ -327,7 +327,7 @@ The following C APIs are bundled into `dist/sqlpipe.h` and available to consumer
 | SQLite: `xml_element_jsonml()`, `xml_attrs_jsonml()`, `jsonml_agg()` | **Fluid** (BLOB output since sqldeep 0.17.0) |
 | SQLite: `xml_element_jsx()`, `xml_attrs_jsx()`, `jsx_agg()` | **Fluid** (new in v0.24.0, JSX BLOB output) |
 | SQLite: `sqldeep_json()`, `sqldeep_json_object()`, `sqldeep_json_array()`, `sqldeep_json_group_array()` | **Fluid** (new in v0.24.0, BLOB output for JSON aggregates) |
-| `sqlift_parse()` / `sqlift_diff()` | **Stable** (matches sqlift 0.14.0; data-dependent changes are tagged on plan ops rather than thrown by `sqlift_diff`) |
+| `sqlift_parse()` / `sqlift_diff()` | **Stable** (matches sqlift 0.18.0; data-dependent changes are tagged on plan ops rather than thrown by `sqlift_diff`) |
 | `sqlift_apply()` | **Fluid** (signature stable since v0.22.0; v0.23.0 added `SQLIFT_ALLOW_LOOSEN` and `SQLIFT_ALLOW_DATA_DEPENDENT` opt-ins; `BreakingChangeError` is now an apply-time policy gate) |
 | `sqlift_extract()` / `sqlift_db_wrap()` / `sqlift_db_close()` | **Stable** |
 | `sqlift_schema_hash()` / `sqlift_detect_redundant_indexes()` | **Stable** |

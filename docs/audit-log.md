@@ -147,3 +147,9 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: (release tag)
 - **Outcome**: Released v0.29.0. Richer migration failure diagnostics for on-device crash reports (sqlift op description + failing SQL; Database/Go attach `[sqlift:…]` class and plan JSON). Inline `sqlift_apply` options. Lossy dual-channel transport tests + bullseye Makefile (🎯T10 retired). Research docs: subscription/IVM history and multiplayer edge projection (🎯T27/T28 parked). Non-breaking; settling clock unchanged (last break v0.26.0, eligible 2026-10-06).
+
+## 2026-07-14 — /release v0.30.0
+
+- **Commit**: (release tag)
+- **Outcome**: Released v0.30.0. 🎯T29: Database open-with-DDL migrates app schema only (get_schema_sql / appSchemaSQL), so `_sqlpipe_meta` and other internal tables are never planned for drop — sqlift stays product-agnostic. Rebundle sqlift v0.18.0 (richer apply errors). Regression test for reopen-with-same-DDL.
+- **Notes**: Non-breaking. Settling clock unchanged (last break v0.26.0).
