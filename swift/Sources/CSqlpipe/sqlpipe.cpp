@@ -4589,15 +4589,23 @@ Database::Database(const std::string& path, const std::string& schema_ddl)
 
     // Apply schema migration if DDL provided.
     if (!schema_ddl.empty()) {
-        // Extract current schema from the database.
+        // Current schema for the diff is *app* tables only — the same set
+        // get_schema_sql / fingerprint / auto_migrate use (excludes
+        // _sqlpipe_%, _sqlift_%, sqlite_%). sqlift is product-agnostic: it
+        // never hears about sqlpipe meta tables. sqlpipe "preserves" them by
+        // not offering them on the current side of the plan, so DropTable on
+        // _sqlpipe_meta is never generated. Desired schema is pure app DDL.
         auto* sdb = sqlift_db_wrap(db);
         int err_type = 0;
         char* err_msg = nullptr;
 
-        char* current_json = sqlift_extract(sdb, &err_type, &err_msg);
+        auto current_sql = detail::get_schema_sql(db);
+        char* current_json = sqlift_parse(
+            current_sql.empty() ? "" : current_sql.c_str(),
+            &err_type, &err_msg);
         if (!current_json) {
             std::string error = format_sqlift_failure(
-                "failed to extract schema", err_type, err_msg);
+                "failed to parse current app schema", err_type, err_msg);
             sqlift_free(err_msg);
             sqlift_db_close(sdb);
             throw Error(ErrorCode::SqliteError, std::move(error));
@@ -6116,11 +6124,28 @@ struct Trigger {
     bool operator==(const Trigger&) const = default;
 };
 
+// A virtual table created via CREATE VIRTUAL TABLE <name> USING <module>(<args>).
+// Diff treats any change as drop+recreate (destructive) — there is no in-place
+// modification for virtual tables. raw_sql holds the full statement;
+// equality compares only (name, module, args) so whitespace differences in
+// the raw text don't trigger spurious recreates.
+struct VirtualTable {
+    std::string name;
+    std::string module;
+    std::string args;
+    std::string raw_sql;
+
+    bool operator==(const VirtualTable& o) const {
+        return name == o.name && module == o.module && args == o.args;
+    }
+};
+
 struct Schema {
-    std::map<std::string, Table>   tables;
-    std::map<std::string, Index>   indexes;
-    std::map<std::string, View>    views;
-    std::map<std::string, Trigger> triggers;
+    std::map<std::string, Table>         tables;
+    std::map<std::string, Index>         indexes;
+    std::map<std::string, View>          views;
+    std::map<std::string, Trigger>       triggers;
+    std::map<std::string, VirtualTable>  virtual_tables;
 
     bool operator==(const Schema&) const = default;
 
@@ -6160,6 +6185,8 @@ enum class OpType {
     DropView,
     CreateTrigger,
     DropTrigger,
+    CreateVirtualTable,
+    DropVirtualTable,
 };
 
 struct Operation {
@@ -6482,6 +6509,14 @@ std::string Schema::hash() const {
     for (const auto& [name, trigger] : triggers)
         oss << "TRIGGER " << name << ' ' << trigger.sql << '\n';
 
+    // Virtual tables: emit only when non-empty so existing schemas without
+    // virtual tables keep their pre-existing hash.
+    if (!virtual_tables.empty()) {
+        for (const auto& [name, vt] : virtual_tables)
+            oss << "VTABLE " << name << " USING " << vt.module
+                << '(' << vt.args << ")\n";
+    }
+
     return sha256(oss.str());
 }
 
@@ -6728,6 +6763,91 @@ ParsedTableBody parse_create_table_body(const std::string& raw_sql) {
     return result;
 }
 
+// Extract module name and args from a CREATE VIRTUAL TABLE statement.
+// Input: "CREATE VIRTUAL TABLE [IF NOT EXISTS] <name> USING <module>[(<args>)]"
+// Output: (module, args). Returns ("", "") if the statement can't be parsed.
+struct VirtualTableSpec {
+    std::string module;
+    std::string args;
+};
+
+VirtualTableSpec parse_virtual_table_sql(const std::string& raw_sql) {
+    VirtualTableSpec spec;
+    std::string upper = to_upper(raw_sql);
+    auto using_pos = upper.find(" USING ");
+    if (using_pos == std::string::npos) return spec;
+
+    // Skip past " USING " to the module name.
+    size_t pos = using_pos + 7;
+    while (pos < raw_sql.size() &&
+           std::isspace(static_cast<unsigned char>(raw_sql[pos]))) ++pos;
+    size_t module_start = pos;
+    while (pos < raw_sql.size() && raw_sql[pos] != '(' &&
+           !std::isspace(static_cast<unsigned char>(raw_sql[pos]))) ++pos;
+    spec.module = raw_sql.substr(module_start, pos - module_start);
+
+    // Optional args inside the outermost parens. CREATE VIRTUAL TABLE allows
+    // omitting them entirely (e.g. "USING fts4"), in which case args stays "".
+    while (pos < raw_sql.size() && raw_sql[pos] != '(' &&
+           std::isspace(static_cast<unsigned char>(raw_sql[pos]))) ++pos;
+    if (pos >= raw_sql.size() || raw_sql[pos] != '(') return spec;
+
+    size_t args_start = pos + 1;
+    int depth = 1;
+    bool in_string = false;
+    char quote = 0;
+    ++pos;
+    while (pos < raw_sql.size() && depth > 0) {
+        char c = raw_sql[pos];
+        if (in_string) {
+            if (c == quote) {
+                if (pos + 1 < raw_sql.size() && raw_sql[pos + 1] == quote)
+                    ++pos; // escaped quote inside string literal
+                else
+                    in_string = false;
+            }
+        } else {
+            if (c == '\'' || c == '"') { in_string = true; quote = c; }
+            else if (c == '(') ++depth;
+            else if (c == ')') {
+                --depth;
+                if (depth == 0) break;
+            }
+        }
+        ++pos;
+    }
+    spec.args = raw_sql.substr(args_start, pos - args_start);
+    return spec;
+}
+
+// True if a sqlite_master row whose `sql` starts with these tokens describes
+// a virtual table (i.e. was created via CREATE VIRTUAL TABLE).
+bool is_virtual_table_sql(const std::string& sql) {
+    auto trimmed = trim(sql);
+    if (trimmed.size() < 21) return false; // "CREATE VIRTUAL TABLE "
+    auto upper = to_upper(trimmed.substr(0, 21));
+    return upper == "CREATE VIRTUAL TABLE ";
+}
+
+// Shadow-table name suffixes per virtual-table module. SQLite materializes
+// these as real CREATE TABLE rows in sqlite_master (with full SQL, not NULL
+// sql) but they are module-internal — the user never declares them. We
+// filter them during extract so they don't show up as regular tables and
+// trigger spurious DROP ops on the next diff.
+//
+// To support a new module, add its shadow suffixes here. An unknown module's
+// shadows will leak through as regular tables (visible failure mode — easy
+// to spot) rather than silently corrupting the parent vtable on apply.
+const std::map<std::string, std::vector<std::string>>& shadow_suffixes() {
+    static const std::map<std::string, std::vector<std::string>> kSuffixes = {
+        {"FTS5", {"_data", "_idx", "_content", "_docsize", "_config"}},
+        {"FTS4", {"_content", "_segments", "_segdir", "_docsize", "_stat"}},
+        {"FTS3", {"_content", "_segments", "_segdir"}},
+        {"RTREE", {"_node", "_rowid", "_parent"}},
+    };
+    return kSuffixes;
+}
+
 // Parse table options after the closing ')' of CREATE TABLE.
 // Returns (without_rowid, strict).
 std::pair<bool, bool> parse_table_options(const std::string& raw_sql) {
@@ -6786,8 +6906,41 @@ Schema extract(sqlite3* db) {
         });
     }
 
+    // First pass: identify virtual tables and the set of shadow-table names
+    // they generate. FTS5 et al. materialize shadows as real CREATE TABLE
+    // rows in sqlite_master with non-NULL sql, indistinguishable from user
+    // tables by row shape alone — we have to know the module's shadow
+    // naming convention.
+    std::set<std::string> shadow_table_names;
+    for (const auto& row : rows) {
+        if (row.type != "table") continue;
+        if (!is_virtual_table_sql(row.sql)) continue;
+        auto spec = parse_virtual_table_sql(row.sql);
+        auto it = shadow_suffixes().find(to_upper(spec.module));
+        if (it == shadow_suffixes().end()) continue;
+        for (const auto& suffix : it->second)
+            shadow_table_names.insert(row.name + suffix);
+    }
+
     for (const auto& row : rows) {
         if (row.type == "table") {
+            // Module-internal shadow tables: filtered by name based on the
+            // parent vtable's module. A user table named `foo_data_real` is
+            // NOT in this set (only the exact shadow suffixes for the
+            // module match), so it survives extraction normally.
+            if (shadow_table_names.count(row.name)) continue;
+
+            if (is_virtual_table_sql(row.sql)) {
+                VirtualTable vt;
+                vt.name = row.name;
+                vt.raw_sql = row.sql;
+                auto spec = parse_virtual_table_sql(row.sql);
+                vt.module = std::move(spec.module);
+                vt.args = std::move(spec.args);
+                schema.virtual_tables[vt.name] = std::move(vt);
+                continue;
+            }
+
             Table table;
             table.name = row.name;
             table.raw_sql = row.sql;
@@ -7588,6 +7741,37 @@ MigrationPlan diff(const Schema& current, const Schema& desired) {
         }
     }
 
+    // --- Phase 4b: Virtual table operations ---
+    // Virtual tables have no in-place modification path. Any change
+    // (module name, args, or removal) is drop+recreate, always destructive
+    // for the drop half. Drops emitted before creates so a recreate works
+    // when the name is reused.
+    for (const auto& [name, vt] : current.virtual_tables) {
+        auto it = desired.virtual_tables.find(name);
+        if (it == desired.virtual_tables.end() || !(it->second == vt)) {
+            plan.ops_.push_back({
+                .type = OpType::DropVirtualTable,
+                .object_name = name,
+                .description = "Drop virtual table " + name,
+                .sql = {"DROP TABLE IF EXISTS " + quote_id(name)},
+                .destructive = true,
+            });
+        }
+    }
+    for (const auto& [name, vt] : desired.virtual_tables) {
+        auto it = current.virtual_tables.find(name);
+        if (it == current.virtual_tables.end() || !(it->second == vt)) {
+            plan.ops_.push_back({
+                .type = OpType::CreateVirtualTable,
+                .object_name = name,
+                .description = "Create virtual table " + name +
+                               " USING " + vt.module,
+                .sql = {vt.raw_sql},
+                .destructive = false,
+            });
+        }
+    }
+
     // --- Phase 5: Create indexes (not part of rebuilds) ---
     for (const auto& [name, idx] : desired.indexes) {
         auto it = current.indexes.find(name);
@@ -8031,16 +8215,18 @@ struct OpTypeEntry {
 };
 
 constexpr OpTypeEntry op_type_names[] = {
-    {OpType::CreateTable,   "CreateTable"},
-    {OpType::DropTable,     "DropTable"},
-    {OpType::RebuildTable,  "RebuildTable"},
-    {OpType::AddColumn,     "AddColumn"},
-    {OpType::CreateIndex,   "CreateIndex"},
-    {OpType::DropIndex,     "DropIndex"},
-    {OpType::CreateView,    "CreateView"},
-    {OpType::DropView,      "DropView"},
-    {OpType::CreateTrigger, "CreateTrigger"},
-    {OpType::DropTrigger,   "DropTrigger"},
+    {OpType::CreateTable,        "CreateTable"},
+    {OpType::DropTable,          "DropTable"},
+    {OpType::RebuildTable,       "RebuildTable"},
+    {OpType::AddColumn,          "AddColumn"},
+    {OpType::CreateIndex,        "CreateIndex"},
+    {OpType::DropIndex,          "DropIndex"},
+    {OpType::CreateView,         "CreateView"},
+    {OpType::DropView,           "DropView"},
+    {OpType::CreateTrigger,      "CreateTrigger"},
+    {OpType::DropTrigger,        "DropTrigger"},
+    {OpType::CreateVirtualTable, "CreateVirtualTable"},
+    {OpType::DropVirtualTable,   "DropVirtualTable"},
 };
 
 } // namespace
@@ -8188,6 +8374,8 @@ MigrationPlan from_json(const std::string& json_str) {
                 case OpType::DropView:      expected_prefix = "DROP VIEW"; break;
                 case OpType::CreateTrigger: expected_prefix = "CREATE TRIGGER"; break;
                 case OpType::DropTrigger:   expected_prefix = "DROP TRIGGER"; break;
+                case OpType::CreateVirtualTable: expected_prefix = "CREATE VIRTUAL TABLE"; break;
+                case OpType::DropVirtualTable:   expected_prefix = "DROP TABLE"; break;
             }
             if (!starts_with(first_sql, expected_prefix)) {
                 throw JsonError(
@@ -8313,6 +8501,21 @@ std::string schema_to_json(const Schema& schema) {
         jtr[name] = std::move(jtrig);
     }
 
+    // Virtual tables. Emit only when non-empty so JSON for schemas without
+    // virtual tables stays byte-identical to the pre-feature output.
+    if (!schema.virtual_tables.empty()) {
+        auto& jvt = j["virtual_tables"];
+        jvt = nlohmann::json::object();
+        for (const auto& [name, vt] : schema.virtual_tables) {
+            nlohmann::json jvtbl;
+            jvtbl["name"] = vt.name;
+            jvtbl["module"] = vt.module;
+            jvtbl["args"] = vt.args;
+            jvtbl["raw_sql"] = vt.raw_sql;
+            jvt[name] = std::move(jvtbl);
+        }
+    }
+
     return j.dump(2);
 }
 
@@ -8413,6 +8616,18 @@ Schema schema_from_json(const std::string& json_str) {
             trig.table_name = jtrig.value("table_name", "");
             trig.sql = jtrig.value("sql", "");
             schema.triggers[name] = std::move(trig);
+        }
+    }
+
+    // Virtual tables (optional for forward-compat with older JSON).
+    if (j.contains("virtual_tables") && j["virtual_tables"].is_object()) {
+        for (const auto& [name, jvt] : j["virtual_tables"].items()) {
+            VirtualTable vt;
+            vt.name = jvt.value("name", "");
+            vt.module = jvt.value("module", "");
+            vt.args = jvt.value("args", "");
+            vt.raw_sql = jvt.value("raw_sql", "");
+            schema.virtual_tables[name] = std::move(vt);
         }
     }
 

@@ -771,6 +771,30 @@ targets:
     - parked
     origin: session discussion 2026-07-11 (SQLite edge / Postgres hub)
     discovered: 2026-07-11
+  T29:
+    name: Schema extract used for Database open-with-DDL never treats _sqlpipe_* (or other sqlpipe-owned) tables as droppable app schema
+    status: achieved
+    value: 8.0
+    cost: 3.0
+    actual_cost: 2.0
+    acceptance:
+    - sqlift extract (or the Database open-with-DDL path that feeds sqlift_diff) excludes sqlpipe-owned internal tables from "current" schema — at minimum names matching `_sqlpipe_%` (e.g. `_sqlpipe_meta`), consistent with sqlpipe's own user-table listing filters.
+    - Opening Database(path, schema_ddl) a second time when the file already has pose (or any app DDL) plus `_sqlpipe_meta` / `_sqlift_state` from a prior successful open does not plan DropTable on those internal tables and does not throw DESTRUCTIVE_ERROR.
+    - First open still creates app tables from schema_ddl and still creates/maintains `_sqlpipe_meta` (and sqlift state) as today.
+    - 'Regression test: open with schema_ddl, close, reopen with the same schema_ddl against the same file — succeeds; plan is empty or additive-only with respect to app tables; no DropTable on `_sqlpipe_meta` or `_sqlift_state`.'
+    - 'Optional: extract also excludes `_sqlift_%` generally (not only the exact name `_sqlift_state`) so future internal tables do not reintroduce the same class of bug.'
+    context: '2026-07-14 (ge stream/dist TiltBuggy on iOS Simulator): after a successful first open, PrefPath game.db contains pose + `_sqlpipe_meta` + `_sqlift_state`. Second launch runs Database(path, schema_ddl) with schema_ddl = app tables only. sqlift extract currently filters `sqlite_%` and `name != ''_sqlift_state''` but not `_sqlpipe_%`, so current schema includes `_sqlpipe_meta` while desired does not → plan DropTable `_sqlpipe_meta` (always destructive) → uncaught sqlpipe::Error / app crash. sqlpipe''s user-table listing already excludes `_sqlpipe_%` and `_sqlift_%`; extract used for auto-migrate must match that contract. Diagnosed with sqlpipe v0.29.0 richer plan-in-exception diagnostics in ge.'
+    tags:
+    - sqlift
+    - schema
+    - migration
+    - _sqlpipe_meta
+    - Database
+    - extract
+    - bug
+    origin: manual
+    discovered: 2026-07-14
+    achieved: 2026-07-14
   T3:
     name: sqlpipe runs in the browser via Emscripten + JS wrapper
     status: achieved

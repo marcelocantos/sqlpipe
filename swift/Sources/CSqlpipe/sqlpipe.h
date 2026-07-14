@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#define SQLPIPE_VERSION       "0.29.0"
+#define SQLPIPE_VERSION       "0.30.0"
 #define SQLPIPE_VERSION_MAJOR 0
-#define SQLPIPE_VERSION_MINOR 29
+#define SQLPIPE_VERSION_MINOR 30
 #define SQLPIPE_VERSION_PATCH 0
 
 // ── Bundled: sqldeep (query transpiler) ─────────────────────────
@@ -77,9 +77,9 @@ int sqldeep_register_sqlite(sqlite3* db);
 // Auto-synced from vendor/include/sqlift.h by scripts/bundle-deps.sh —
 // do not edit this block by hand.
 
-#define SQLIFT_VERSION "0.14.0"
+#define SQLIFT_VERSION "0.18.0"
 #define SQLIFT_VERSION_MAJOR 0
-#define SQLIFT_VERSION_MINOR 14
+#define SQLIFT_VERSION_MINOR 18
 #define SQLIFT_VERSION_PATCH 0
 
 #include <stdint.h>

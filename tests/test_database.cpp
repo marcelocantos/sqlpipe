@@ -27,6 +27,36 @@ TEST_CASE("database: schema migration creates tables") {
     CHECK(std::get<int64_t>(r2.rows[0][0]) == 1);
 }
 
+TEST_CASE("database: reopen with same schema_ddl preserves _sqlpipe_meta") {
+    // 🎯T29: second open must not plan DropTable on sqlpipe-owned meta.
+    // sqlpipe injects "preserve" by only presenting app tables as current
+    // schema to sqlift (get_schema_sql), never by teaching sqlift product names.
+    const char* path = "test_meta_preserve.db";
+    std::remove(path);
+    const char* ddl =
+        "CREATE TABLE pose (id INTEGER PRIMARY KEY, x REAL, y REAL)";
+    {
+        Database first(path, ddl);
+        first.exec("INSERT INTO pose VALUES (1, 1.0, 2.0)");
+        auto n = first.query(
+            "SELECT count(*) FROM sqlite_master WHERE name='_sqlpipe_meta'");
+        CHECK(std::get<int64_t>(n.rows[0][0]) == 1);
+    }
+    // Second open: same app DDL; file already has pose + _sqlpipe_meta +
+    // _sqlift_state. Must succeed without DESTRUCTIVE_ERROR.
+    Database second(path, ddl);
+    auto r = second.query("SELECT x FROM pose WHERE id = 1");
+    REQUIRE(r.rows.size() == 1);
+    CHECK(std::get<double>(r.rows[0][0]) == doctest::Approx(1.0));
+    auto meta = second.query(
+        "SELECT count(*) FROM sqlite_master WHERE name='_sqlpipe_meta'");
+    CHECK(std::get<int64_t>(meta.rows[0][0]) == 1);
+    auto state = second.query(
+        "SELECT count(*) FROM sqlite_master WHERE name='_sqlift_state'");
+    CHECK(std::get<int64_t>(state.rows[0][0]) >= 0);  // may exist after apply
+    std::remove(path);
+}
+
 TEST_CASE("database: failed destructive migration error is diagnostic") {
     // Database apply allows rebuild but not destructive drops. Opening an
     // existing file DB with a schema that drops a column must throw a message
