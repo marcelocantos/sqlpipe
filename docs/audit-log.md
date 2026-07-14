@@ -142,3 +142,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: (pending)
 - **Outcome**: Released v0.28.0. Ownership pass + Go Database parity (🎯T13): FTS5 enabled in CGo flags; `OpenDatabase(path, schemaDDL...)` and `Migrate` via sqlift; sqldeep transpile on Exec/Query/Rows (skipped unless extended syntax is present — sqldeep currently rewrites FTS5 DDL). 🎯T14: `scripts/bundle-deps.sh` auto-syncs the sqlift C API block in `dist/sqlpipe.h`. Target graph reconciled: retired 🎯T11 (unified product already shipped), 🎯T3 (Wasm path), 🎯T12 (diff-sync benches + baselines); set aside 🎯T11.4 (transport-agnostic design) and 🎯T3.4 (npm deferred). Non-breaking; settling clock unchanged (last break v0.26.0, eligible 2026-10-06). Verified: `cv test`, `go test ./...`, CI matrix.
+
+## 2026-07-14 — /release v0.29.0
+
+- **Commit**: (release tag)
+- **Outcome**: Released v0.29.0. Richer migration failure diagnostics for on-device crash reports (sqlift op description + failing SQL; Database/Go attach `[sqlift:…]` class and plan JSON). Inline `sqlift_apply` options. Lossy dual-channel transport tests + bullseye Makefile (🎯T10 retired). Research docs: subscription/IVM history and multiplayer edge projection (🎯T27/T28 parked). Non-breaking; settling clock unchanged (last break v0.26.0, eligible 2026-10-06).
