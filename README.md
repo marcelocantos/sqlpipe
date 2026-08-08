@@ -67,8 +67,9 @@ lost and recovered by the next convergence round.
   algebra; predicates are propagated through equijoins and evaluated by a
   bytecode VM. Supports equality, inequality, range, IS NULL, IN, NOT IN,
   BETWEEN, and OR-of-equalities.
-- **Prediction API** — `begin_prediction`/`commit_prediction`/`rollback_prediction`
-  for optimistic local updates with automatic rollback on server response
+- **Prediction API** — `begin_prediction`/`commit_prediction`/`end_prediction`/
+  `rollback_prediction` for optimistic local updates; optional
+  `queue_while_predicting` defers inbound apply until the prediction ends
 - **Auto-flush** — `MasterConfig::on_flush` callback fires on commit, so
   callers never need to call `flush()` explicitly
 - **Per-row change events** (insert/update/delete) on the receiving side
@@ -457,6 +458,22 @@ replica.commit_prediction();
 // Send the corresponding action to the server.
 // When the server's changeset arrives via handle_message(), the prediction
 // savepoint is automatically rolled back and the server's state applied.
+```
+
+Optional: preserve the sandbox until the app ends the prediction (e.g. short
+freehand strokes) by queueing inbound truth instead of applying it mid-gesture:
+
+```cpp
+ReplicaConfig cfg;
+cfg.queue_while_predicting = true;  // default false = historical clobber
+Replica replica(db, cfg);
+
+replica.begin_prediction();
+// ... local optimistic writes ...
+replica.commit_prediction();
+// Inbound handle_message() calls queue; prediction stays visible.
+auto result = replica.end_prediction();  // rollback savepoint, apply queue
+// Send result.messages (acks) back to the master.
 ```
 
 ### Reconnection

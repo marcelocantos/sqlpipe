@@ -788,6 +788,14 @@ struct ReplicaConfig {
 
     /// Log callback. nullptr = discard all log output.
     LogCallback on_log = nullptr;
+
+    /// When true, messages received while a prediction is active (Drafting
+    /// or Committed) are queued instead of applied, so inbound truth cannot
+    /// clobber the local sandbox mid-gesture. Call `end_prediction()` (or
+    /// `rollback_prediction()`) to roll back the savepoint and apply the
+    /// queue in order. Default false preserves historical behaviour: a
+    /// Committed prediction is auto-rolled back on the next handle_message.
+    bool queue_while_predicting = false;
 };
 
 /// Return type for Replica::handle_message.
@@ -854,16 +862,34 @@ public:
 
     /// Finalise the prediction — the client is done editing and will
     /// send the action to the server. The savepoint stays open until
-    /// the server responds (via handle_message, which auto-rollbacks).
+    /// `end_prediction()` / `rollback_prediction()`, or (when
+    /// `queue_while_predicting` is false) the next `handle_message`,
+    /// which auto-rollbacks.
     void commit_prediction();
 
-    /// Cancel the prediction before sending. Rolls back the savepoint,
-    /// restoring the pre-prediction state.
+    /// End an active prediction: roll back the savepoint, then apply any
+    /// messages queued under `queue_while_predicting`. Returns the combined
+    /// HandleResult from applying the queue (empty if none were queued).
+    /// Throws if no prediction is active.
+    HandleResult end_prediction();
+
+    /// Cancel the prediction (same savepoint rollback as `end_prediction`).
+    /// Any queued inbound messages are still applied afterwards so truth
+    /// catches up; their HandleResult is discarded. Prefer `end_prediction`
+    /// when you need subscription/change results from the drain.
     void rollback_prediction();
+
+    /// Number of inbound messages held while `queue_while_predicting` is
+    /// set and a prediction is active. Zero when not queueing.
+    std::size_t prediction_queue_size() const;
+
+    /// Whether this replica was constructed with queue_while_predicting.
+    bool queues_while_predicting() const;
 
     /// Reset to Init state for reconnection. Subscriptions are preserved;
     /// they will re-evaluate after the next handshake applies changes.
-    /// Also rolls back any active prediction.
+    /// Also rolls back any active prediction and drops any queued inbound
+    /// messages without applying them (reconnect/diff will resync).
     void reset();
 
     Seq current_seq() const;

@@ -828,6 +828,103 @@ TEST_CASE("prediction: error on double begin") {
     replica.rollback_prediction();  // cleanup
 }
 
+TEST_CASE("prediction: queue_while_predicting defers apply until end") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    ReplicaConfig rcfg;
+    rcfg.queue_while_predicting = true;
+    Replica replica(replica_db.db, rcfg);
+    REQUIRE(replica.queues_while_predicting());
+    sync_handshake(master, replica);
+
+    // Local prediction: row 1.
+    replica.begin_prediction();
+    replica_db.exec("INSERT INTO t1 VALUES (1, 'predicted')");
+    replica.commit_prediction();
+    CHECK(replica_db.count("t1") == 1);
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=1") == "predicted");
+
+    // Unrelated server write arrives during prediction — must not clobber.
+    master_db.exec("INSERT INTO t1 VALUES (2, 'other')");
+    auto other_msgs = master.flush();
+    auto deferred = replica.handle_message(other_msgs[0].msg);
+    CHECK(deferred.changes.empty());
+    CHECK(replica.prediction_queue_size() == 1);
+    // Predicted row still visible; server row not applied yet.
+    CHECK(replica_db.count("t1") == 1);
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=1") == "predicted");
+
+    // Matching server truth for the prediction, also deferred.
+    master_db.exec("INSERT INTO t1 VALUES (1, 'predicted')");
+    auto truth_msgs = master.flush();
+    replica.handle_message(truth_msgs[0].msg);
+    CHECK(replica.prediction_queue_size() == 2);
+    CHECK(replica_db.count("t1") == 1);
+
+    // End prediction: overlay gone, both queued applies land.
+    auto result = replica.end_prediction();
+    CHECK(replica.prediction_queue_size() == 0);
+    CHECK(replica_db.count("t1") == 2);
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=1") == "predicted");
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=2") == "other");
+    CHECK(result.changes.size() >= 1);
+}
+
+TEST_CASE("prediction: queue_while_predicting=false still auto-rollbacks") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    ReplicaConfig rcfg;
+    rcfg.queue_while_predicting = false;
+    Replica replica(replica_db.db, rcfg);
+    sync_handshake(master, replica);
+
+    replica.begin_prediction();
+    replica_db.exec("INSERT INTO t1 VALUES (1, 'predicted')");
+    replica.commit_prediction();
+
+    master_db.exec("INSERT INTO t1 VALUES (2, 'server')");
+    auto msgs = master.flush();
+    replica.handle_message(msgs[0].msg);
+
+    CHECK(replica.prediction_queue_size() == 0);
+    CHECK(replica_db.count("t1") == 1);
+    CHECK(replica_db.query_val("SELECT val FROM t1 WHERE id=2") == "server");
+}
+
+TEST_CASE("prediction: reset drops queue without applying") {
+    DB master_db, replica_db;
+    const char* schema = "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)";
+    master_db.exec(schema);
+    replica_db.exec(schema);
+
+    Master master(master_db.db);
+    ReplicaConfig rcfg;
+    rcfg.queue_while_predicting = true;
+    Replica replica(replica_db.db, rcfg);
+    sync_handshake(master, replica);
+
+    replica.begin_prediction();
+    replica_db.exec("INSERT INTO t1 VALUES (1, 'local')");
+    replica.commit_prediction();
+
+    master_db.exec("INSERT INTO t1 VALUES (2, 'server')");
+    auto msgs = master.flush();
+    replica.handle_message(msgs[0].msg);
+    CHECK(replica.prediction_queue_size() == 1);
+
+    replica.reset();
+    CHECK(replica.prediction_queue_size() == 0);
+    CHECK(replica_db.count("t1") == 0);  // prediction rolled back; queue dropped
+}
+
 // ── Fan-out tests (one Master, N Replicas) ──────────────────────
 
 TEST_CASE("fan-out: 3 replicas all receive same data") {
