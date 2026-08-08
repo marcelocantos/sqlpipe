@@ -357,10 +357,12 @@ public:
     HandleResult handle_messages(std::span<const Message> msgs);  // batched
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
-    void begin_prediction();       // optimistic local update
-    void commit_prediction();      // finalise prediction
-    void rollback_prediction();    // cancel prediction
-    void reset();                  // back to Init; preserves subscriptions
+    void begin_prediction();       // optimistic local update (SAVEPOINT)
+    void commit_prediction();      // done editing; await end or auto-clear
+    HandleResult end_prediction(); // rollback + apply queued inbound
+    void rollback_prediction();    // same drain; discard HandleResult
+    std::size_t prediction_queue_size() const;
+    void reset();                  // back to Init; drops prediction queue
     Seq current_seq() const;
     SchemaVersion schema_version() const;
     State state() const;  // Init, Handshake, DiffBuckets, DiffRows, Live, Error
@@ -447,21 +449,26 @@ needed.
 
 ### Prediction API
 
-Optimistic local updates with automatic rollback:
+Optimistic local updates for low-latency UI over **server-owned** tables.
+Prediction is a SAVEPOINT sandbox on the Replica: subscriptions can paint
+anticipated truth immediately; server apply always supersedes. It does **not**
+change ownership — still send intent on client-owned tables via Master/Peer.
+
+Default: automatic rollback when the next inbound message is applied:
 
 ```cpp
 replica.begin_prediction();
-// Write optimistically to the local database.
+// Write optimistically to the local replica of server-owned tables.
 sqlite3_exec(replica_db, "INSERT INTO items VALUES (99, 'pending')", 0, 0, 0);
 // Subscriptions now reflect the predicted state.
 replica.commit_prediction();
-// Send the corresponding action to the server.
-// When the server's changeset arrives via handle_message(), the prediction
-// savepoint is automatically rolled back and the server's state applied.
+// Send intent to the server on the Master path (separate from prediction).
+// When a changeset arrives via handle_message(), the prediction savepoint
+// is auto-rolled back and authoritative state applied.
 ```
 
-Optional: preserve the sandbox until the app ends the prediction (e.g. short
-freehand strokes) by queueing inbound truth instead of applying it mid-gesture:
+Optional: queue inbound truth until the app ends the prediction (short
+gestures — freehand strokes — so unrelated applies do not clobber paint):
 
 ```cpp
 ReplicaConfig cfg;
@@ -475,6 +482,11 @@ replica.commit_prediction();
 auto result = replica.end_prediction();  // rollback savepoint, apply queue
 // Send result.messages (acks) back to the master.
 ```
+
+**Agent guidance** (when to use, two-DB topology, short-lived discipline,
+intent vs paint): see
+[`dist/sqlpipe-agents-guide.md`](dist/sqlpipe-agents-guide.md) § *Optimistic
+prediction*. Edge-case tests: `tests/test_prediction_queue.cpp`.
 
 ### Reconnection
 
