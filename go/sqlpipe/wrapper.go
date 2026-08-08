@@ -1230,6 +1230,9 @@ func NewReplica(db *Database, config ReplicaConfig) (*Replica, error) {
 		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
 		cfg.log_ctx = unsafe.Pointer(uintptr(h))
 	}
+	if config.QueueWhilePredicting {
+		cfg.queue_while_predicting = 1
+	}
 
 	if err := convertError(C.sqlpipe_replica_new(db.db, cfg, &r.ptr)); err != nil {
 		r.handles.free()
@@ -1357,6 +1360,47 @@ func (r *Replica) SchemaVersion() SchemaVersion {
 	buf := C.sqlpipe_replica_schema_version(r.ptr)
 	defer C.sqlpipe_free_buf(buf)
 	return SchemaVersion(C.GoBytes(unsafe.Pointer(buf.data), C.int(buf.len)))
+}
+
+// BeginPrediction opens a SAVEPOINT sandbox for optimistic local truth.
+// Subscriptions fire on predicted rows. Only one prediction at a time.
+func (r *Replica) BeginPrediction() error {
+	return convertError(C.sqlpipe_replica_begin_prediction(r.ptr))
+}
+
+// CommitPrediction marks the prediction ready (still sandboxed until
+// EndPrediction or auto-clear on inbound apply).
+func (r *Replica) CommitPrediction() error {
+	return convertError(C.sqlpipe_replica_commit_prediction(r.ptr))
+}
+
+// EndPrediction rolls back the prediction savepoint and applies any
+// queued inbound messages (when QueueWhilePredicting). Prefer this over
+// RollbackPrediction so acks in HandleResult are returned.
+func (r *Replica) EndPrediction() (HandleResult, error) {
+	var buf C.sqlpipe_buf
+	if err := convertError(C.sqlpipe_replica_end_prediction(r.ptr, &buf)); err != nil {
+		return HandleResult{}, err
+	}
+	return decodeHandleResult(buf)
+}
+
+// RollbackPrediction ends the prediction (same drain as EndPrediction)
+// and discards the HandleResult.
+func (r *Replica) RollbackPrediction() error {
+	return convertError(C.sqlpipe_replica_rollback_prediction(r.ptr))
+}
+
+// PredictionQueueSize is the number of inbound messages held while
+// QueueWhilePredicting is active.
+func (r *Replica) PredictionQueueSize() int {
+	return int(C.sqlpipe_replica_prediction_queue_size(r.ptr))
+}
+
+// QueuesWhilePredicting reports whether this replica was constructed
+// with QueueWhilePredicting.
+func (r *Replica) QueuesWhilePredicting() bool {
+	return C.sqlpipe_replica_queues_while_predicting(r.ptr) != 0
 }
 
 // Close releases the Replica.

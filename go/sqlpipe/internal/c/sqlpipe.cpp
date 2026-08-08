@@ -4772,6 +4772,9 @@ struct Replica::Impl {
     // Prediction state.
     enum class PredictionState : uint8_t { None, Drafting, Committed };
     PredictionState prediction = PredictionState::None;
+    /// Inbound messages deferred while prediction is active and
+    /// config.queue_while_predicting is set.
+    std::vector<Message> prediction_queue;
 
     Impl(sqlite3* db_, ReplicaConfig cfg)
         : db(db_), config(std::move(cfg)), watch(db_) {}
@@ -5114,7 +5117,17 @@ std::vector<OutMessage> Replica::converge() {
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
-    // Auto-rollback a committed prediction before applying server data.
+    // Optional: hold inbound truth while a prediction sandbox is open.
+    if (impl_->config.queue_while_predicting &&
+        impl_->prediction != Impl::PredictionState::None) {
+        impl_->prediction_queue.push_back(msg);
+        SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug,
+                    "prediction queue: deferred inbound message (depth={})",
+                    impl_->prediction_queue.size());
+        return {};
+    }
+
+    // Default: auto-rollback a committed prediction before applying.
     if (impl_->prediction == Impl::PredictionState::Committed) {
         detail::exec(impl_->db, "ROLLBACK TO _sqlpipe_prediction");
         detail::exec(impl_->db, "RELEASE _sqlpipe_prediction");
@@ -5212,6 +5225,16 @@ HandleResult Replica::handle_message(const Message& msg) {
 }
 
 HandleResult Replica::handle_messages(std::span<const Message> msgs) {
+    if (impl_->config.queue_while_predicting &&
+        impl_->prediction != Impl::PredictionState::None) {
+        impl_->prediction_queue.insert(impl_->prediction_queue.end(),
+                                       msgs.begin(), msgs.end());
+        SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug,
+                    "prediction queue: deferred {} inbound messages (depth={})",
+                    msgs.size(), impl_->prediction_queue.size());
+        return {};
+    }
+
     if (impl_->prediction == Impl::PredictionState::Committed) {
         detail::exec(impl_->db, "ROLLBACK TO _sqlpipe_prediction");
         detail::exec(impl_->db, "RELEASE _sqlpipe_prediction");
@@ -5317,6 +5340,10 @@ void Replica::begin_prediction() {
         throw Error(ErrorCode::InvalidState,
                     "prediction already active");
     }
+    if (!impl_->prediction_queue.empty()) {
+        throw Error(ErrorCode::InvalidState,
+                    "prediction queue not empty; call end_prediction first");
+    }
     detail::exec(impl_->db, "SAVEPOINT _sqlpipe_prediction");
     impl_->prediction = PS::Drafting;
     SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "prediction begun");
@@ -5329,19 +5356,44 @@ void Replica::commit_prediction() {
                     "no drafting prediction to commit");
     }
     impl_->prediction = PS::Committed;
-    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "prediction committed (awaiting server)");
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug,
+                "prediction committed (awaiting end or server apply)");
 }
 
-void Replica::rollback_prediction() {
+HandleResult Replica::end_prediction() {
     using PS = Impl::PredictionState;
     if (impl_->prediction == PS::None) {
         throw Error(ErrorCode::InvalidState,
-                    "no active prediction to rollback");
+                    "no active prediction to end");
     }
     detail::exec(impl_->db, "ROLLBACK TO _sqlpipe_prediction");
     detail::exec(impl_->db, "RELEASE _sqlpipe_prediction");
     impl_->prediction = PS::None;
-    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug, "prediction rolled back");
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Debug,
+                "prediction ended (queue depth={})",
+                impl_->prediction_queue.size());
+
+    if (impl_->prediction_queue.empty()) {
+        return {};
+    }
+    auto queued = std::move(impl_->prediction_queue);
+    impl_->prediction_queue.clear();
+    return handle_messages(queued);
+}
+
+void Replica::rollback_prediction() {
+    // Discard overlay; still drain any deferred truth so the replica
+    // does not stay frozen. Callers that need the drain's HandleResult
+    // should use end_prediction() instead.
+    (void)end_prediction();
+}
+
+std::size_t Replica::prediction_queue_size() const {
+    return impl_->prediction_queue.size();
+}
+
+bool Replica::queues_while_predicting() const {
+    return impl_->config.queue_while_predicting;
 }
 
 void Replica::reset() {
@@ -5351,6 +5403,8 @@ void Replica::reset() {
         detail::exec(impl_->db, "RELEASE _sqlpipe_prediction");
         impl_->prediction = Impl::PredictionState::None;
     }
+    // Drop deferred messages — reconnect/diff will resync truth.
+    impl_->prediction_queue.clear();
     impl_->state = State::Init;
     impl_->seq = detail::read_seq(impl_->db, impl_->config.seq_key);
     SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info, "replica reset to Init at seq={}", impl_->seq);

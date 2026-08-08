@@ -182,6 +182,10 @@ type ReplicaConfig struct {
 	OnProgress       ProgressCallback        // nil = no reporting.
 	OnSchemaMismatch SchemaMismatchCallback  // nil = default behaviour.
 	OnLog            LogCallback             // nil = discard log output.
+	// QueueWhilePredicting holds inbound truth while a prediction is
+	// Drafting or Committed. Drain with EndPrediction (preferred).
+	// Default false: next HandleMessage auto-clears a committed prediction.
+	QueueWhilePredicting bool
 }
 
 // PeerConfig configures a Peer.
