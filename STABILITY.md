@@ -43,15 +43,15 @@ Eligible: 2026-10-06.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.30.0. Items annotated with stability assessments.
+Snapshot as of v0.31.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.30.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.31.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `30` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `31` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 | `SQLDEEP_VERSION` | `"0.23.0"` | **Stable** (bundled) |
 | `SQLIFT_VERSION` | `"0.18.0"` | **Stable** (bundled) |
@@ -128,7 +128,7 @@ Snapshot as of v0.30.0. Items annotated with stability assessments.
 | Struct | Fields | Stability |
 |---|---|---|
 | `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, on_flush, changeset_queue_size` | **Stable** |
-| `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log` | **Stable** |
+| `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, queue_while_predicting` | **Stable** (`queue_while_predicting` added for prediction hold) |
 | `PeerConfig` | `role, owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch, on_log` | **Stable** (owned_tables accepts glob patterns since v0.18.0) |
 | `RelayConfig` | `table_filter, on_conflict, on_schema_mismatch, on_log` | **Stable** |
 
@@ -188,7 +188,10 @@ class Replica {
     void unsubscribe(SubscriptionId id);
     void begin_prediction();
     void commit_prediction();
+    HandleResult end_prediction();
     void rollback_prediction();
+    std::size_t prediction_queue_size() const;
+    bool queues_while_predicting() const;
     void reset();
     Seq current_seq() const;
     SchemaVersion schema_version() const;
@@ -196,7 +199,9 @@ class Replica {
 };
 ```
 
-**Stability**: **Stable** (converge() added v0.16.0)
+**Stability**: **Stable** (converge() added v0.16.0; `end_prediction` /
+`prediction_queue_size` / `queues_while_predicting` /
+`queue_while_predicting` added for optional inbound queue during prediction)
 
 ### Peer class
 

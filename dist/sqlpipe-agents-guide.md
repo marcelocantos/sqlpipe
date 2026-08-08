@@ -87,6 +87,7 @@ auto qr = replica.subscribe("SELECT * FROM t1 ORDER BY id");
 // After handle_message, check r.subscriptions for updated results
 replica.unsubscribe(qr.id);
 replica.reset();              // return to Init; subscriptions preserved
+// (also rolls back any prediction and drops any queued inbound messages)
 ```
 
 `ReplicaConfig`:
@@ -94,6 +95,123 @@ replica.reset();              // return to Init; subscriptions preserved
   Abort.
 - `table_filter` — `optional<set<string>>`. `nullopt` = all tables, empty = none.
 - `bucket_size` — rows per bucket for diff protocol (default 1024).
+- `queue_while_predicting` — `bool`, default `false`. See **Optimistic
+  prediction** below.
+
+### Optimistic prediction (low-latency UI over server-owned truth)
+
+sqlpipe is dual uni-directional ownership: a client cannot master tables the
+server owns. Painting the UI from a subscription over server-owned tables
+therefore waits a full round trip unless you use **prediction** — a local
+SAVEPOINT sandbox on the **Replica** so subscriptions can show anticipated
+truth immediately. Server apply always wins when it lands.
+
+**When to use.** Interactive latency where the user must see local effect
+before the network returns (freehand drawing, dragging, typing into a
+server-owned row). Not for durable multi-writer, offline queues, or
+long-lived “pending” workflows — provisionality is a **session lifecycle**,
+not a data lifetime. Prefer prediction over app-level “tentative” columns:
+open-ended tentatives leave GC/identity holes; prediction closes the loop.
+
+**Lifecycle**
+
+```
+begin_prediction()     → Drafting  (SAVEPOINT open; write optimistically)
+  local writes...
+commit_prediction()    → Committed (done editing; still sandboxed)
+end_prediction()       → None      (rollback savepoint; apply any queue)
+// or rollback_prediction()  — same drain; discards HandleResult
+// or reset()                — drop queue without applying (reconnect)
+```
+
+- Only **one** prediction active at a time (`InvalidState` on double begin).
+- One prediction may contain many row writes (one gesture, many points).
+- Slot stays taken through **Committed** until end / auto-clear / reset —
+  sequentialize short gestures; do not expect concurrent independent
+  predictions.
+
+**Two modes of inbound truth**
+
+| `queue_while_predicting` | Behaviour |
+|---|---|
+| `false` (default) | Next `handle_message` **auto-rollbacks** a Committed prediction, then applies. Simple; unrelated truth can end the sandbox early (flicker). |
+| `true` | Inbound messages during Drafting **or** Committed are **queued**. Sandbox stays until `end_prediction()` / `rollback_prediction()`, which roll back then apply the queue in order. You **must** end the prediction or truth freezes and the queue grows. |
+
+```cpp
+ReplicaConfig cfg;
+cfg.queue_while_predicting = true;   // preserve paint for short gestures
+Replica truth(truth_db, cfg);
+
+truth.begin_prediction();
+// write anticipated rows into server-owned tables on truth_db
+truth.commit_prediction();
+// keep calling handle_message — messages queue; local paint stays
+auto hr = truth.end_prediction();    // e.g. on pen-up
+// forward hr.messages (acks) to the master
+```
+
+**Intent vs paint (critical).** Prediction only affects the **local replica
+of server-owned tables**. It does not ship intent upstream. Always:
+
+1. Write **intent** on client-owned tables (Master / Peer flush path).
+2. Optionally **predict** truth-shaped rows on the replica for instant UI.
+3. Server applies intent → authoritative truth replicates → prediction ends
+   and truth supersedes the guess.
+
+If guess ≠ server truth, the UI may briefly correct on end/apply — that is
+correct, not a bug.
+
+**Recommended topology: two databases / two pipes**
+
+Prefer separate SQLite handles for the two directions when using prediction
+seriously:
+
+| DB | Role | Prediction? |
+|---|---|---|
+| Intent | Client → server (`Master` only) | No |
+| Truth | Server → client (`Replica` only) | Yes (`queue_while_predicting` as needed) |
+
+Benefits: savepoint cannot roll back client-owned rows; intent-pipe traffic
+cannot tear down a truth prediction; lower SQLite writer contention between
+directions. Cost: no cross-DB SQL joins (join in the app).
+
+Avoid one shared `sqlite3*` for Master+Replica while a prediction is open
+unless you are sure **no** owned-table writes land inside the savepoint
+window (including after `commit_prediction` — the savepoint stays open until
+end/auto-clear). Writes inside the window are undone with the prediction.
+
+**Keep predictions short-lived.** After queue + dual DB, the remaining cost
+of a long hold is **truth lag** (collaborative updates and your own confirm
+wait until `end_prediction`) plus queue growth and a drain burst. Fine for
+sub-second gestures; treat multi-second holds as an explicit “draft frozen”
+mode, not the default. Short life also reduces how often the single-flight
+sandbox collides with the next gesture.
+
+**Do / don’t**
+
+| Do | Don’t |
+|---|---|
+| Predict only on truth-shaped, server-owned tables | Treat prediction as multi-writer ownership |
+| End on gesture complete (pen-up); drain acks | Leave queue mode open indefinitely |
+| Sequentialize gestures (or batch into one envelope) | Expect two concurrent predictions |
+| Send intent on the Master path separately | Put intent rows inside the prediction savepoint on a shared DB |
+| Use subscriptions for paint (`subscribe` on truth) | Rely on durable “tentative” columns for closed-loop UX |
+| Call `end_prediction()` when `queue_while_predicting` | Assume `handle_message` will clear the sandbox in queue mode |
+
+**API surface (Replica)**
+
+```cpp
+void begin_prediction();
+void commit_prediction();
+HandleResult end_prediction();       // rollback + apply queue; prefer this
+void rollback_prediction();          // same drain; result discarded
+std::size_t prediction_queue_size() const;
+bool queues_while_predicting() const;
+```
+
+Tests: `tests/test_prediction_queue.cpp` (ordering, Drafting vs Committed,
+batch `handle_messages`, subscriptions on drain, reset drops queue, seq
+continuity).
 
 ### Peer (bidirectional)
 
@@ -220,7 +338,7 @@ for (auto& m : peer_msgs) {
 ### Go wrapper (`go/sqlpipe`)
 
 ```
-go get github.com/marcelocantos/sqlpipe/go/sqlpipe@v0.30.0
+go get github.com/marcelocantos/sqlpipe/go/sqlpipe@v0.31.0
 ```
 
 Self-contained CGo module (vendored SQLite with session/preupdate + FTS5).
@@ -256,7 +374,8 @@ Use `go/sqlpipe/vX.Y.0` path-prefixed tags (created alongside root tags).
 - Library is transport-agnostic: `handle_message` in, `HandleResult` out.
   You provide the transport.
 - Replica returns `AckMsg` in `result.messages` after each `ChangesetMsg` —
-  forward to the master.
+  forward to the master. After `end_prediction()` drain, forward **all**
+  acks in the returned `HandleResult` as well.
 - Replica may return `ErrorMsg` in `result.messages` — forward to the master.
 - Row-level changes are in `result.changes`, not a callback.
 - Subscriptions use table-level invalidation: any change to a table a query
@@ -265,3 +384,7 @@ Use `go/sqlpipe/vX.Y.0` path-prefixed tags (created alongside root tags).
   discovers differences, then only the delta is transferred.
 - Schema mismatch is an error (not auto-resolved). Migrate schemas before
   connecting, or use `Database` which handles migration automatically.
+- Prediction is Replica-only (not on Master). With `queue_while_predicting`,
+  you own the hold: end the prediction or truth stays frozen.
+- One prediction at a time; `reset()` drops any queued inbound messages
+  without applying them (reconnect/diff will resync).
