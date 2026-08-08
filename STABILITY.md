@@ -43,15 +43,15 @@ Eligible: 2026-10-06.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.30.0. Items annotated with stability assessments.
+Snapshot as of v0.31.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.30.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.31.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `30` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `31` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 | `SQLDEEP_VERSION` | `"0.23.0"` | **Stable** (bundled) |
 | `SQLIFT_VERSION` | `"0.18.0"` | **Stable** (bundled) |
@@ -191,6 +191,7 @@ class Replica {
     HandleResult end_prediction();
     void rollback_prediction();
     std::size_t prediction_queue_size() const;
+    bool queues_while_predicting() const;
     void reset();
     Seq current_seq() const;
     SchemaVersion schema_version() const;
@@ -199,8 +200,8 @@ class Replica {
 ```
 
 **Stability**: **Stable** (converge() added v0.16.0; `end_prediction` /
-`prediction_queue_size` / `queue_while_predicting` added for optional
-inbound queue during prediction)
+`prediction_queue_size` / `queues_while_predicting` /
+`queue_while_predicting` added for optional inbound queue during prediction)
 
 ### Peer class
 

@@ -153,3 +153,7 @@ maintenance activities. Append-only — newest entries at the bottom.
 - **Commit**: (release tag)
 - **Outcome**: Released v0.30.0. 🎯T29: Database open-with-DDL migrates app schema only (get_schema_sql / appSchemaSQL), so `_sqlpipe_meta` and other internal tables are never planned for drop — sqlift stays product-agnostic. Rebundle sqlift v0.18.0 (richer apply errors). Regression test for reopen-with-same-DDL.
 - **Notes**: Non-breaking. Settling clock unchanged (last break v0.26.0).
+
+## 2026-08-09 — /release v0.31.0
+
+- **Outcome**: Released v0.31.0. Optional `ReplicaConfig::queue_while_predicting` defers inbound apply during prediction; `end_prediction()` drains the queue. Edge-case suite and agents-guide guidance for intent vs paint, two-DB topology, short-lived holds.
