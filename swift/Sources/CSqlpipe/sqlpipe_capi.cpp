@@ -276,6 +276,7 @@ sqlpipe::ReplicaConfig to_replica_config(sqlpipe_replica_config cfg) {
     }
     if (cfg.seq_key) rc.seq_key = cfg.seq_key;
     if (cfg.bucket_size > 0) rc.bucket_size = cfg.bucket_size;
+    rc.queue_while_predicting = cfg.queue_while_predicting != 0;
     if (cfg.on_progress) {
         auto fn = cfg.on_progress;
         auto ctx = cfg.progress_ctx;
@@ -563,6 +564,47 @@ int64_t sqlpipe_replica_current_seq(sqlpipe_replica* r) {
 
 sqlpipe_buf sqlpipe_replica_schema_version(sqlpipe_replica* r) {
     return to_buf(Buf(r->impl.schema_version()));
+}
+
+sqlpipe_error sqlpipe_replica_begin_prediction(sqlpipe_replica* r) {
+    try {
+        r->impl.begin_prediction();
+        return ok();
+    } catch (const sqlpipe::Error& e) { return make_error(e); }
+      catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+
+sqlpipe_error sqlpipe_replica_commit_prediction(sqlpipe_replica* r) {
+    try {
+        r->impl.commit_prediction();
+        return ok();
+    } catch (const sqlpipe::Error& e) { return make_error(e); }
+      catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+
+sqlpipe_error sqlpipe_replica_end_prediction(sqlpipe_replica* r, sqlpipe_buf* out) {
+    try {
+        auto hr = r->impl.end_prediction();
+        *out = to_buf(encode_handle_result(hr));
+        return ok();
+    } catch (const sqlpipe::Error& e) { return make_error(e); }
+      catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+
+sqlpipe_error sqlpipe_replica_rollback_prediction(sqlpipe_replica* r) {
+    try {
+        r->impl.rollback_prediction();
+        return ok();
+    } catch (const sqlpipe::Error& e) { return make_error(e); }
+      catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+
+size_t sqlpipe_replica_prediction_queue_size(sqlpipe_replica* r) {
+    return r->impl.prediction_queue_size();
+}
+
+uint8_t sqlpipe_replica_queues_while_predicting(sqlpipe_replica* r) {
+    return r->impl.queues_while_predicting() ? 1 : 0;
 }
 
 // ── Peer ────────────────────────────────────────────────────────

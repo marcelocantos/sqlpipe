@@ -109,6 +109,9 @@ typedef struct {
     void*                       schema_mismatch_ctx;
     sqlpipe_log_fn              on_log;
     void*                       log_ctx;
+    // When non-zero, inbound messages queue while a prediction is active
+    // (Drafting or Committed). Drain with end_prediction / rollback_prediction.
+    uint8_t                     queue_while_predicting;
 } sqlpipe_replica_config;
 
 typedef struct {
@@ -185,6 +188,15 @@ void sqlpipe_replica_reset(sqlpipe_replica* r);
 uint8_t sqlpipe_replica_state(sqlpipe_replica* r);
 int64_t sqlpipe_replica_current_seq(sqlpipe_replica* r);
 sqlpipe_buf sqlpipe_replica_schema_version(sqlpipe_replica* r);
+
+// Prediction (optimistic local truth on Replica). See agents guide.
+sqlpipe_error sqlpipe_replica_begin_prediction(sqlpipe_replica* r);
+sqlpipe_error sqlpipe_replica_commit_prediction(sqlpipe_replica* r);
+// Rolls back savepoint and applies any queued inbound; out = HandleResult wire.
+sqlpipe_error sqlpipe_replica_end_prediction(sqlpipe_replica* r, sqlpipe_buf* out);
+sqlpipe_error sqlpipe_replica_rollback_prediction(sqlpipe_replica* r);
+size_t sqlpipe_replica_prediction_queue_size(sqlpipe_replica* r);
+uint8_t sqlpipe_replica_queues_while_predicting(sqlpipe_replica* r);
 
 // ── Peer ────────────────────────────────────────────────────────
 
