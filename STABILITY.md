@@ -162,8 +162,8 @@ class Master {
     Master& operator=(Master&&) noexcept;
 
     void exec(const std::string& sql);
-    std::vector<Message> flush();
-    std::vector<Message> handle_message(const Message& msg);
+    std::vector<OutMessage> flush();
+    std::vector<OutMessage> handle_message(const Message& msg);
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 };
@@ -180,8 +180,8 @@ class Replica {
     Replica(Replica&&) noexcept;
     Replica& operator=(Replica&&) noexcept;
 
-    Message hello() const;
-    std::vector<Message> converge();
+    OutMessage hello() const;
+    std::vector<OutMessage> converge();
     HandleResult handle_message(const Message& msg);
     HandleResult handle_messages(std::span<const Message> msgs);
     SubscriptionId subscribe(const std::string& sql);
@@ -212,8 +212,8 @@ class Peer {
     Peer(Peer&&) noexcept;
     Peer& operator=(Peer&&) noexcept;
 
-    std::vector<PeerMessage> start();
-    std::vector<PeerMessage> flush();
+    std::vector<PeerOutMessage> start();
+    std::vector<PeerOutMessage> flush();
     PeerHandleResult handle_message(const PeerMessage& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
@@ -237,9 +237,9 @@ class Relay {
 
     std::size_t add_sink(SinkCallback cb);
     void remove_sink(std::size_t id);
-    Message hello();
-    std::vector<Message> handle_upstream(const Message& msg);
-    std::vector<Message> handle_downstream(const Message& msg);
+    OutMessage hello();
+    std::vector<OutMessage> handle_upstream(const Message& msg);
+    std::vector<OutMessage> handle_downstream(const Message& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
     void reset();
@@ -353,6 +353,21 @@ The following C APIs are bundled into `dist/sqlpipe.h` and available to consumer
 | `_sqlpipe_meta` | `CREATE TABLE _sqlpipe_meta(key TEXT PRIMARY KEY, value)` | **Stable** |
 
 Keys: `seq` (Master/Replica solo), `master_seq` / `replica_seq` (Peer mode).
+
+## Language bindings (outside the C++ 1.0 contract)
+
+The catalogue above is `dist/sqlpipe.h`. Bindings are copies and FFI shims,
+not a second stability contract:
+
+| Surface | vs C++ HEAD |
+|---|---|
+| Go (`go/sqlpipe`) | C-API encodes HandleResult as `[u32 count][[serialized msg][u8 delivery]]…`. Go also has its own `Serialize`/`Deserialize`. Prediction is present. |
+| Swift (`swift/`) | SPM `CSqlpipe` + `Sqlpipe`. Prediction via `TruthReplica`. CI is `swift build` only — no in-package test target. |
+| Wasm/TS (`web/`) | **Reduced surface:** no prediction API (`begin_prediction` / `queue_while_predicting` are absent from `sqlpipe_wapi.cpp`). HandleResult encoding is `[u32 count][serialized msg]…` with **no** delivery byte (deliberate fork from the Go C-API). |
+| Relay | C++ only; no C ABI. |
+
+`scripts/bundle-deps.sh` copies `dist/sqlpipe.{h,cpp}` into Go and Swift.
+That copy is not a CI job.
 
 ## Gaps
 

@@ -58,11 +58,15 @@ auto plan = Database::migration("", "CREATE TABLE t (id INTEGER PRIMARY KEY)");
 
 ```cpp
 Master master(db);                           // does NOT own db
-auto msgs = master.flush();                  // after each write txn
-auto resp = master.handle_message(incoming); // process replica msgs
+auto msgs = master.flush();                  // vector<OutMessage> after each write txn
+auto resp = master.handle_message(incoming); // vector<OutMessage>; incoming is Message
 master.current_seq();                        // current sequence number
 master.schema_version();                     // schema fingerprint
 ```
+
+`OutMessage` is `{Message msg; Delivery delivery;}`. `serialize` and
+`handle_message` take `msg`. Do not pass `vector<OutMessage>` where
+`vector<Message>` is required.
 
 `MasterConfig`:
 - `table_filter` — `optional<set<string>>`. `nullopt` = all tables, empty = none.
@@ -72,20 +76,22 @@ master.schema_version();                     // schema fingerprint
 
 ```cpp
 Replica replica(db, config);                   // does NOT own db
-auto hello = replica.hello();                  // send to master first
+auto hello = replica.hello();                  // OutMessage; send hello.msg to master
 HandleResult r = replica.handle_message(incoming);
-// r.messages      — protocol responses to send back
+// r.messages      — vector<OutMessage> protocol responses
 // r.changes       — per-row ChangeEvents applied this call
 // r.subscriptions — invalidated query subscription results
 replica.current_seq();
 replica.schema_version();
 replica.state();  // Init → Handshake → DiffBuckets → DiffRows → Live (or Error)
 
-// Query subscriptions (reactive queries)
-auto qr = replica.subscribe("SELECT * FROM t1 ORDER BY id");
-// qr.id, qr.columns, qr.rows — current result
-// After handle_message, check r.subscriptions for updated results
-replica.unsubscribe(qr.id);
+// Preferred reconnect: converge() — no HelloMsg required
+auto buckets = replica.converge();             // vector<OutMessage> (BucketHashesMsg)
+
+// Query subscriptions: subscribe returns an id, not a result set.
+auto id = replica.subscribe("SELECT * FROM t1 ORDER BY id");
+// Results arrive later on HandleResult::subscriptions (not at subscribe()).
+replica.unsubscribe(id);
 replica.reset();              // return to Init; subscriptions preserved
 // (also rolls back any prediction and drops any queued inbound messages)
 ```
@@ -222,11 +228,11 @@ cfg.owned_tables = {"draft*"};       // glob: own tables starting with "draft"
 cfg.owned_tables = {"drafts"};       // exact match (still works)
 Peer client(db, cfg);                // does NOT own db
 
-auto msgs = client.start();              // initiate handshake (client only)
+auto msgs = client.start();              // vector<PeerOutMessage> (client only)
 PeerHandleResult r = client.handle_message(incoming);
-// r.messages — PeerMessages to send back
+// r.messages — vector<PeerOutMessage> to send back
 // r.changes  — per-row ChangeEvents applied
-auto fmsgs = client.flush();             // after writing owned tables
+auto fmsgs = client.flush();             // vector<PeerOutMessage> after writing owned tables
 client.state();    // Init → Negotiating → Diffing → Live (or Error)
 client.owned_tables();                   // tables we master
 client.remote_tables();                  // tables we replicate
@@ -267,20 +273,23 @@ Key features:
 ### Typical loop (unidirectional)
 
 ```cpp
-// 1. Handshake (multi-step: hello → bucket hashes → row hashes → diff)
-auto hello = replica.hello();
-auto resp = master.handle_message(hello);
-// Exchange messages until replica.state() == Live:
-// master → HelloMsg → replica → BucketHashesMsg → master
-// master → NeedBucketsMsg → replica → RowHashesMsg → master
-// master → DiffReadyMsg → replica → AckMsg → master
+// Preferred: converge() — no prior HelloMsg. Every message is regenerable.
+auto buckets = replica.converge();
+auto resp = master.handle_message(buckets[0].msg);
+// Exchange .msg until replica.state() == Live:
+// replica → BucketHashesMsg → master → NeedBucketsMsg
+// replica → RowHashesMsg → master → DiffReadyMsg → replica → AckMsg
 
-// 2. Live streaming
+// Legacy ordered-channel handshake: replica.hello() then the same
+// exchange starting with HelloMsg. sync_handshake(master, replica)
+// drives either path in-process (tests).
+
+// Live streaming
 sqlite3_exec(db, "INSERT ...", ...);
-auto msgs = master.flush();            // → send to replica
-for (auto& m : msgs) {
-    auto result = replica.handle_message(m);
-    // result.messages → send back to master
+auto msgs = master.flush();            // vector<OutMessage>
+for (auto& om : msgs) {
+    auto result = replica.handle_message(om.msg);
+    // result.messages → send .msg back to master
     // result.changes  → business-level row changes
 }
 ```
@@ -298,21 +307,22 @@ server_cfg.approve_ownership = [](auto& t) { return true; };
 Peer server(server_db, server_cfg);
 
 // Handshake — exchange messages until both Live
-auto msgs = client.start();
-// ... deliver msgs to server, deliver responses to client, repeat ...
+auto msgs = client.start();               // vector<PeerOutMessage>
+// ... deliver msgs[i].msg to server, deliver responses, repeat ...
 
 // Live — each side flushes its owned tables
 sqlite3_exec(client_db, "INSERT INTO drafts ...", ...);
-auto peer_msgs = client.flush();          // → send to server
-for (auto& m : peer_msgs) {
-    auto r = server.handle_message(m);
-    // r.messages → send back    r.changes → row events
+auto peer_msgs = client.flush();          // vector<PeerOutMessage>
+for (auto& om : peer_msgs) {
+    auto r = server.handle_message(om.msg);
+    // r.messages → send .msg back    r.changes → row events
 }
 ```
 
 ### Key types
 
-- `HandleResult` — `.messages` (protocol responses), `.changes` (row events),
+- `OutMessage` — `.msg` (`Message`) + `.delivery` (`Reliable` / `BestEffort`)
+- `HandleResult` — `.messages` (`vector<OutMessage>`), `.changes` (row events),
   `.subscriptions` (invalidated query results)
 - `QueryResult` — `.id` (SubscriptionId), `.columns`, `.rows`
 - `Message` — variant of: `HelloMsg`, `ChangesetMsg`, `AckMsg`, `ErrorMsg`,
@@ -322,7 +332,10 @@ for (auto& m : peer_msgs) {
 - `Value` — variant: `monostate` (NULL), `int64_t`, `double`, `string`,
   `vector<uint8_t>` (BLOB)
 - `PeerMessage` — `.sender_role` (`AsMaster`/`AsReplica`), `.payload` (Message)
-- `PeerHandleResult` — `.messages` (PeerMessages), `.changes` (row events)
+- `PeerOutMessage` — `.msg` (`PeerMessage`) + `.delivery`
+- `PeerHandleResult` — `.messages` (`vector<PeerOutMessage>`), `.changes` (row events)
+- `Relay` — C++-only chain node (`hello` / `handle_upstream` /
+  `handle_downstream` return `OutMessage`). No C ABI.
 - `serialize(msg)` / `deserialize(buf)` — wire format:
   `[4B LE length][1B tag][payload]`. Changeset blobs within payloads use
   compression framing: `[u32 len][u8 type][data]` where type `0x00` =
@@ -359,6 +372,9 @@ _ = db.Exec("CREATE VIRTUAL TABLE docs USING fts5(content)")
 
 Also: `Master` / `Replica` / `Peer` with the same wire protocol as C++.
 Use `go/sqlpipe/vX.Y.0` path-prefixed tags (created alongside root tags).
+Go encodes HandleResult with a delivery byte; Wasm/TS does **not**, and
+Wasm has no prediction API (reduced surface). Swift `TruthReplica` wraps
+the C-API prediction symbols; CI is `swift build` only.
 
 ## Gotchas
 
