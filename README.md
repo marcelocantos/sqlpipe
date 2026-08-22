@@ -77,17 +77,19 @@ lost and recovered by the next convergence round.
 - **LZ4 changeset compression** — automatic, with uncompressed fallback
 - **Schema fingerprinting** via structural hashing (sqlift) to detect mismatches
 - **Single header + source** (`sqlpipe.h` / `sqlpipe.cpp`) for easy integration
-- **Formally verified** — the convergence protocol is modelled in
-  [TLA+](formal/Convergence.tla) and checked with TLC
+- **Convergence model** — the abstract convergence loop is specified in
+  [TLA+](formal/Convergence.tla). TLC is not run in CI.
 
 ## Language bindings
 
-| Language | Location | Install |
-|---|---|---|
-| C++ | `dist/sqlpipe.h` + `dist/sqlpipe.cpp` | Copy two files (includes sqlpipe + sqlift + sqldeep) |
-| Go | `go/sqlpipe/` | `go get github.com/marcelocantos/sqlpipe/go/sqlpipe` |
-| Swift | `swift/` | SPM package with `CSqlpipe` and `Sqlpipe` targets |
-| TypeScript/Wasm | `web/` | `npm install` (builds SQLite + sqlpipe to Wasm) |
+| Language | Location | Install | Surface vs C++ |
+|---|---|---|---|
+| C++ | `dist/sqlpipe.h` + `dist/sqlpipe.cpp` | Copy two files (includes sqlpipe + sqlift + sqldeep) | Full API, including Relay and prediction |
+| Go | `go/sqlpipe/` | `go get github.com/marcelocantos/sqlpipe/go/sqlpipe` | C-API + a Go wire codec; prediction present |
+| Swift | `swift/` | SPM package (`CSqlpipe` + `Sqlpipe`) | Prediction via `TruthReplica`; CI is `swift build` only |
+| TypeScript/Wasm | `web/` | `cv wasm` then `npx tsc` in `web/` | **Reduced:** no prediction API; HandleResult omits the delivery byte |
+
+`scripts/bundle-deps.sh` copies `dist/` into the Go and Swift trees. That copy is not a CI lockstep check. Relay has no C ABI.
 
 ## Requirements
 
@@ -148,8 +150,8 @@ auto sub = replica_db.subscribe("SELECT count(*) FROM items",
 
 // Insert on master, flush, apply on replica.
 master_db.exec("INSERT INTO items VALUES (1, 'hello')");
-for (auto& msg : master.flush())
-    replica.handle_message(msg);
+for (auto& om : master.flush())           // vector<OutMessage>
+    replica.handle_message(om.msg);       // handle_message takes Message
 replica_db.notify();  // fires subscriptions registered on replica_db
 ```
 
@@ -177,28 +179,36 @@ sync_handshake(master, replica);  // convenience for in-process use
 
 // Make changes on the master, then flush.
 sqlite3_exec(master_db, "INSERT INTO t VALUES (1, 'hello')", 0, 0, 0);
-auto msgs = master.flush();  // returns vector<Message>
-for (auto& msg : msgs) {
-    auto result = replica.handle_message(msg);
-    // result.messages    — vector<Message> to send back
-    // result.changes     — per-row ChangeEvents
+auto msgs = master.flush();  // vector<OutMessage> — {msg, delivery}
+for (auto& om : msgs) {
+    auto result = replica.handle_message(om.msg);
+    // result.messages      — vector<OutMessage> to send back
+    // result.changes       — per-row ChangeEvents
     // result.subscriptions — updated query results
 }
 // replica_db now has the row.
 ```
 
-See [`examples/loopback.cpp`](examples/loopback.cpp) for a complete working
-example including handshake and change event handling.
+`OutMessage` pairs a `Message` with a `Delivery` hint (`Reliable` or
+`BestEffort`). `serialize` / `handle_message` take the inner `Message`.
+Working in-process patterns live in `tests/test_integration.cpp` (the
+doctest suite is the shipped C++ path). `examples/loopback.cpp` is not
+kept in lockstep with `OutMessage` and is not built by CI.
 
 ## Building
 
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-cv test     # build and run tests (146 test cases)
-cv example  # build and run the loopback demo
-cv wasm     # build Wasm module (requires emscripten)
+cv test     # C++ doctest suite (tests/test_*.cpp) — the shipped C++ gate
+cv wasm     # Wasm module (requires emscripten); reduced TS surface, see above
 ```
+
+`cv example` (`examples/loopback.cpp`) does not currently compile:
+`Master::flush()` returns `std::vector<OutMessage>`, while the example still
+passes that vector to a `deliver` that takes `const std::vector<Message>&`.
+CI runs `cv test`, Go tests, `swift build`, and Wasm+TS smoke — not
+`cv example`.
 
 If you use an agentic coding tool (Claude Code, Cursor, Copilot, etc.), include
 [`dist/sqlpipe-agents-guide.md`](dist/sqlpipe-agents-guide.md) in your project
@@ -275,7 +285,7 @@ public:
     void exec(const std::string& sql);
 
     // Run a query (sqldeep transpiled). Returns the full result set.
-    QueryResult query(const std::string& sql);
+    QueryResult query(const std::string& sql) const;
 
     // Register a callback query (sqldeep transpiled). The callback fires
     // immediately with the current result, then again after each exec() or
@@ -314,7 +324,7 @@ struct MasterConfig {
     std::int64_t bucket_size = 1024;
     ProgressCallback on_progress = nullptr;
     SchemaMismatchCallback on_schema_mismatch = nullptr;
-    FlushCallback on_flush = nullptr;        // auto-flush on commit (takes std::vector<Message>)
+    FlushCallback on_flush = nullptr;        // auto-flush on commit (vector<OutMessage>)
     std::size_t changeset_queue_size = 64;   // 0 = disable queue replay
     LogCallback on_log = nullptr;
 };
@@ -323,8 +333,8 @@ class Master {
 public:
     explicit Master(sqlite3* db, MasterConfig config = {});
     void exec(const std::string& sql);                     // auto-flushes if on_flush set
-    std::vector<Message> flush();                          // manual flush
-    std::vector<Message> handle_message(const Message& msg);
+    std::vector<OutMessage> flush();                       // manual flush
+    std::vector<OutMessage> handle_message(const Message& msg);
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 };
@@ -340,10 +350,11 @@ struct ReplicaConfig {
     ProgressCallback on_progress = nullptr;
     SchemaMismatchCallback on_schema_mismatch = nullptr;
     LogCallback on_log = nullptr;
+    bool queue_while_predicting = false;  // queue inbound during prediction
 };
 
 struct HandleResult {
-    std::vector<Message>      messages;       // protocol responses
+    std::vector<OutMessage>   messages;       // tagged protocol responses
     std::vector<ChangeEvent>  changes;        // row-level changes applied
     std::vector<QueryResult>  subscriptions;  // invalidated query results
 };
@@ -351,8 +362,8 @@ struct HandleResult {
 class Replica {
 public:
     explicit Replica(sqlite3* db, ReplicaConfig config = {});
-    Message hello() const;
-    std::vector<Message> converge();                       // stateless sync
+    OutMessage hello() const;
+    std::vector<OutMessage> converge();                    // stateless sync
     HandleResult handle_message(const Message& msg);
     HandleResult handle_messages(std::span<const Message> msgs);  // batched
     SubscriptionId subscribe(const std::string& sql);
@@ -386,16 +397,16 @@ struct PeerConfig {
 };
 
 struct PeerHandleResult {
-    std::vector<PeerMessage>  messages;
-    std::vector<ChangeEvent>  changes;
-    std::vector<QueryResult>  subscriptions;
+    std::vector<PeerOutMessage> messages;
+    std::vector<ChangeEvent>    changes;
+    std::vector<QueryResult>    subscriptions;
 };
 
 class Peer {
 public:
     explicit Peer(sqlite3* db, PeerConfig config = {});
-    std::vector<PeerMessage> start();      // client initiates
-    std::vector<PeerMessage> flush();
+    std::vector<PeerOutMessage> start();   // client initiates
+    std::vector<PeerOutMessage> flush();
     PeerHandleResult handle_message(const PeerMessage& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
@@ -412,11 +423,11 @@ public:
 class Relay {
 public:
     explicit Relay(sqlite3* db, RelayConfig config = {});
-    std::size_t add_sink(SinkCallback cb);             // register downstream (takes const Message&)
+    std::size_t add_sink(SinkCallback cb);             // register downstream (const OutMessage&)
     void remove_sink(std::size_t id);
-    Message hello();                                   // send to upstream
-    std::vector<Message> handle_upstream(const Message& msg);
-    std::vector<Message> handle_downstream(const Message& msg);
+    OutMessage hello();                                // send to upstream
+    std::vector<OutMessage> handle_upstream(const Message& msg);
+    std::vector<OutMessage> handle_downstream(const Message& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
     void reset();
@@ -495,8 +506,8 @@ without a handshake. Works from any state — Init, Live, or after `reset()`.
 
 ```cpp
 replica.reset();
-auto msgs = replica.converge();  // returns BucketHashesMsg
-// Send msgs to master, process responses normally.
+auto msgs = replica.converge();  // vector<OutMessage> (BucketHashesMsg)
+// Send msgs[i].msg to master, process responses via handle_message.
 // If a message is lost, just call converge() again.
 ```
 
@@ -522,7 +533,7 @@ human-readable message:
 
 ```cpp
 try {
-    auto msgs = master.flush();  // std::vector<Message>
+    auto msgs = master.flush();  // std::vector<OutMessage>
 } catch (const sqlpipe::Error& e) {
     // e.code()  — ErrorCode enum
     // e.what()  — descriptive string
@@ -623,9 +634,10 @@ Apache 2.0. See [LICENSE](LICENSE) for details.
 Third-party dependencies:
 - **SQLite** — public domain
 - **LZ4** — BSD 2-Clause
-- **spdlog** — MIT
 - **nlohmann/json** — MIT
-- **liteparser** — MIT
+- **liteparser** — MIT (deepparser / query predicates)
 - **sqlift** — Apache 2.0
 - **sqldeep** — Apache 2.0
 - **doctest** — MIT (test only)
+
+Logging is a `LogCallback` (`SQLPIPE_LOG`); there is no spdlog dependency.
