@@ -1,0 +1,623 @@
+# hygiene.yaml — declared, drift-validated hygiene posture for sqlpipe.
+# Schema: ~/.claude/skills/hygiene/SKILL.md
+# Validate: ~/.claude/skills/hygiene/hygiene_check.py
+#
+# Honest init (2026-08-22): floors are the held tier this tree already reaches.
+# Gaps sit above the floor in the aspires band. Shipped C++ gate is `cv test`;
+# `cv example` does not compile and is not in CI. Do not read this file as a
+# promise to add scanners, a release workflow, or a format/lint job.
+
+schema_version: 1
+
+repo: sqlpipe
+aspires: 3
+floors:            # per-dimension held-tier ratchet; below floor => DRIFT
+  correctness: 1   # cv test + go test in CI; example stale; fuzz/TLA not in CI
+  security: 2      # vendor + go.sum; GitHub secret scan is T3 with planned SAST
+  quality: 1       # -Wall -Wextra -Wpedantic in cvfile; no format/lint CI gate
+  deps: 2          # vendor + go.sum + NOTICES; no Dependabot
+  release: 2       # MINOR v* tags + version macros; no release.yml (library)
+  governance: 2    # Apache-2.0 + squash-only; no SECURITY.md
+  build: 2         # cvfile + CI; Makefile is the bullseye hook only
+  docs: 2          # README + STABILITY + agents-guide; TLA not in CI
+  perf: 0          # doctest bench exists; no perf regression gate
+  vcs: 1           # master + .gitignore; no committed hooks / branch protection
+  agent: 2         # CLAUDE.md / bullseye / agents-guide; no AGENTS.md on master
+
+tiers:
+  1: baseline    # LICENSE + README + .gitignore; tests build & run
+  2: maintained  # full matrix, examples run, lint/format, release + governance
+  3: hardened    # formal specs, security scanning, SBOM/signing, fuzzing, perf
+
+items:
+
+  # ============================== CORRECTNESS =============================
+  - id: correctness.cv-test
+    dim: correctness
+    desc: C++ doctest suite (cv test) runs on every push/PR
+    state: enforced
+    cadence: continuous
+    enforce: blocking
+    tier: 1
+    evidence: {ci_step: {workflow: ci.yml, name: Build and test}}
+
+  - id: correctness.go-test
+    dim: correctness
+    desc: Go CGo wrapper tests (go test ./...) run in CI
+    state: enforced
+    cadence: continuous
+    enforce: blocking
+    tier: 1
+    evidence: {ci_step: {workflow: ci.yml, name: Go test}}
+
+  - id: correctness.make-cv-test
+    dim: correctness
+    desc: Local C++ suite is a Makefile target (make cv-test)
+    state: present
+    cadence: continuous
+    enforce: blocking
+    tier: 1
+    evidence: {make_target: cv-test}
+
+  - id: correctness.os-matrix
+    dim: correctness
+    desc: cv test runs on ubuntu-latest and macos-latest
+    state: enforced
+    cadence: continuous
+    enforce: blocking
+    tier: 2
+    evidence: {ci_job: ci.yml#test}
+
+  - id: correctness.wasm
+    dim: correctness
+    desc: Wasm module builds and TS smoke runs in CI
+    state: enforced
+    cadence: continuous
+    enforce: blocking
+    tier: 2
+    evidence: {ci_job: ci.yml#wasm}
+
+  - id: correctness.swift-build
+    dim: correctness
+    desc: Swift package (swift build) compiles in CI
+    state: enforced
+    cadence: continuous
+    enforce: blocking
+    tier: 2
+    evidence: {ci_job: ci.yml#swift}
+
+  - id: correctness.examples
+    dim: correctness
+    desc: examples/loopback.cpp builds and runs in CI
+    state: planned
+    cadence: continuous
+    enforce: warning
+    tier: 2
+    reason: >-
+      cv example does not compile (flush() returns vector<OutMessage>; the
+      example still takes vector<Message>). CI does not run it. Integration
+      coverage is tests/test_integration.cpp.
+    evidence: {absent: {ci_step: {workflow: ci.yml, name: Example}}}
+
+  - id: correctness.fuzz-harness
+    dim: correctness
+    desc: libFuzzer harness exists for deserialize (cv fuzz)
+    state: present
+    cadence: once-must-hold
+    enforce: informational
+    tier: 3
+    evidence: {file: {path: tests/fuzz_deserialize.cpp}}
+
+  - id: correctness.fuzz-ci
+    dim: correctness
+    desc: Fuzz harness runs in CI
+    state: planned
+    cadence: continuous
+    enforce: informational
+    tier: 3
+    reason: cv fuzz / tests/fuzz_deserialize.cpp exist; CI does not invoke them.
+    evidence: {absent: {ci_job: ci.yml#fuzz}}
+
+  - id: correctness.tlc-ci
+    dim: correctness
+    desc: TLC model-checks formal/Convergence.tla in CI
+    state: planned
+    cadence: continuous
+    enforce: informational
+    tier: 3
+    reason: formal/Convergence.tla exists; TLC is not a CI job (AGENTS.md).
+    evidence: {absent: {ci_job: ci.yml#tlc}}
+
+  - id: correctness.swift-tests
+    dim: correctness
+    desc: Swift package has an in-package test target run in CI
+    state: planned
+    cadence: continuous
+    enforce: warning
+    tier: 3
+    reason: CI is `swift build` only; there is no in-package test target.
+    evidence: {absent: {ci_step: {workflow: ci.yml, name: Swift test}}}
+
+  - id: correctness.windows
+    dim: correctness
+    desc: Windows CI job
+    state: skipped
+    cadence: continuous
+    enforce: informational
+    tier: 3
+    reason: >-
+      Shipped matrix is Ubuntu + macOS (C++), Ubuntu (Go, Wasm), macOS (Swift).
+      Windows is not a supported host for this library.
+    evidence: {absent: {ci_job: ci.yml#windows}}
+
+  # =========================== SECURITY / SUPPLY ==========================
+  - id: security.vendor
+    dim: security
+    desc: C++ SQLite/LZ4 are vendored in-tree (no system/Homebrew link)
+    state: present
+    cadence: once-must-hold
+    enforce: warning
+    tier: 2
+    evidence: {file: {path: vendor/src/sqlite3.c}}
+
+  - id: security.go-sum
+    dim: security
+    desc: go/sqlpipe/go.sum committed — pinned Go module graph
+    state: present
+    cadence: per-release
+    enforce: warning
+    tier: 2
+    evidence: {file: {path: go/sqlpipe/go.sum}}
+
+  - id: security.secret-scan
+    dim: security
+    desc: GitHub secret scanning is enabled on the repo
+    state: enforced
+    cadence: once-must-hold
+    enforce: blocking
+    tier: 3
+    evidence:
+      gh_setting:
+        key: security_and_analysis.secret_scanning.status
+        equals: enabled
+
+  - id: security.push-protection
+    dim: security
+    desc: Secret-scanning push protection is enabled
+    state: enforced
+    cadence: once-must-hold
+    enforce: blocking
+    tier: 3
+    evidence:
+      gh_setting:
+        key: security_and_analysis.secret_scanning_push_protection.status
+        equals: enabled
+
+  - id: security.gitleaks
+    dim: security
+    desc: gitleaks scanner in CI
+    state: skipped
+    cadence: continuous
+    enforce: informational
+    tier: 3
+    reason: >-
+      GitHub native secret scanning and push protection are enabled; a second
+      gitleaks job would duplicate that gate.
+    evidence: {absent: {scanner: {tool: gitleaks}}}
+
+  - id: security.sast-codeql
+    dim: security
+    desc: CodeQL (or equivalent) static analysis for C++/Go
+    state: planned
+    cadence: continuous
+    enforce: warning
+    tier: 3
+    reason: No CodeQL workflow; compiler warnings + tests are the current static net.
+    evidence: {absent: {ci_job: ci.yml#codeql}}
+
+  - id: security.dep-vuln-scan
+    dim: security
+    desc: Advisory scan over Go modules and/or vendored C sources
+    state: planned
+    cadence: periodic:30d
+    enforce: warning
+    tier: 3
+    reason: go.sum and vendor/ are pinned; no govulncheck/OSV/pip-audit job.
+    evidence: {absent: {scanner: {tool: govulncheck}}}
+
+  - id: security.actions-perms
+    dim: security
+    desc: GitHub Actions default token permissions scoped to least privilege
+    state: planned
+    cadence: once-must-hold
+    enforce: warning
+    tier: 3
+    reason: ci.yml has no top-level permissions block.
+    evidence:
+      absent:
+        file: {path: .github/workflows/ci.yml, matches: '(?m)^permissions:'}
+
+  - id: security.signed-releases
+    dim: security
+    desc: Release artifacts carry provenance / are signed
+    state: skipped
+    cadence: per-release
+    enforce: informational
+    tier: 3
+    reason: >-
+      sqlpipe ships as source (dist/sqlpipe.h + dist/sqlpipe.cpp), not
+      CI-built binaries; there is nothing to sign.
+    evidence: {absent: {ci_step: {workflow: release.yml, name: Sign}}}
+
+  # ============================== CODE QUALITY ============================
+  - id: quality.compiler-warnings
+    dim: quality
+    desc: C++ build uses -Wall -Wextra -Wpedantic (cvfile, used by cv test)
+    state: present
+    cadence: continuous
+    enforce: warning
+    tier: 1
+    evidence: {file: {path: cvfile, matches: '-Wall -Wextra -Wpedantic'}}
+
+  - id: quality.format
+    dim: quality
+    desc: Sources are clang-format/gofmt-clean, enforced in CI
+    state: planned
+    cadence: continuous
+    enforce: blocking
+    tier: 2
+    reason: No .clang-format / gofmt CI step; compile_flags.txt is stale and unused.
+    evidence: {absent: {ci_step: {workflow: ci.yml, name: clang-format}}}
+
+  - id: quality.lint
+    dim: quality
+    desc: clang-tidy / golangci-lint (or equivalent) runs in CI
+    state: planned
+    cadence: continuous
+    enforce: warning
+    tier: 2
+    reason: No clang-tidy or golangci-lint config or CI job.
+    evidence: {absent: {scanner: {tool: clang-tidy}}}
+
+  # =========================== DEPENDENCY HEALTH ==========================
+  - id: deps.vendor
+    dim: deps
+    desc: SQLite, LZ4, nlohmann/json, and doctest live under vendor/
+    state: present
+    cadence: once-must-hold
+    enforce: warning
+    tier: 2
+    evidence: {file: {path: vendor/src/lz4.c}}
+
+  - id: deps.go-sum
+    dim: deps
+    desc: go/sqlpipe/go.sum pins the Go wrapper's module graph
+    state: present
+    cadence: once-must-hold
+    enforce: warning
+    tier: 2
+    evidence: {file: {path: go/sqlpipe/go.sum, matches: 'pierrec/lz4'}}
+
+  - id: deps.notices
+    dim: deps
+    desc: NOTICES attributes bundled third-party code
+    state: present
+    cadence: per-release
+    enforce: informational
+    tier: 2
+    evidence: {file: {path: NOTICES, matches: 'Third-Party Notices'}}
+
+  - id: deps.dependabot
+    dim: deps
+    desc: Dependabot (or equivalent) watches gomod / Actions for advisories
+    state: planned
+    cadence: periodic:30d
+    enforce: informational
+    tier: 3
+    reason: No .github/dependabot.yml; Dependabot security updates are disabled.
+    evidence: {absent: {file: {path: .github/dependabot.yml}}}
+
+  # ========================== RELEASE & VERSIONING =======================
+  - id: release.version-macros
+    dim: release
+    desc: SQLPIPE_VERSION macros live in dist/sqlpipe.h
+    state: present
+    cadence: per-release
+    enforce: blocking
+    tier: 1
+    evidence: {file: {path: dist/sqlpipe.h, matches: 'SQLPIPE_VERSION'}}
+
+  - id: release.semver-minor
+    dim: release
+    desc: Product git tags are MINOR-only (vMAJOR.MINOR.0)
+    state: present
+    cadence: per-release
+    enforce: blocking
+    tier: 2
+    evidence:
+      command: test -z "$(git tag -l 'v[0-9]*' | grep -vE '^v[0-9]+\.[0-9]+\.0$')"
+
+  - id: release.stability-snapshot
+    dim: release
+    desc: STABILITY.md snapshots the version and interaction-surface catalogue
+    state: present
+    cadence: per-release
+    enforce: warning
+    tier: 2
+    evidence: {file: {path: STABILITY.md, matches: 'SQLPIPE_VERSION'}}
+
+  - id: release.ci-built
+    dim: release
+    desc: Release artifacts are built by a GitHub Actions release workflow
+    state: skipped
+    cadence: per-release
+    enforce: informational
+    tier: 3
+    reason: >-
+      Library is two source files plus language wrappers; releases are git
+      tags (and go/sqlpipe/v* module tags), not CI-built binaries.
+    evidence: {absent: {ci_job: release.yml#build}}
+
+  - id: release.changelog
+    dim: release
+    desc: A maintained CHANGELOG records user-visible changes per release
+    state: planned
+    cadence: per-release
+    enforce: warning
+    tier: 3
+    reason: History lives in git tags + STABILITY.md; no CHANGELOG.md.
+    evidence: {absent: {file: {path: CHANGELOG.md}}}
+
+  # ============================ GOVERNANCE / META ========================
+  - id: governance.license
+    dim: governance
+    desc: Apache-2.0 LICENSE present
+    state: present
+    cadence: once-must-hold
+    enforce: blocking
+    tier: 1
+    evidence: {file: {path: LICENSE, matches: 'Apache License'}}
+
+  - id: governance.readme
+    dim: governance
+    desc: README present
+    state: present
+    cadence: once-must-hold
+    enforce: blocking
+    tier: 1
+    evidence: {file: {path: README.md}}
+
+  - id: governance.gitignore
+    dim: governance
+    desc: .gitignore covers build/, node_modules/, IDE/OS, and Wasm/Swift artifacts
+    state: present
+    cadence: once-must-hold
+    enforce: warning
+    tier: 1
+    evidence: {file: {path: .gitignore, matches: 'build/'}}
+
+  - id: governance.squash-only
+    dim: governance
+    desc: Repo is squash-merge only (merge and rebase commits disabled)
+    state: enforced
+    cadence: once-must-hold
+    enforce: blocking
+    tier: 2
+    evidence: {gh_setting: {key: allow_merge_commit, equals: false}}
+
+  - id: governance.delete-branch
+    dim: governance
+    desc: Head branch is deleted on merge
+    state: enforced
+    cadence: once-must-hold
+    enforce: warning
+    tier: 2
+    evidence: {gh_setting: {key: delete_branch_on_merge, equals: true}}
+
+  - id: governance.security-md
+    dim: governance
+    desc: SECURITY.md documents the vulnerability-disclosure process
+    state: planned
+    cadence: once-must-hold
+    enforce: informational
+    tier: 3
+    reason: Public repo without a published disclosure policy yet.
+    evidence: {absent: {file: {path: SECURITY.md}}}
+
+  - id: governance.codeowners
+    dim: governance
+    desc: CODEOWNERS names reviewers for the tree
+    state: skipped
+    cadence: once-must-hold
+    enforce: informational
+    tier: 3
+    reason: Sole-owner repo; review is the owner, not a roster.
+    evidence: {absent: {file: {path: CODEOWNERS}}}
+
+  # ================================= BUILD ===============================
+  - id: build.cvfile
+    dim: build
+    desc: cvfile is the C++ build system (test/wasm/fuzz/clean)
+    state: present
+    cadence: once-must-hold
+    enforce: blocking
+    tier: 1
+    evidence: {file: {path: cvfile, matches: '!test:'}}
+
+  - id: build.cpp23
+    dim: build
+    desc: C++ toolchain is pinned to C++23 in cvfile
+    state: present
+    cadence: once-must-hold
+    enforce: warning
+    tier: 1
+    evidence: {file: {path: cvfile, matches: '-std=c[+][+]23'}}
+
+  - id: build.ci
+    dim: build
+    desc: CI workflow builds C++, Go, Swift, and Wasm
+    state: enforced
+    cadence: continuous
+    enforce: blocking
+    tier: 2
+    evidence: {ci_job: ci.yml#test}
+
+  - id: build.make-bullseye
+    dim: build
+    desc: Makefile bullseye target wires cv-test + go-test + clean-tree
+    state: present
+    cadence: continuous
+    enforce: warning
+    tier: 2
+    evidence: {make_target: bullseye}
+
+  - id: build.sbom
+    dim: build
+    desc: Release produces an SBOM
+    state: planned
+    cadence: per-release
+    enforce: informational
+    tier: 3
+    reason: No SBOM step or release workflow; supply list is vendor/ + NOTICES.
+    evidence: {absent: {ci_step: {workflow: release.yml, name: SBOM}}}
+
+  # ============================ DOCUMENTATION ============================
+  - id: docs.readme
+    dim: docs
+    desc: README documents the library, protocol, and build
+    state: present
+    cadence: once-must-hold
+    enforce: blocking
+    tier: 1
+    evidence: {file: {path: README.md, matches: 'sqlpipe'}}
+
+  - id: docs.stability
+    dim: docs
+    desc: STABILITY.md is the interaction-surface catalogue
+    state: present
+    cadence: per-release
+    enforce: warning
+    tier: 2
+    evidence: {file: {path: STABILITY.md, matches: 'Interaction surface catalogue'}}
+
+  - id: docs.agents-guide
+    dim: docs
+    desc: dist/sqlpipe-agents-guide.md is the C++ consumer / agent API
+    state: present
+    cadence: once-must-hold
+    enforce: informational
+    tier: 2
+    evidence: {file: {path: dist/sqlpipe-agents-guide.md}}
+
+  - id: docs.formal-tla
+    dim: docs
+    desc: Abstract convergence loop is specified in TLA+
+    state: present
+    cadence: once-must-hold
+    enforce: informational
+    tier: 3
+    evidence: {file: {path: formal/Convergence.tla, matches: 'MODULE Convergence'}}
+
+  - id: docs.todo-md
+    dim: docs
+    desc: docs/TODO.md is not the work ledger (bullseye.yaml is)
+    state: planned
+    cadence: once-must-hold
+    enforce: informational
+    tier: 3
+    reason: >-
+      docs/TODO.md still exists with live items (DDL propagation). Global
+      convention is bullseye.yaml; promote remaining entries and delete.
+    evidence: {absent: {file: {path: docs/TODO.md}}}
+
+  # ============================== PERFORMANCE ===========================
+  - id: perf.doctest-bench
+    dim: perf
+    desc: Large-row diff timing lives in tests/test_bench.cpp (doctest)
+    state: present
+    cadence: once-must-hold
+    enforce: informational
+    tier: 3
+    evidence: {file: {path: tests/test_bench.cpp}}
+
+  - id: perf.ci-gate
+    dim: perf
+    desc: A dedicated perf/benchmark job fails the build on regression
+    state: planned
+    cadence: per-release
+    enforce: informational
+    tier: 3
+    reason: test_bench.cpp runs inside cv test; there is no isolated perf gate.
+    evidence: {absent: {ci_job: ci.yml#bench}}
+
+  # ============================== VCS / HISTORY =========================
+  - id: vcs.default-branch
+    dim: vcs
+    desc: Default branch is master
+    state: enforced
+    cadence: once-must-hold
+    enforce: blocking
+    tier: 1
+    evidence: {gh_setting: {key: default_branch, equals: master}}
+
+  - id: vcs.branch-protection
+    dim: vcs
+    desc: master is protected and requires the CI test job
+    state: planned
+    cadence: once-must-hold
+    enforce: warning
+    tier: 3
+    reason: Branch protection 404; CI runs on push/PR but is not a required check.
+    evidence:
+      absent:
+        command: gh api repos/marcelocantos/sqlpipe/branches/master/protection --jq .url
+
+  - id: vcs.pre-commit-hook
+    dim: vcs
+    desc: Committed git hooks (scripts/hooks) gate locally before commit
+    state: planned
+    cadence: once-must-hold
+    enforce: informational
+    tier: 3
+    reason: No scripts/hooks; core.hooksPath is the default .git/hooks samples.
+    evidence: {absent: {file: {path: scripts/hooks/pre-commit}}}
+
+  # =================== AGENT-READINESS / ONBOARDING ====================
+  - id: agent.claude-md
+    dim: agent
+    desc: CLAUDE.md documents project conventions for coding agents
+    state: present
+    cadence: once-must-hold
+    enforce: warning
+    tier: 1
+    evidence: {file: {path: CLAUDE.md, matches: 'sqlpipe'}}
+
+  - id: agent.agents-md
+    dim: agent
+    desc: AGENTS.md is the shared multi-tool instruction file
+    state: planned
+    cadence: once-must-hold
+    enforce: informational
+    tier: 3
+    reason: >-
+      Master has CLAUDE.md only (no AGENTS.md). Global convention prefers
+      AGENTS.md as canonical with a thin CLAUDE.md adapter.
+    evidence: {absent: {file: {path: AGENTS.md}}}
+
+  - id: agent.bullseye
+    dim: agent
+    desc: bullseye.yaml is the intent ledger for followable work
+    state: present
+    cadence: once-must-hold
+    enforce: informational
+    tier: 2
+    evidence: {file: {path: bullseye.yaml}}
+
+  - id: agent.agents-guide
+    dim: agent
+    desc: dist/sqlpipe-agents-guide.md is the C++ consumer / agent API
+    state: present
+    cadence: once-must-hold
+    enforce: informational
+    tier: 2
+    evidence: {file: {path: dist/sqlpipe-agents-guide.md, matches: 'sqlpipe'}}
