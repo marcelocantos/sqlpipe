@@ -1,5 +1,8 @@
 # sqlpipe
 
+Streaming SQLite replication, declarative schema migration (sqlift), and SQL
+transpilation (sqldeep) in one two-file C++23 library.
+
 ## Code Search
 
 Use Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.
@@ -13,8 +16,8 @@ Use Vera before opening many files or running broad text search when you need to
 - `vera watch .` to auto-update the index, or `vera update .` after edits (`vera index .` if `.vera/` is missing)
 - For detailed usage, query patterns, and troubleshooting, read the Vera skill file installed by `vera agent install`
 
-Streaming replication protocol for SQLite. Two-file library: `dist/sqlpipe.h`
-(public API) and `dist/sqlpipe.cpp` (implementation).
+Two-file distribution: `dist/sqlpipe.h` (public API) and `dist/sqlpipe.cpp`
+(implementation), with Go, Swift, and TypeScript/Wasm wrappers.
 
 ## Build
 
@@ -109,9 +112,19 @@ SQLite must be compiled with `-DSQLITE_ENABLE_SESSION
 
 - **SQLite3** — vendored in `vendor/src/sqlite3.c` + `vendor/include/sqlite3.h`
 - **LZ4** — vendored in `vendor/src/lz4.c` + `vendor/include/lz4.h` (changeset compression)
-- **spdlog** — git submodule at `vendor/github.com/gabime/spdlog` (header-only)
 - **sqlift** — git submodule at `vendor/github.com/marcelocantos/sqlift` (structural schema diffing)
+- **sqldeep** — git submodule at `vendor/github.com/marcelocantos/sqldeep` (SQL transpiler)
+- **deepparser/liteparser** — git submodule at
+  `vendor/github.com/marcelocantos/deepparser` (branch `sqldeep-grammar`);
+  supplies `liteparser.h`, which `dist/sqlpipe.cpp` includes. `cv test` fails
+  with `'liteparser.h' file not found` until
+  `git submodule update --init --recursive` has run.
+- **nlohmann/json** — vendored in `vendor/include/nlohmann/json.hpp`
 - **doctest** — vendored in `vendor/include/doctest.h` (test only)
+
+There is no spdlog dependency: logging is a `LogCallback` (`LogLevel` +
+`string_view`) driven by the `SQLPIPE_LOG` macro (`dist/sqlpipe.cpp:16`),
+which replaced spdlog in v0.7.0.
 
 ## Architecture
 
@@ -230,7 +243,8 @@ cvfile              Build system (cv)
 
 ## Tests
 
-Test cases across 8 files (all use doctest):
+196 test cases across 11 `test_*.cpp` files plus `fuzz_deserialize.cpp`
+(all use doctest; run with `cv test`):
 
 - `test_database.cpp` — Database class: open/exec/query, schema migration,
   subscriptions (fire/no-fire/auto-unsubscribe/move), sqldeep transpilation,
@@ -245,12 +259,20 @@ Test cases across 8 files (all use doctest):
   already-in-sync, diff-then-live
 - `test_peer.cpp` — Peer handshake, ownership negotiation, bidirectional
   streaming, diff sync after reconnect, glob patterns
+- `test_prediction_queue.cpp` — Prediction lifecycle, `queue_while_predicting`
+  ordering, drain-on-end, reset drops queue
+- `test_query_watch.cpp` — Standalone query-watch engine (result hashing)
+- `test_stress.cpp` — High-volume and adversarial replication scenarios
+- `test_bench.cpp` — Timing benchmarks (diff sync, live streaming)
+- `fuzz_deserialize.cpp` — libFuzzer target; run with `cv fuzz`
 
 Add new tests to the file matching the component under test.
 
 ## Conventions
 
-- Use `SPDLOG_INFO`/`SPDLOG_WARN`/`SPDLOG_ERROR` macros (not `spdlog::info`).
+- Log through the `SQLPIPE_LOG(cb, level, ...)` macro with a `LogLevel`
+  (`Debug`/`Info`/`Warn`/`Error`); output goes to the caller's `on_log`
+  callback. There is no logging library.
 - All tables must have a single `INTEGER PRIMARY KEY` rowid alias (SQLite
   session extension + rowid-keyed diff sync requirement); other PK shapes are
   rejected at construction.

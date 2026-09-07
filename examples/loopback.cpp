@@ -10,10 +10,13 @@
 
 using namespace sqlpipe;
 
-static HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
+// Master::flush() and Replica::handle_message() return OutMessage — a
+// Message paired with a Delivery hint the transport is free to honour.
+// A loopback transport ignores the hint and forwards the payload.
+static HandleResult deliver(const std::vector<OutMessage>& msgs, Replica& handler) {
     HandleResult result;
-    for (const auto& m : msgs) {
-        auto resp = handler.handle_message(m);
+    for (const auto& out : msgs) {
+        auto resp = handler.handle_message(out.msg);
         result.messages.insert(result.messages.end(),
                                resp.messages.begin(), resp.messages.end());
         result.changes.insert(result.changes.end(),

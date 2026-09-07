@@ -1,3 +1,7 @@
+> **Archived 2026-09-07.** TODO files are not the project's record of work —
+> `bullseye.yaml` is. The one live item (DDL propagation) is tracked as a
+> target; the rest is history. Kept for the design notes below.
+
 # TODO
 
 - [x] **Logging hook** — Done in v0.7.0 (callback logging replaced spdlog).

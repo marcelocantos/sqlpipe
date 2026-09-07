@@ -12,8 +12,8 @@ two-file distribution (`dist/sqlpipe.h` / `dist/sqlpipe.cpp`):
   bidirectional replication with table-level ownership. A **Relay** enables
   chain replication (source → relay → sink).
 - **sqlift** — declarative schema migration via structural diffing. The
-  `Database` constructor auto-migrates your schema on open; the
-  `generate_migration()` free function produces migration SQL from any two
+  `Database` constructor auto-migrates your schema on open; the static
+  `Database::migration()` produces a sqlift JSON migration plan from any two
   DDL strings.
 - **sqldeep** — JSON5-like SQL transpiler. All SQL passed through `Database`
   methods is transpiled automatically. Extended syntax like
@@ -43,8 +43,8 @@ lost and recovered by the next convergence round.
   sqlpipe core, sqlift, and sqldeep. No separate dependency installation
   needed beyond SQLite itself.
 - **Schema migration via sqlift** — `Database` constructor auto-migrates on
-  open; `Database::migration(from_ddl, to_ddl)` static method; and the
-  `generate_migration(old_ddl, new_ddl)` free function for offline use.
+  open; `Database::migration(from_ddl, to_ddl)` returns the sqlift JSON
+  migration plan for offline use.
 - **Convergence loop** — `Replica::converge()` provides stateless,
   loss-tolerant sync. The replica computes bucket hashes and sends them
   directly; the master responds with the delta. Works entirely over
@@ -148,8 +148,8 @@ auto sub = replica_db.subscribe("SELECT count(*) FROM items",
 
 // Insert on master, flush, apply on replica.
 master_db.exec("INSERT INTO items VALUES (1, 'hello')");
-for (auto& msg : master.flush())
-    replica.handle_message(msg);
+for (auto& out : master.flush())
+    replica.handle_message(out.msg);
 replica_db.notify();  // fires subscriptions registered on replica_db
 ```
 
@@ -177,10 +177,10 @@ sync_handshake(master, replica);  // convenience for in-process use
 
 // Make changes on the master, then flush.
 sqlite3_exec(master_db, "INSERT INTO t VALUES (1, 'hello')", 0, 0, 0);
-auto msgs = master.flush();  // returns vector<Message>
-for (auto& msg : msgs) {
-    auto result = replica.handle_message(msg);
-    // result.messages    — vector<Message> to send back
+auto msgs = master.flush();  // returns vector<OutMessage>
+for (auto& out : msgs) {
+    auto result = replica.handle_message(out.msg);
+    // result.messages    — vector<OutMessage> to send back
     // result.changes     — per-row ChangeEvents
     // result.subscriptions — updated query results
 }
@@ -195,7 +195,8 @@ example including handshake and change event handling.
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-cv test     # build and run tests (146 test cases)
+# (in an existing clone: git submodule update --init --recursive)
+cv test     # build and run tests (196 test cases)
 cv example  # build and run the loopback demo
 cv wasm     # build Wasm module (requires emscripten)
 ```
@@ -293,15 +294,16 @@ public:
     // Access the raw sqlite3* handle (e.g. to pass to Master/Replica/Peer).
     sqlite3* handle() const;
 
-    // Generate migration SQL from one DDL to another (uses sqlift).
+    // Generate a sqlift JSON migration plan from one DDL to another.
+    // Returns an empty string if the schemas are equivalent.
     static std::string migration(const std::string& from_ddl,
                                  const std::string& to_ddl);
 };
-
-// Free function: generate migration SQL between two DDL strings.
-std::string generate_migration(const std::string& old_ddl,
-                               const std::string& new_ddl);
 ```
+
+> `std::string generate_migration(old_ddl, new_ddl)` is **declared** in
+> `dist/sqlpipe.h` but has no definition in `dist/sqlpipe.cpp` — calling it is
+> a link error. Use `Database::migration()` until it is implemented.
 
 `Subscription` is a RAII handle: when it is destroyed, the underlying
 subscription is automatically removed.
@@ -311,10 +313,11 @@ subscription is automatically removed.
 ```cpp
 struct MasterConfig {
     std::optional<std::set<std::string>> table_filter;  // nullopt = all tables
-    std::int64_t bucket_size = 1024;
+    std::string seq_key = "seq";                  // meta-table key for the sequence number
+    std::int64_t bucket_size = kDefaultBucketSize;  // 1024
     ProgressCallback on_progress = nullptr;
     SchemaMismatchCallback on_schema_mismatch = nullptr;
-    FlushCallback on_flush = nullptr;        // auto-flush on commit (takes std::vector<Message>)
+    FlushCallback on_flush = nullptr;   // auto-flush on commit (const std::vector<OutMessage>&)
     std::size_t changeset_queue_size = 64;   // 0 = disable queue replay
     LogCallback on_log = nullptr;
 };
@@ -323,12 +326,27 @@ class Master {
 public:
     explicit Master(sqlite3* db, MasterConfig config = {});
     void exec(const std::string& sql);                     // auto-flushes if on_flush set
-    std::vector<Message> flush();                          // manual flush
-    std::vector<Message> handle_message(const Message& msg);
+    std::vector<OutMessage> flush();                       // manual flush
+    std::vector<OutMessage> handle_message(const Message& msg);
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 };
 ```
+
+Outbound APIs return `OutMessage`, not bare `Message`:
+
+```cpp
+struct OutMessage {
+    Message  msg;       // the protocol message
+    Delivery delivery;  // Reliable or BestEffort
+};
+```
+
+`delivery_for()` assigns the hint: `BucketHashesMsg`, `NeedBucketsMsg`, and
+`RowHashesMsg` are `Delivery::BestEffort` (regenerable by the next convergence
+round); everything else is `Delivery::Reliable`. A transport that has only one
+channel may ignore the hint and send `out.msg` on it. `serialize()` takes the
+`Message`, not the `OutMessage`.
 
 ### Replica
 
@@ -336,14 +354,16 @@ public:
 struct ReplicaConfig {
     ConflictCallback on_conflict = nullptr;
     std::optional<std::set<std::string>> table_filter;
-    std::int64_t bucket_size = 1024;
+    std::string seq_key = "seq";
+    std::int64_t bucket_size = kDefaultBucketSize;  // 1024
     ProgressCallback on_progress = nullptr;
     SchemaMismatchCallback on_schema_mismatch = nullptr;
     LogCallback on_log = nullptr;
+    bool queue_while_predicting = false;   // see Prediction API
 };
 
 struct HandleResult {
-    std::vector<Message>      messages;       // protocol responses
+    std::vector<OutMessage>   messages;       // protocol responses (delivery-tagged)
     std::vector<ChangeEvent>  changes;        // row-level changes applied
     std::vector<QueryResult>  subscriptions;  // invalidated query results
 };
@@ -351,8 +371,8 @@ struct HandleResult {
 class Replica {
 public:
     explicit Replica(sqlite3* db, ReplicaConfig config = {});
-    Message hello() const;
-    std::vector<Message> converge();                       // stateless sync
+    OutMessage hello() const;
+    std::vector<OutMessage> converge();                    // stateless sync
     HandleResult handle_message(const Message& msg);
     HandleResult handle_messages(std::span<const Message> msgs);  // batched
     SubscriptionId subscribe(const std::string& sql);
@@ -362,6 +382,7 @@ public:
     HandleResult end_prediction(); // rollback + apply queued inbound
     void rollback_prediction();    // same drain; discard HandleResult
     std::size_t prediction_queue_size() const;
+    bool queues_while_predicting() const;
     void reset();                  // back to Init; drops prediction queue
     Seq current_seq() const;
     SchemaVersion schema_version() const;
@@ -386,7 +407,7 @@ struct PeerConfig {
 };
 
 struct PeerHandleResult {
-    std::vector<PeerMessage>  messages;
+    std::vector<PeerOutMessage> messages;   // delivery-tagged, like OutMessage
     std::vector<ChangeEvent>  changes;
     std::vector<QueryResult>  subscriptions;
 };
@@ -394,8 +415,8 @@ struct PeerHandleResult {
 class Peer {
 public:
     explicit Peer(sqlite3* db, PeerConfig config = {});
-    std::vector<PeerMessage> start();      // client initiates
-    std::vector<PeerMessage> flush();
+    std::vector<PeerOutMessage> start();   // client initiates
+    std::vector<PeerOutMessage> flush();
     PeerHandleResult handle_message(const PeerMessage& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
@@ -412,11 +433,11 @@ public:
 class Relay {
 public:
     explicit Relay(sqlite3* db, RelayConfig config = {});
-    std::size_t add_sink(SinkCallback cb);             // register downstream (takes const Message&)
+    std::size_t add_sink(SinkCallback cb);   // register downstream (const OutMessage&)
     void remove_sink(std::size_t id);
-    Message hello();                                   // send to upstream
-    std::vector<Message> handle_upstream(const Message& msg);
-    std::vector<Message> handle_downstream(const Message& msg);
+    OutMessage hello();                      // send to upstream
+    std::vector<OutMessage> handle_upstream(const Message& msg);
+    std::vector<OutMessage> handle_downstream(const Message& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
     void reset();
@@ -522,7 +543,7 @@ human-readable message:
 
 ```cpp
 try {
-    auto msgs = master.flush();  // std::vector<Message>
+    auto msgs = master.flush();  // std::vector<OutMessage>
 } catch (const sqlpipe::Error& e) {
     // e.code()  — ErrorCode enum
     // e.what()  — descriptive string
@@ -541,17 +562,14 @@ try {
 ## Schema migration
 
 `Database` handles migration automatically on construction. For custom
-migration workflows, use `generate_migration()` or the static
-`Database::migration()` method, which both delegate to sqlift's structural
-schema diffing:
+migration workflows, use the static `Database::migration()` method, which
+delegates to sqlift's structural schema diffing (`sqlift_parse` +
+`sqlift_diff`, `dist/sqlpipe.cpp:4721`):
 
 ```cpp
-// Generate migration SQL between two DDL strings.
-auto sql = generate_migration(old_schema_ddl, new_schema_ddl);
-sqlite3_exec(db, sql.c_str(), 0, 0, 0);
-
-// Or via the static method:
-auto sql = Database::migration(old_schema_ddl, new_schema_ddl);
+// Returns the sqlift JSON migration plan — not executable SQL.
+// Feed it to sqlift_apply(), or inspect it to drive your own migration.
+auto plan = Database::migration(old_schema_ddl, new_schema_ddl);
 ```
 
 For lower-level use, install an `on_schema_mismatch` callback to run
@@ -575,7 +593,7 @@ sqlpipe is transport-agnostic. The wire format is length-prefixed:
 
 ```cpp
 // Sending:
-auto buf = sqlpipe::serialize(msg);   // or serialize(peer_msg)
+auto buf = sqlpipe::serialize(out.msg);   // or serialize(peer_out.msg)
 send(socket, buf.data(), buf.size());
 
 // Receiving:
@@ -623,9 +641,9 @@ Apache 2.0. See [LICENSE](LICENSE) for details.
 Third-party dependencies:
 - **SQLite** — public domain
 - **LZ4** — BSD 2-Clause
-- **spdlog** — MIT
 - **nlohmann/json** — MIT
 - **liteparser** — MIT
+- **deepparser** — MIT
 - **sqlift** — Apache 2.0
 - **sqldeep** — Apache 2.0
 - **doctest** — MIT (test only)

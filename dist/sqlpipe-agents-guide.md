@@ -58,21 +58,30 @@ auto plan = Database::migration("", "CREATE TABLE t (id INTEGER PRIMARY KEY)");
 
 ```cpp
 Master master(db);                           // does NOT own db
-auto msgs = master.flush();                  // after each write txn
-auto resp = master.handle_message(incoming); // process replica msgs
+auto msgs = master.flush();                  // vector<OutMessage>, after each write txn
+auto resp = master.handle_message(incoming); // vector<OutMessage>
 master.current_seq();                        // current sequence number
 master.schema_version();                     // schema fingerprint
 ```
 
 `MasterConfig`:
 - `table_filter` — `optional<set<string>>`. `nullopt` = all tables, empty = none.
-- `bucket_size` — rows per bucket for diff protocol (default 1024).
+- `bucket_size` — rows per bucket for diff protocol (`kDefaultBucketSize`, 1024).
+- `seq_key` — meta-table key holding the sequence number (default `"seq"`).
+- `on_flush` — `void(const std::vector<OutMessage>&)`; auto-flush on commit.
+- `changeset_queue_size` — recent changesets retained for reconnect replay
+  (default 64; 0 disables).
+
+Outbound APIs return `OutMessage { Message msg; Delivery delivery; }`. Bucket
+hash / need-buckets / row-hash messages are `Delivery::BestEffort`; everything
+else is `Delivery::Reliable`. Send `out.msg`; `serialize()` takes the
+`Message`, not the `OutMessage`.
 
 ### Replica (receiving side)
 
 ```cpp
 Replica replica(db, config);                   // does NOT own db
-auto hello = replica.hello();                  // send to master first
+auto hello = replica.hello();                  // OutMessage; send to master first
 HandleResult r = replica.handle_message(incoming);
 // r.messages      — protocol responses to send back
 // r.changes       — per-row ChangeEvents applied this call
@@ -82,10 +91,12 @@ replica.schema_version();
 replica.state();  // Init → Handshake → DiffBuckets → DiffRows → Live (or Error)
 
 // Query subscriptions (reactive queries)
-auto qr = replica.subscribe("SELECT * FROM t1 ORDER BY id");
-// qr.id, qr.columns, qr.rows — current result
-// After handle_message, check r.subscriptions for updated results
-replica.unsubscribe(qr.id);
+SubscriptionId sid = replica.subscribe("SELECT * FROM t1 ORDER BY id");
+// subscribe() does NOT evaluate the query — it only registers it.
+// Results (QueryResult: .id, .columns, .rows) arrive in
+// HandleResult::subscriptions on the next handle_message(); before Live,
+// evaluation is deferred until sync completes.
+replica.unsubscribe(sid);
 replica.reset();              // return to Init; subscriptions preserved
 // (also rolls back any prediction and drops any queued inbound messages)
 ```
@@ -222,9 +233,9 @@ cfg.owned_tables = {"draft*"};       // glob: own tables starting with "draft"
 cfg.owned_tables = {"drafts"};       // exact match (still works)
 Peer client(db, cfg);                // does NOT own db
 
-auto msgs = client.start();              // initiate handshake (client only)
+auto msgs = client.start();              // vector<PeerOutMessage>; client only
 PeerHandleResult r = client.handle_message(incoming);
-// r.messages — PeerMessages to send back
+// r.messages — PeerOutMessages to send back (use .msg for the PeerMessage)
 // r.changes  — per-row ChangeEvents applied
 auto fmsgs = client.flush();             // after writing owned tables
 client.state();    // Init → Negotiating → Diffing → Live (or Error)
@@ -260,8 +271,10 @@ Key features:
 ### sqlift (bundled schema migration)
 
 - `Database` constructor auto-migrates schema on open
-- `Database::migration(from_ddl, to_ddl)` — returns JSON migration plan
-- `generate_migration(old_ddl, new_ddl)` — same as the static method
+- `Database::migration(from_ddl, to_ddl)` — returns the sqlift JSON migration
+  plan (empty string when the schemas are equivalent), not executable SQL
+- `generate_migration(old_ddl, new_ddl)` — **declared in `sqlpipe.h` but not
+  defined in `sqlpipe.cpp`**; calling it is a link error. Use the static method.
 - Direct access: `sqlift_parse()`, `sqlift_diff()`, `sqlift_apply()`
 
 ### Typical loop (unidirectional)
@@ -278,8 +291,8 @@ auto resp = master.handle_message(hello);
 // 2. Live streaming
 sqlite3_exec(db, "INSERT ...", ...);
 auto msgs = master.flush();            // → send to replica
-for (auto& m : msgs) {
-    auto result = replica.handle_message(m);
+for (auto& out : msgs) {
+    auto result = replica.handle_message(out.msg);
     // result.messages → send back to master
     // result.changes  → business-level row changes
 }
@@ -303,16 +316,17 @@ auto msgs = client.start();
 
 // Live — each side flushes its owned tables
 sqlite3_exec(client_db, "INSERT INTO drafts ...", ...);
-auto peer_msgs = client.flush();          // → send to server
-for (auto& m : peer_msgs) {
-    auto r = server.handle_message(m);
+auto peer_msgs = client.flush();          // vector<PeerOutMessage> → send to server
+for (auto& out : peer_msgs) {
+    auto r = server.handle_message(out.msg);
     // r.messages → send back    r.changes → row events
 }
 ```
 
 ### Key types
 
-- `HandleResult` — `.messages` (protocol responses), `.changes` (row events),
+- `OutMessage` — `.msg` (Message), `.delivery` (`Reliable` / `BestEffort`)
+- `HandleResult` — `.messages` (`OutMessage`), `.changes` (row events),
   `.subscriptions` (invalidated query results)
 - `QueryResult` — `.id` (SubscriptionId), `.columns`, `.rows`
 - `Message` — variant of: `HelloMsg`, `ChangesetMsg`, `AckMsg`, `ErrorMsg`,
@@ -322,7 +336,7 @@ for (auto& m : peer_msgs) {
 - `Value` — variant: `monostate` (NULL), `int64_t`, `double`, `string`,
   `vector<uint8_t>` (BLOB)
 - `PeerMessage` — `.sender_role` (`AsMaster`/`AsReplica`), `.payload` (Message)
-- `PeerHandleResult` — `.messages` (PeerMessages), `.changes` (row events)
+- `PeerHandleResult` — `.messages` (`PeerOutMessage`), `.changes` (row events)
 - `serialize(msg)` / `deserialize(buf)` — wire format:
   `[4B LE length][1B tag][payload]`. Changeset blobs within payloads use
   compression framing: `[u32 len][u8 type][data]` where type `0x00` =

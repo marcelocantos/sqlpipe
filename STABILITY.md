@@ -26,7 +26,7 @@ API surface complexity:
 
 The clock starts from the last breaking change to the interaction surface.
 
-Current surface: ~107 items → 3 months. Last breaking change: v0.26.0
+Current surface: ~107 items (> 100) → 4 months. Last breaking change: v0.26.0
 (Schema fingerprint widened to the full sqlift structural hash. `SchemaVersion`
 changes from `std::int32_t` to opaque variable-length bytes
 (`std::vector<std::uint8_t>`) of the form `[algorithm-id][digest]` — previously
@@ -162,8 +162,8 @@ class Master {
     Master& operator=(Master&&) noexcept;
 
     void exec(const std::string& sql);
-    std::vector<Message> flush();
-    std::vector<Message> handle_message(const Message& msg);
+    std::vector<OutMessage> flush();
+    std::vector<OutMessage> handle_message(const Message& msg);
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 };
@@ -180,8 +180,8 @@ class Replica {
     Replica(Replica&&) noexcept;
     Replica& operator=(Replica&&) noexcept;
 
-    Message hello() const;
-    std::vector<Message> converge();
+    OutMessage hello() const;
+    std::vector<OutMessage> converge();
     HandleResult handle_message(const Message& msg);
     HandleResult handle_messages(std::span<const Message> msgs);
     SubscriptionId subscribe(const std::string& sql);
@@ -212,8 +212,8 @@ class Peer {
     Peer(Peer&&) noexcept;
     Peer& operator=(Peer&&) noexcept;
 
-    std::vector<PeerMessage> start();
-    std::vector<PeerMessage> flush();
+    std::vector<PeerOutMessage> start();
+    std::vector<PeerOutMessage> flush();
     PeerHandleResult handle_message(const PeerMessage& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
@@ -237,9 +237,9 @@ class Relay {
 
     std::size_t add_sink(SinkCallback cb);
     void remove_sink(std::size_t id);
-    Message hello();
-    std::vector<Message> handle_upstream(const Message& msg);
-    std::vector<Message> handle_downstream(const Message& msg);
+    OutMessage hello();
+    std::vector<OutMessage> handle_upstream(const Message& msg);
+    std::vector<OutMessage> handle_downstream(const Message& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
     void reset();
@@ -313,7 +313,7 @@ class Subscription {
 | `void sync_handshake(Peer& client, Peer& server)` | **Stable** |
 | `void sync_handshake(Master&, Relay&)` | **Stable** |
 | `QueryResult query(sqlite3* db, const std::string& sql)` | **Stable** |
-| `std::string generate_migration(const std::string&, const std::string&)` | **Fluid** (new in v0.19.0) |
+| `std::string generate_migration(const std::string&, const std::string&)` | **Unimplemented** — declared in `sqlpipe.h:1153`, no definition in `sqlpipe.cpp`; calling it is a link error |
 
 ### Bundled C APIs (sqldeep, sqlift)
 
