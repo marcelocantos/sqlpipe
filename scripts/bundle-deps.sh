@@ -262,6 +262,17 @@ cp dist/sqlpipe.h swift/Sources/CSqlpipe/include/
 # feeds cgo the wrong prototypes. Keep it in lockstep with the source of truth.
 cp go/sqlpipe/sqlpipe_capi.{h,cpp} go/sqlpipe/internal/c/
 
+# The Swift package vendors the same C-API shim. Its only public header
+# directory is include/ (Package.swift sets publicHeadersPath: "include"), so
+# the header goes there and nowhere else — a second copy beside the .cpp would
+# not be compiled and would rot unnoticed. The .cpp needs its two include paths
+# rewritten for that layout; everything else must stay byte-identical.
+cp go/sqlpipe/sqlpipe_capi.h swift/Sources/CSqlpipe/include/
+gsed -E \
+    -e 's|^#include "sqlpipe_capi\.h"$|#include "include/sqlpipe_capi.h"|' \
+    -e 's|^#include "internal/c/sqlpipe\.h"$|#include "include/sqlpipe.h"|' \
+    go/sqlpipe/sqlpipe_capi.cpp > swift/Sources/CSqlpipe/sqlpipe_capi.cpp
+
 # ── 6. Sync deepparser sources to wrappers ────────────────────
 # The bundled sqldeep parses input via deepparser. Wrappers must
 # vendor deepparser sources so consumers don't need to fetch them.

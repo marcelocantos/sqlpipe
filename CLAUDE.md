@@ -56,10 +56,16 @@ Also update the Swift package (`swift/Sources/CSqlpipe/`):
 cp vendor/src/{sqlite3.c,lz4.c} swift/Sources/CSqlpipe/
 cp vendor/include/{sqlite3.h,lz4.h} swift/Sources/CSqlpipe/include/
 cp vendor/include/nlohmann/json.hpp swift/Sources/CSqlpipe/include/nlohmann/
-cp go/sqlpipe/sqlpipe_capi.{h,cpp} swift/Sources/CSqlpipe/ && cp go/sqlpipe/sqlpipe_capi.h swift/Sources/CSqlpipe/include/
 ```
-Note: `sqlpipe_capi.cpp` in the Swift package uses `#include "include/..."` paths
-(different from the Go copy which uses `#include "internal/c/..."`).
+`sqlpipe_capi.{h,cpp}` are no longer on this manual list: `bundle-deps.sh`
+copies them into the Swift package itself. The header goes into `include/` and
+nowhere else (`Package.swift` sets `publicHeadersPath: "include"`, so a copy
+beside the `.cpp` would not be compiled and would rot unnoticed); the `.cpp`
+gets its two include paths rewritten from `internal/c/...` to `include/...`.
+
+`scripts/check-vendor-lockstep.sh` asserts every vendored wrapper copy is
+identical to its source and runs as the `vendor-lockstep` CI job, so drift
+cannot ship silently.
 
 ### Swift wrapper
 

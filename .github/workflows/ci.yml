@@ -32,6 +32,18 @@ jobs:
       - name: Build and test
         run: cv test
 
+  vendor-lockstep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # The Go and Swift wrapper packages vendor copies of dist/sqlpipe.{h,cpp}
+      # and the C-API shim so they build standalone. Nothing else in CI compares
+      # those copies against their sources, so a stale one — e.g. a header
+      # missing a struct field — could ship silently. This asserts lockstep.
+      - name: Check vendored wrapper copies are in lockstep
+        run: scripts/check-vendor-lockstep.sh
+
   go:
     runs-on: ubuntu-latest
     steps:
