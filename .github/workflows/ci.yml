@@ -32,6 +32,12 @@ jobs:
       - name: Build and test
         run: cv test
 
+      # README advertises `cv example` as the first-run command, but nothing
+      # else in CI compiles examples/loopback.cpp against the public headers,
+      # so an API change could (and did) leave the advertised demo unbuildable.
+      - name: Build and run the loopback example
+        run: cv example
+
   vendor-lockstep:
     runs-on: ubuntu-latest
     steps:
@@ -43,6 +49,13 @@ jobs:
       # missing a struct field — could ship silently. This asserts lockstep.
       - name: Check vendored wrapper copies are in lockstep
         run: scripts/check-vendor-lockstep.sh
+
+      # The Go C-API and the emscripten Wasm shim are two hand-written encoders
+      # for the same core types. Nothing else compares them, so one could (and
+      # did) drop a field the other emits, giving the same value two wire
+      # encodings.
+      - name: Check the two FFI shims encode results identically
+        run: scripts/check-ffi-framing.sh
 
   go:
     runs-on: ubuntu-latest

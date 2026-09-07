@@ -10,10 +10,10 @@
 
 using namespace sqlpipe;
 
-static HandleResult deliver(const std::vector<Message>& msgs, Replica& handler) {
+static HandleResult deliver(const std::vector<OutMessage>& msgs, Replica& handler) {
     HandleResult result;
-    for (const auto& m : msgs) {
-        auto resp = handler.handle_message(m);
+    for (const auto& out : msgs) {
+        auto resp = handler.handle_message(out.msg);
         result.messages.insert(result.messages.end(),
                                resp.messages.begin(), resp.messages.end());
         result.changes.insert(result.changes.end(),
