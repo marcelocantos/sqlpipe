@@ -148,27 +148,30 @@ void encode_query_result(Buf& b, const sqlpipe::QueryResult& qr) {
     }
 }
 
-// Encode vector<OutMessage> as [u32 count][serialized msg]... The core API
-// returns delivery-tagged OutMessage; we serialize the wrapped Message only.
-// (The TypeScript decoder reads [u32 count] + length-prefixed bodies and does
-// not consume a delivery byte, so — unlike the Go C-API — none is emitted.)
+// Encode vector<OutMessage> as [u32 count][[serialized msg][u8 delivery]]...
+// Byte-identical to the Go C-API's framing: sqlpipe::Delivery is part of the
+// core's HandleResult contract, so dropping it here would give the Wasm surface
+// a second, weaker encoding of the same type (a caller could not tell Reliable
+// from BestEffort). scripts/check-ffi-framing.sh holds the two shims together.
 Buf encode_messages(const std::vector<sqlpipe::OutMessage>& msgs) {
     Buf b;
     put_u32(b, static_cast<uint32_t>(msgs.size()));
     for (auto& om : msgs) {
         auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
+        put_u8(b, static_cast<uint8_t>(om.delivery));
     }
     return b;
 }
 
-// Encode vector<PeerOutMessage> as [u32 count][serialized pmsg]...
+// Encode vector<PeerOutMessage> as [u32 count][[serialized pmsg][u8 delivery]]...
 Buf encode_peer_messages(const std::vector<sqlpipe::PeerOutMessage>& msgs) {
     Buf b;
     put_u32(b, static_cast<uint32_t>(msgs.size()));
     for (auto& om : msgs) {
         auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
+        put_u8(b, static_cast<uint8_t>(om.delivery));
     }
     return b;
 }
@@ -180,6 +183,7 @@ Buf encode_handle_result(const sqlpipe::HandleResult& hr) {
     for (auto& om : hr.messages) {
         auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
+        put_u8(b, static_cast<uint8_t>(om.delivery));
     }
     put_u32(b, static_cast<uint32_t>(hr.changes.size()));
     for (auto& ce : hr.changes) encode_change_event(b, ce);
@@ -195,6 +199,7 @@ Buf encode_peer_handle_result(const sqlpipe::PeerHandleResult& phr) {
     for (auto& om : phr.messages) {
         auto wire = sqlpipe::serialize(om.msg);
         put_bytes(b, wire.data(), wire.size());
+        put_u8(b, static_cast<uint8_t>(om.delivery));
     }
     put_u32(b, static_cast<uint32_t>(phr.changes.size()));
     for (auto& ce : phr.changes) encode_change_event(b, ce);

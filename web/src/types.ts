@@ -11,10 +11,23 @@ export enum OpType {
   Delete = 3,
 }
 
+/**
+ * Delivery guarantee a message needs from the transport. Mirrors
+ * sqlpipe::Delivery in dist/sqlpipe.h.
+ */
+export enum Delivery {
+  /** Must arrive: changesets, errors, acks, hellos, patchsets. */
+  Reliable = 0,
+  /** Regenerable by convergence: bucket/row hashes, need-buckets. */
+  BestEffort = 1,
+}
+
 /** A serialized wire-format protocol message. */
 export interface WireMessage {
   /** Serialized message (including 4-byte length prefix). */
   data: Uint8Array;
+  /** Delivery guarantee the transport must provide for this message. */
+  delivery: Delivery;
 }
 
 /** A row-level change extracted from a changeset. */

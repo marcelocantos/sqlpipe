@@ -8,7 +8,7 @@ import type {
   LogCallback, MasterConfig, WireMessage, PeerConfig, PeerHandleResult,
   ProgressCallback, QueryResult, ReplicaConfig, SchemaMismatchCallback,
 } from './types.js';
-import { ConflictAction, PeerState, ReplicaState, SqldeepBackend } from './types.js';
+import { ConflictAction, Delivery, PeerState, ReplicaState, SqldeepBackend } from './types.js';
 import { decodeHandleResult, decodeMessages, decodePeerHandleResult, decodeQueryResult, decodeChangeEvent, Reader } from './decode.js';
 import { type WasmModule, SqlpipeError, readBuf, checkError, withStack } from './wasm.js';
 
@@ -317,7 +317,10 @@ export class Replica {
     this.M._sqlpipe_replica_hello(this.ptr, this.bufPtr, this.errPtr);
     checkError(this.M, this.errPtr);
     const data = readBuf(this.M, this.bufPtr);
-    return { data };
+    // sqlpipe_replica_hello returns a bare serialized message with no framing,
+    // so there is no delivery byte to read. A HelloMsg must arrive for the
+    // session to start, hence Reliable (see sqlpipe::Delivery in dist/sqlpipe.h).
+    return { data, delivery: Delivery.Reliable };
   }
 
   /** Handle a message from the master. */

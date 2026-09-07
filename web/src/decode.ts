@@ -1,14 +1,11 @@
 // Copyright 2026 Marcelo Cantos
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ChangeEvent, HandleResult, PeerHandleResult, QueryResult, Value } from './types.js';
+import type { ChangeEvent, HandleResult, PeerHandleResult, QueryResult, Value, WireMessage } from './types.js';
+import { Delivery } from './types.js';
 import { OpType } from './types.js';
 
-/** Wire message — a length-prefixed serialized protocol message. */
-export interface WireMessage {
-  /** Serialized wire-format message (including 4-byte length prefix). */
-  data: Uint8Array;
-}
+export type { WireMessage } from './types.js';
 
 /** Little-endian binary reader over a Uint8Array. */
 export class Reader {
@@ -105,6 +102,11 @@ export function decodeQueryResult(r: Reader): QueryResult {
   return { id, columns, rows };
 }
 
+// Framing is [u32 count][[serialized msg][u8 delivery]]... — the same encoding
+// the Go C-API emits (see encode_messages in web/sqlpipe_wapi.cpp and
+// go/sqlpipe/sqlpipe_capi.cpp, held together by scripts/check-ffi-framing.sh).
+// The delivery tag says whether the transport must guarantee arrival, so it is
+// part of the message, not optional decoration.
 function decodeWireMessages(buf: Uint8Array, r: Reader, count: number): WireMessage[] {
   const msgs: WireMessage[] = [];
   for (let i = 0; i < count; i++) {
@@ -112,7 +114,8 @@ function decodeWireMessages(buf: Uint8Array, r: Reader, count: number): WireMess
     const start = r.pos - 4;
     r.pos += len;
     const data = buf.slice(start, r.pos);
-    msgs.push({ data });
+    const delivery = r.u8() as Delivery;
+    msgs.push({ data, delivery });
   }
   return msgs;
 }
