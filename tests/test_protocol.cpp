@@ -3,6 +3,9 @@
 #include <doctest.h>
 #include <sqlpipe.h>
 
+#include <fstream>
+#include <nlohmann/json.hpp>
+
 using namespace sqlpipe;
 
 TEST_CASE("HelloMsg round-trip") {
@@ -348,4 +351,81 @@ TEST_CASE("checked_malloc throws on allocation failure (T23/F9)") {
     std::free(p);
     // SIZE_MAX bytes cannot be allocated → malloc returns nullptr → must throw.
     CHECK_THROWS_AS(detail::checked_malloc(SIZE_MAX), std::bad_alloc);
+}
+
+static std::string to_hex(const std::vector<std::uint8_t>& buf) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    out.resize(buf.size() * 2);
+    for (size_t i = 0; i < buf.size(); ++i) {
+        out[2 * i] = hex[buf[i] >> 4];
+        out[2 * i + 1] = hex[buf[i] & 0x0f];
+    }
+    return out;
+}
+
+static nlohmann::json load_serialize_golden() {
+    const char* candidates[] = {
+        "testdata/serialize_golden.json",
+        "../testdata/serialize_golden.json",
+    };
+    for (const char* p : candidates) {
+        std::ifstream in(p);
+        if (!in) {
+            continue;
+        }
+        nlohmann::json corpus;
+        in >> corpus;
+        return corpus;
+    }
+    FAIL("missing testdata/serialize_golden.json (C++ golden corpus)");
+    return {};
+}
+
+TEST_CASE("serialize matches golden corpus") {
+    auto corpus = load_serialize_golden();
+    REQUIRE(corpus.is_object());
+
+    HelloMsg hello{kProtocolVersion, SchemaVersion{0x01, 0x03}, {}, -1};
+    CHECK(to_hex(serialize(Message{hello})) == corpus.at("hello").get<std::string>());
+
+    ChangesetMsg cs{7, Changeset{0x01, 0x02, 0x03, 0xFF}};
+    CHECK(to_hex(serialize(Message{cs})) == corpus.at("changeset").get<std::string>());
+
+    CHECK(to_hex(serialize(Message{AckMsg{55}})) == corpus.at("ack").get<std::string>());
+
+    ErrorMsg err(ErrorCode::SchemaMismatch, "schema differs", SchemaVersion{0x01, 0x2a},
+                 "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);");
+    CHECK(to_hex(serialize(Message{err})) == corpus.at("error").get<std::string>());
+
+    BucketHashesMsg bh;
+    bh.buckets.push_back({"t1", 0, 1023, 0xABCDEF0123456789ULL, 100});
+    bh.buckets.push_back({"t1", 1024, 2047, 0x1122334455667788ULL, 50});
+    CHECK(to_hex(serialize(Message{bh})) == corpus.at("bucket_hashes").get<std::string>());
+
+    NeedBucketsMsg nb;
+    nb.ranges.push_back({"users", 0, 1023});
+    nb.ranges.push_back({"orders", 1024, 2047});
+    CHECK(to_hex(serialize(Message{nb})) == corpus.at("need_buckets").get<std::string>());
+
+    RowHashesMsg rh;
+    RowHashesEntry entry;
+    entry.table = "t1";
+    entry.lo = 0;
+    entry.hi = 1023;
+    entry.runs.push_back({1, 3, {0xAA, 0xBB, 0xCC}});
+    entry.runs.push_back({10, 2, {0xDD, 0xEE}});
+    rh.entries.push_back(std::move(entry));
+    CHECK(to_hex(serialize(Message{rh})) == corpus.at("row_hashes").get<std::string>());
+
+    DiffReadyMsg dr;
+    dr.seq = 42;
+    dr.patchset = {0x01, 0x02, 0x03};
+    dr.deletes.push_back({"t1", {1, 2, 3}});
+    dr.deletes.push_back({"t2", {10, 20}});
+    CHECK(to_hex(serialize(Message{dr})) == corpus.at("diff_ready").get<std::string>());
+
+    // Decode each golden vector back to the same tag.
+    auto hello_back = deserialize(serialize(Message{hello}));
+    CHECK(std::holds_alternative<HelloMsg>(hello_back));
 }

@@ -5,6 +5,12 @@ package sqlpipe
 
 import (
 	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -471,4 +477,113 @@ func int64sEqual(a, b []int64) bool {
 		}
 	}
 	return true
+}
+
+type serializeGoldenCase struct {
+	name string
+	msg  Message
+}
+
+func serializeGoldenFixtures() []serializeGoldenCase {
+	return []serializeGoldenCase{
+		{"hello", HelloMsg{
+			ProtocolVersion: ProtocolVersion,
+			SchemaVersion:   SchemaVersion{0x01, 0x03},
+			OwnedTables:     nil,
+			LastSeq:         -1,
+		}},
+		{"changeset", ChangesetMsg{Seq: 7, Data: Changeset{0x01, 0x02, 0x03, 0xFF}}},
+		{"ack", AckMsg{Seq: 55}},
+		{"error", ErrorMsg{
+			Code:                ErrSchemaMismatch,
+			Detail:              "schema differs",
+			RemoteSchemaVersion: SchemaVersion{0x01, 0x2a},
+			RemoteSchemaSQL:     "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);",
+		}},
+		{"bucket_hashes", BucketHashesMsg{
+			LastSeq:         -1,
+			ProtocolVersion: 0,
+			Buckets: []BucketHashEntry{
+				{Table: "t1", BucketLo: 0, BucketHi: 1023, Hash: 0xABCDEF0123456789, RowCount: 100},
+				{Table: "t1", BucketLo: 1024, BucketHi: 2047, Hash: 0x1122334455667788, RowCount: 50},
+			},
+		}},
+		{"need_buckets", NeedBucketsMsg{Ranges: []NeedBucketRange{
+			{Table: "users", Lo: 0, Hi: 1023},
+			{Table: "orders", Lo: 1024, Hi: 2047},
+		}}},
+		{"row_hashes", RowHashesMsg{Entries: []RowHashesEntry{{
+			Table: "t1", Lo: 0, Hi: 1023,
+			Runs: []RowHashRun{
+				{StartRowid: 1, Count: 3, Hashes: []uint64{0xAA, 0xBB, 0xCC}},
+				{StartRowid: 10, Count: 2, Hashes: []uint64{0xDD, 0xEE}},
+			},
+		}}}},
+		{"diff_ready", DiffReadyMsg{
+			Seq:      42,
+			Patchset: Changeset{0x01, 0x02, 0x03},
+			Deletes: []TableDeletes{
+				{Table: "t1", Rowids: []int64{1, 2, 3}},
+				{Table: "t2", Rowids: []int64{10, 20}},
+			},
+		}},
+	}
+}
+
+func loadSerializeGolden() (map[string][]byte, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return nil, fmt.Errorf("runtime.Caller failed")
+	}
+	candidates := []string{
+		filepath.Join(filepath.Dir(thisFile), "..", "..", "testdata", "serialize_golden.json"),
+		"testdata/serialize_golden.json",
+	}
+	var raw []byte
+	var err error
+	for _, p := range candidates {
+		raw, err = os.ReadFile(p)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("testdata/serialize_golden.json: %w", err)
+	}
+	var hexMap map[string]string
+	if err := json.Unmarshal(raw, &hexMap); err != nil {
+		return nil, err
+	}
+	out := make(map[string][]byte, len(hexMap))
+	for k, h := range hexMap {
+		b, err := hex.DecodeString(h)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", k, err)
+		}
+		out[k] = b
+	}
+	return out, nil
+}
+
+func TestSerializeMatchesGolden(t *testing.T) {
+	corpus, err := loadSerializeGolden()
+	if err != nil {
+		t.Fatalf("shared C++ golden corpus: %v", err)
+	}
+	for _, tc := range serializeGoldenFixtures() {
+		got := Serialize(tc.msg)
+		want, ok := corpus[tc.name]
+		if !ok {
+			t.Errorf("%s: missing from golden corpus", tc.name)
+			continue
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s: Go serialize != C++ golden\n  go=%x\n  cxx=%x", tc.name, got, want)
+		}
+		back, err := Deserialize(got)
+		if err != nil {
+			t.Errorf("%s: deserialize golden: %v", tc.name, err)
+		}
+		_ = back
+	}
 }
