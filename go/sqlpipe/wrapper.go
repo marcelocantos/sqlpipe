@@ -75,25 +75,27 @@ extern int goApproveOwnershipTrampoline(uintptr_t, const char**, size_t);
 extern void goLogTrampoline(uintptr_t, uint8_t, const char*);
 extern void goFlushTrampoline(uintptr_t, const uint8_t*, size_t);
 
-// C trampolines that cast void* ctx to uintptr_t for Go.
+// C trampolines load a cgo.Handle from a malloc'd uintptr_t.
+// The void* is that allocation. A cgo.Handle is a small integer, and
+// stuffing it into void* trips checkptr under the race detector.
 // These cannot be static because CGo needs them as exported symbols.
 void cProgressTrampoline(void* ctx, uint8_t phase, const char* table, int64_t done, int64_t total) {
-	goProgressTrampoline((uintptr_t)ctx, phase, table, done, total);
+	goProgressTrampoline(*(uintptr_t*)ctx, phase, table, done, total);
 }
 int cSchemaMismatchTrampoline(void* ctx, const uint8_t* remote_sv, size_t remote_sv_len, const uint8_t* local_sv, size_t local_sv_len, const char* remote_sql) {
-	return goSchemaMismatchTrampoline((uintptr_t)ctx, remote_sv, remote_sv_len, local_sv, local_sv_len, remote_sql);
+	return goSchemaMismatchTrampoline(*(uintptr_t*)ctx, remote_sv, remote_sv_len, local_sv, local_sv_len, remote_sql);
 }
 uint8_t cConflictTrampoline(void* ctx, uint8_t ct, const uint8_t* data, size_t len) {
-	return goConflictTrampoline((uintptr_t)ctx, ct, data, len);
+	return goConflictTrampoline(*(uintptr_t*)ctx, ct, data, len);
 }
 int cApproveOwnershipTrampoline(void* ctx, const char** tables, size_t count) {
-	return goApproveOwnershipTrampoline((uintptr_t)ctx, tables, count);
+	return goApproveOwnershipTrampoline(*(uintptr_t*)ctx, tables, count);
 }
 void cLogTrampoline(void* ctx, uint8_t level, const char* message) {
-	goLogTrampoline((uintptr_t)ctx, level, message);
+	goLogTrampoline(*(uintptr_t*)ctx, level, message);
 }
 void cFlushTrampoline(void* ctx, const uint8_t* data, size_t len) {
-	goFlushTrampoline((uintptr_t)ctx, data, len);
+	goFlushTrampoline(*(uintptr_t*)ctx, data, len);
 }
 */
 import "C"
@@ -822,13 +824,23 @@ type decoder struct {
 	pos  int
 }
 
-func (d *decoder) u8() uint8       { v := d.data[d.pos]; d.pos++; return v }
-func (d *decoder) u32() uint32     { v := binary.LittleEndian.Uint32(d.data[d.pos:]); d.pos += 4; return v }
-func (d *decoder) i32() int32      { return int32(d.u32()) }
-func (d *decoder) u64() uint64     { v := binary.LittleEndian.Uint64(d.data[d.pos:]); d.pos += 8; return v }
-func (d *decoder) i64() int64      { return int64(d.u64()) }
-func (d *decoder) str() string     { n := d.u32(); s := string(d.data[d.pos : d.pos+int(n)]); d.pos += int(n); return s }
-func (d *decoder) bytes(n int) []byte { b := make([]byte, n); copy(b, d.data[d.pos:]); d.pos += n; return b }
+func (d *decoder) u8() uint8   { v := d.data[d.pos]; d.pos++; return v }
+func (d *decoder) u32() uint32 { v := binary.LittleEndian.Uint32(d.data[d.pos:]); d.pos += 4; return v }
+func (d *decoder) i32() int32  { return int32(d.u32()) }
+func (d *decoder) u64() uint64 { v := binary.LittleEndian.Uint64(d.data[d.pos:]); d.pos += 8; return v }
+func (d *decoder) i64() int64  { return int64(d.u64()) }
+func (d *decoder) str() string {
+	n := d.u32()
+	s := string(d.data[d.pos : d.pos+int(n)])
+	d.pos += int(n)
+	return s
+}
+func (d *decoder) bytes(n int) []byte {
+	b := make([]byte, n)
+	copy(b, d.data[d.pos:])
+	d.pos += n
+	return b
+}
 
 func (d *decoder) value() Value {
 	tag := d.u8()
@@ -1025,21 +1037,37 @@ func decodePeerHandleResult(buf C.sqlpipe_buf) (PeerHandleResult, error) {
 
 // ── Callback handle management ──────────────────────────────────
 
-// callbackHandles holds cgo.Handles that must be kept alive for the
-// lifetime of a Master/Replica/Peer. Freed on Close().
-type callbackHandles []cgo.Handle
+// callbackHandles keeps cgo.Handles alive for the lifetime of a
+// Master/Replica/Peer and stores each one in a C-allocated uintptr_t.
+// The pointer passed to sqlpipe is that allocation. Freed on Close(),
+// after the C object that would call back has been released.
+type callbackHandles struct {
+	handles []cgo.Handle
+	boxes   []unsafe.Pointer
+}
 
-func (h *callbackHandles) add(v any) cgo.Handle {
+func (h *callbackHandles) add(v any) unsafe.Pointer {
 	handle := cgo.NewHandle(v)
-	*h = append(*h, handle)
-	return handle
+	box := C.malloc(C.size_t(unsafe.Sizeof(C.uintptr_t(0))))
+	if box == nil {
+		handle.Delete()
+		panic("sqlpipe: malloc cgo handle box")
+	}
+	*(*C.uintptr_t)(box) = C.uintptr_t(handle)
+	h.handles = append(h.handles, handle)
+	h.boxes = append(h.boxes, box)
+	return box
 }
 
 func (h *callbackHandles) free() {
-	for _, handle := range *h {
+	for _, handle := range h.handles {
 		handle.Delete()
 	}
-	*h = nil
+	h.handles = nil
+	for _, box := range h.boxes {
+		C.free(box)
+	}
+	h.boxes = nil
 }
 
 // ── C string array helpers ──────────────────────────────────────
@@ -1105,22 +1133,22 @@ func NewMaster(db *Database, config MasterConfig) (*Master, error) {
 	if config.OnProgress != nil {
 		h := m.handles.add(config.OnProgress)
 		cfg.on_progress = C.sqlpipe_progress_fn(C.cProgressTrampoline)
-		cfg.progress_ctx = unsafe.Pointer(uintptr(h))
+		cfg.progress_ctx = h
 	}
 	if config.OnSchemaMismatch != nil {
 		h := m.handles.add(config.OnSchemaMismatch)
 		cfg.on_schema_mismatch = C.sqlpipe_schema_mismatch_fn(C.cSchemaMismatchTrampoline)
-		cfg.schema_mismatch_ctx = unsafe.Pointer(uintptr(h))
+		cfg.schema_mismatch_ctx = h
 	}
 	if config.OnLog != nil {
 		h := m.handles.add(config.OnLog)
 		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
-		cfg.log_ctx = unsafe.Pointer(uintptr(h))
+		cfg.log_ctx = h
 	}
 	if config.OnFlush != nil {
 		h := m.handles.add(config.OnFlush)
 		cfg.on_flush = C.sqlpipe_flush_fn(C.cFlushTrampoline)
-		cfg.flush_ctx = unsafe.Pointer(uintptr(h))
+		cfg.flush_ctx = h
 	}
 
 	if err := convertError(C.sqlpipe_master_new(db.db, cfg, &m.ptr)); err != nil {
@@ -1200,7 +1228,7 @@ func NewReplica(db *Database, config ReplicaConfig) (*Replica, error) {
 	if config.OnConflict != nil {
 		h := r.handles.add(config.OnConflict)
 		cfg.on_conflict = C.sqlpipe_conflict_fn(C.cConflictTrampoline)
-		cfg.conflict_ctx = unsafe.Pointer(uintptr(h))
+		cfg.conflict_ctx = h
 	}
 
 	tfPtrs, tfCount := tableFilterToCStrings(config.TableFilter)
@@ -1218,17 +1246,17 @@ func NewReplica(db *Database, config ReplicaConfig) (*Replica, error) {
 	if config.OnProgress != nil {
 		h := r.handles.add(config.OnProgress)
 		cfg.on_progress = C.sqlpipe_progress_fn(C.cProgressTrampoline)
-		cfg.progress_ctx = unsafe.Pointer(uintptr(h))
+		cfg.progress_ctx = h
 	}
 	if config.OnSchemaMismatch != nil {
 		h := r.handles.add(config.OnSchemaMismatch)
 		cfg.on_schema_mismatch = C.sqlpipe_schema_mismatch_fn(C.cSchemaMismatchTrampoline)
-		cfg.schema_mismatch_ctx = unsafe.Pointer(uintptr(h))
+		cfg.schema_mismatch_ctx = h
 	}
 	if config.OnLog != nil {
 		h := r.handles.add(config.OnLog)
 		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
-		cfg.log_ctx = unsafe.Pointer(uintptr(h))
+		cfg.log_ctx = h
 	}
 
 	if err := convertError(C.sqlpipe_replica_new(db.db, cfg, &r.ptr)); err != nil {
@@ -1396,27 +1424,27 @@ func NewPeer(db *Database, config PeerConfig) (*Peer, error) {
 	if config.ApproveOwnership != nil {
 		h := p.handles.add(config.ApproveOwnership)
 		cfg.approve_ownership = C.sqlpipe_approve_ownership_fn(C.cApproveOwnershipTrampoline)
-		cfg.approve_ownership_ctx = unsafe.Pointer(uintptr(h))
+		cfg.approve_ownership_ctx = h
 	}
 	if config.OnConflict != nil {
 		h := p.handles.add(config.OnConflict)
 		cfg.on_conflict = C.sqlpipe_conflict_fn(C.cConflictTrampoline)
-		cfg.conflict_ctx = unsafe.Pointer(uintptr(h))
+		cfg.conflict_ctx = h
 	}
 	if config.OnProgress != nil {
 		h := p.handles.add(config.OnProgress)
 		cfg.on_progress = C.sqlpipe_progress_fn(C.cProgressTrampoline)
-		cfg.progress_ctx = unsafe.Pointer(uintptr(h))
+		cfg.progress_ctx = h
 	}
 	if config.OnSchemaMismatch != nil {
 		h := p.handles.add(config.OnSchemaMismatch)
 		cfg.on_schema_mismatch = C.sqlpipe_schema_mismatch_fn(C.cSchemaMismatchTrampoline)
-		cfg.schema_mismatch_ctx = unsafe.Pointer(uintptr(h))
+		cfg.schema_mismatch_ctx = h
 	}
 	if config.OnLog != nil {
 		h := p.handles.add(config.OnLog)
 		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
-		cfg.log_ctx = unsafe.Pointer(uintptr(h))
+		cfg.log_ctx = h
 	}
 
 	if err := convertError(C.sqlpipe_peer_new(db.db, cfg, &p.ptr)); err != nil {
