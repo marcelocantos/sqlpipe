@@ -15,7 +15,7 @@ floors:            # per-dimension held-tier ratchet; below floor => DRIFT
   correctness: 1   # cv test + go test in CI; example stale; fuzz/TLA not in CI
   security: 2      # vendor + go.sum; GitHub secret scan is T3 with planned SAST
   quality: 1       # -Wall -Wextra -Wpedantic in cvfile; no format/lint CI gate
-  deps: 2          # vendor + go.sum + NOTICES; no Dependabot
+  deps: 2          # vendor + go.sum + NOTICE; no Dependabot
   release: 2       # MINOR v* tags + version macros; no release.yml (library)
   governance: 2    # Apache-2.0 + squash-only; no SECURITY.md
   build: 2         # cvfile + CI; Makefile is the bullseye hook only
@@ -300,12 +300,12 @@ items:
 
   - id: deps.notices
     dim: deps
-    desc: NOTICES attributes bundled third-party code
+    desc: NOTICE attributes bundled third-party code
     state: present
     cadence: per-release
     enforce: informational
     tier: 2
-    evidence: {file: {path: NOTICES, matches: 'Third-Party Notices'}}
+    evidence: {file: {path: NOTICE, matches: 'Third-Party Notices'}}
 
   - id: deps.dependabot
     dim: deps
@@ -478,7 +478,7 @@ items:
     cadence: per-release
     enforce: informational
     tier: 3
-    reason: No SBOM step or release workflow; supply list is vendor/ + NOTICES.
+    reason: No SBOM step or release workflow; supply list is vendor/ + NOTICE.
     evidence: {absent: {ci_step: {workflow: release.yml, name: SBOM}}}
 
   # ============================ DOCUMENTATION ============================
