@@ -4,9 +4,9 @@
 package sqlpipe
 
 const (
-	Version      = "0.32.0"
+	Version      = "0.33.0"
 	VersionMajor = 0
-	VersionMinor = 32
+	VersionMinor = 33
 	VersionPatch = 0
 )
 
