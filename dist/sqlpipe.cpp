@@ -1591,6 +1591,31 @@ struct Master::Impl {
         return cs;
     }
 
+    /// Rowids the session has recorded since it last restarted, per table:
+    /// every row written there that a flush would send.
+    std::map<std::string, std::set<std::int64_t>> session_rowids() {
+        std::map<std::string, std::set<std::int64_t>> out;
+        for (const auto& ev : detail::collect_events(extract_changeset())) {
+            for (std::size_t i = 0; i < ev.pk_flags.size(); ++i) {
+                if (!ev.pk_flags[i]) continue;
+                for (const auto* vals : {&ev.old_values, &ev.new_values}) {
+                    if (i >= vals->size()) continue;
+                    if (auto* id = std::get_if<std::int64_t>(&(*vals)[i])) {
+                        out[ev.table].insert(*id);
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    bool row_exists(const std::string& table, std::int64_t rowid) {
+        std::string sql = "SELECT 1 FROM \"" + table + "\" WHERE rowid = ?";
+        auto stmt = detail::prepare(db, sql.c_str());
+        sqlite3_bind_int64(stmt.get(), 1, rowid);
+        return sqlite3_step(stmt.get()) == SQLITE_ROW;
+    }
+
     std::vector<OutMessage> handle_hello(const HelloMsg& hello) {
         if (hello.protocol_version != kProtocolVersion) {
             return {tagged(Message{ErrorMsg{ErrorCode::ProtocolError,
@@ -1838,7 +1863,11 @@ struct Master::Impl {
             });
 
         if (need.ranges.empty()) {
-            // All buckets match. Skip row-hash exchange.
+            // All buckets match. Skip row-hash exchange. Everything the
+            // session recorded is already on the replica, so for a
+            // single-replica master the session restarts here: a later
+            // flush must not send those rows again.
+            if (config.exclusive_replica) recreate_session();
             hs_state = HSState::Live;
             SQLPIPE_LOG(config.on_log, LogLevel::Info, "all buckets match, entering live at seq={}", seq);
             return {tagged(Message{NeedBucketsMsg{}}),
@@ -1873,9 +1902,9 @@ struct Master::Impl {
             }
         }
 
-        // Compute diff per table and build patchset + deletes.
-        std::vector<Changeset> patchsets;
-        std::vector<TableDeletes> deletes;
+        // Compute diff per table, then build patchset + deletes.
+        std::map<std::string, std::set<std::int64_t>> table_upserts;
+        std::map<std::string, std::set<std::int64_t>> table_deletes;
 
         // Group pending_ranges by table.
         std::map<std::string, std::vector<std::pair<std::int64_t, std::int64_t>>>
@@ -1933,29 +1962,49 @@ struct Master::Impl {
                 }
             }
 
-            // Build INSERT patchset for insert + update rowids.
-            std::vector<std::int64_t> upsert_rowids;
-            upsert_rowids.reserve(insert_rowids.size() + update_rowids.size());
-            upsert_rowids.insert(upsert_rowids.end(),
-                                 insert_rowids.begin(), insert_rowids.end());
-            upsert_rowids.insert(upsert_rowids.end(),
-                                 update_rowids.begin(), update_rowids.end());
-
-            if (!upsert_rowids.empty()) {
-                report(DiffPhase::BuildingPatchset, table,
-                       static_cast<std::int64_t>(upsert_rowids.size()), 0);
-                auto ps = detail::build_insert_patchset(db, table, upsert_rowids);
-                if (!ps.empty()) {
-                    patchsets.push_back(std::move(ps));
-                }
-            }
-
-            if (!delete_rowids.empty()) {
-                std::sort(delete_rowids.begin(), delete_rowids.end());
-                deletes.push_back(TableDeletes{table, std::move(delete_rowids)});
-            }
+            table_upserts[table].insert(insert_rowids.begin(), insert_rowids.end());
+            table_upserts[table].insert(update_rowids.begin(), update_rowids.end());
+            table_deletes[table].insert(delete_rowids.begin(), delete_rowids.end());
 
             ++tables_done;
+        }
+
+        // A single-replica master restarts its session here, at the instant
+        // the diff is built, so a later flush sends only what is written
+        // after it. Every row the session recorded goes in this diff as it
+        // now stands. The bucket comparison ran a round trip ago; a row
+        // written since then in a bucket that matched is not in the ranges
+        // above, and without this it would be in neither the diff nor any
+        // later changeset.
+        if (config.exclusive_replica) {
+            for (const auto& [table, rowids] : session_rowids()) {
+                for (auto rid : rowids) {
+                    if (row_exists(table, rid)) {
+                        table_upserts[table].insert(rid);
+                    } else {
+                        table_deletes[table].insert(rid);
+                    }
+                }
+            }
+            recreate_session();
+        }
+
+        std::vector<Changeset> patchsets;
+        std::vector<TableDeletes> deletes;
+        for (const auto& [table, rowids] : table_upserts) {
+            if (rowids.empty()) continue;
+            std::vector<std::int64_t> upsert_rowids(rowids.begin(), rowids.end());
+            report(DiffPhase::BuildingPatchset, table,
+                   static_cast<std::int64_t>(upsert_rowids.size()), 0);
+            auto ps = detail::build_insert_patchset(db, table, upsert_rowids);
+            if (!ps.empty()) {
+                patchsets.push_back(std::move(ps));
+            }
+        }
+        for (const auto& [table, rowids] : table_deletes) {
+            if (rowids.empty()) continue;
+            deletes.push_back(TableDeletes{
+                table, std::vector<std::int64_t>(rowids.begin(), rowids.end())});
         }
 
         // Combine all per-table patchsets.
@@ -5532,6 +5581,8 @@ struct Peer::Impl {
         MasterConfig mc;
         mc.table_filter = my_tables;
         mc.seq_key = "master_seq";
+        // A peer link's Master serves exactly one replica, the remote peer.
+        mc.exclusive_replica = true;
         mc.on_progress = config.on_progress;
         mc.on_schema_mismatch = config.on_schema_mismatch;
         mc.on_log = config.on_log;
@@ -5772,6 +5823,10 @@ std::vector<PeerOutMessage> Peer::start() {
 std::vector<PeerOutMessage> Peer::flush() {
     if (!impl_->master) return {};
     if (impl_->state != State::Live && impl_->state != State::Diffing) return {};
+    // Until our Master has sent its handshake diff, the remote replica is
+    // not live and would reject a changeset. The session keeps the writes;
+    // the diff carries them and the session restarts there.
+    if (!impl_->master_handshake_done) return {};
 
     auto msgs = impl_->master->flush();
     std::vector<PeerOutMessage> result;

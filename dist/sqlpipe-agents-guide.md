@@ -71,6 +71,10 @@ master.schema_version();                     // schema fingerprint
 `MasterConfig`:
 - `table_filter` — `optional<set<string>>`. `nullopt` = all tables, empty = none.
 - `bucket_size` — rows per bucket for diff protocol (default 1024).
+- `exclusive_replica` — this Master serves exactly one replica (Peer sets
+  it). The flush session restarts when the handshake diff is built, and
+  rows it recorded ride in that diff, so a write committed mid-handshake
+  crosses once. Leave false for a Master that fans out to many replicas.
 
 ### Replica (receiving side)
 

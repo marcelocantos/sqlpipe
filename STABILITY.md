@@ -127,7 +127,7 @@ Snapshot as of v0.32.0. Items annotated with stability assessments.
 
 | Struct | Fields | Stability |
 |---|---|---|
-| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, on_flush, changeset_queue_size` | **Stable** |
+| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, on_flush, changeset_queue_size, exclusive_replica` | **Stable** (`exclusive_replica` added for single-replica masters; Peer sets it) |
 | `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, queue_while_predicting` | **Stable** (`queue_while_predicting` added for prediction hold) |
 | `PeerConfig` | `role, owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch, on_log` | **Stable** (owned_tables accepts glob patterns since v0.18.0) |
 | `RelayConfig` | `table_filter, on_conflict, on_schema_mismatch, on_log` | **Stable** |

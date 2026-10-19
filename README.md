@@ -327,6 +327,7 @@ struct MasterConfig {
     FlushCallback on_flush = nullptr;        // auto-flush on commit (vector<OutMessage>)
     std::size_t changeset_queue_size = 64;   // 0 = disable queue replay
     LogCallback on_log = nullptr;
+    bool exclusive_replica = false;          // one replica only (Peer sets it)
 };
 
 class Master {

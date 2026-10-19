@@ -720,6 +720,17 @@ struct MasterConfig {
     /// the queue instead of running a full diff sync.
     /// 0 = no queue (always diff sync on reconnect). Default: 64.
     std::size_t changeset_queue_size = 64;
+
+    /// This Master serves exactly one replica. Peer sets it on the Master
+    /// inside each peer link. When true, the session that collects changes
+    /// for flush() restarts at the instant the handshake diff is built, and
+    /// every row it had recorded is sent in that diff as the row now stands.
+    /// A write committed while the handshake is in progress then reaches
+    /// the replica exactly once: in the diff, never again as a changeset.
+    /// Leave it false for a Master that fans out to several replicas:
+    /// restarting the session for one replica's handshake would drop
+    /// unflushed changes the replicas already live still need.
+    bool exclusive_replica = false;
 };
 
 /// The sending side of the replication protocol.
