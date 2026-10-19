@@ -288,7 +288,11 @@ func TestLinkMasterReplicaLossyDatagrams(t *testing.T) {
 // sustained ~50% BestEffort loss after the first datagram.
 func TestLinkMasterReplicaDropEveryOtherDatagram(t *testing.T) {
 	mDB, rDB, master, replica := setupMasterReplica(t)
-	mTransport, rTransport := newLossyPair(0, 2) // drop every 2nd outbound dg
+	// Drop the first outbound datagram, then every 2nd. Without the first,
+	// a handshake whose opening converge probe gets through sees no loss
+	// at all, so the test would pass or fail on timing and never exercise
+	// recovery.
+	mTransport, rTransport := newLossyPair(1, 2)
 	mLink := transport.NewLink(mTransport)
 	rLink := transport.NewLink(rTransport)
 	rLink.ReConvergeInterval = 15 * time.Millisecond
