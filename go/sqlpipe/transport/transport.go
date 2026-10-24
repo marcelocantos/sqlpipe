@@ -66,6 +66,14 @@ type Link struct {
 	// native PeerConfig callbacks execute inside the native call and its lock.
 	OwnerLock sync.Locker
 
+	// OnPeerInitialized optionally runs once per RunPeer invocation, after the
+	// replica is initialized and before that step's messages are sent. It runs
+	// outside OwnerLock, so it may acquire that lock to Subscribe and query a
+	// local snapshot. That snapshot is not convergence evidence; subscriptions
+	// are reevaluated when the replica reaches Live, even without changes.
+	// Errors terminate the runner. The hook must not wait for link progress.
+	OnPeerInitialized func() error
+
 	// ReConvergeInterval controls how often the replica re-probes while
 	// not Live. Zero means DefaultReConvergeInterval.
 	ReConvergeInterval time.Duration
@@ -306,7 +314,9 @@ func (l *Link) RunReplica(ctx context.Context, r *sqlpipe.Replica, handler Repli
 type PeerHandler func(hr sqlpipe.PeerHandleResult) error
 
 // RunPeer runs a bidirectional peer replication protocol over the
-// transport. For client peers, it initiates the handshake. For server
+// transport. Pass a fresh or Reset peer; only Reset after the previous runner
+// has returned. Each new run invokes OnPeerInitialized again, allowing fresh
+// subscriptions after Reset. For client peers, it initiates the handshake. For server
 // peers, it waits for the client's hello.
 //
 // flushCh should emit whenever the peer has new local data to flush.
@@ -373,10 +383,16 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 		if err != nil {
 			return err
 		}
+		if l.OnPeerInitialized != nil {
+			if err := l.OnPeerInitialized(); err != nil {
+				return err
+			}
+		}
 		if err := send(messages); err != nil {
 			return err
 		}
 	}
+	initialized := isClient
 	// A buffered flush may precede the handshake. Keep it until Live instead
 	// of consuming a wake whose Flush would return no changes yet.
 	pending := false
@@ -418,12 +434,23 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 			}
 			lock.Lock()
 			result, err := p.HandleMessage(message)
+			state := p.State()
 			lock.Unlock()
 			if err != nil {
 				if event.bestEffort {
 					continue
 				}
 				return err
+			}
+			// An accepted server Hello creates the replica before Diffing/Live.
+			// A rejected Hello can return nil error with PeerError: never hook it.
+			if !initialized && (state == sqlpipe.PeerDiffing || state == sqlpipe.PeerLive) {
+				initialized = true
+				if l.OnPeerInitialized != nil {
+					if err := l.OnPeerInitialized(); err != nil {
+						return err
+					}
+				}
 			}
 			if err := send(result.Messages); err != nil {
 				return err

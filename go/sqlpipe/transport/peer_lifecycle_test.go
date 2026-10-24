@@ -67,7 +67,7 @@ func openFilePeer(t *testing.T, client bool) *filePeer {
 		t.Fatal(err)
 	}
 	f := &filePeer{db: db, peer: p}
-	t.Cleanup(func() { f.mu.Lock(); defer f.mu.Unlock(); _ = p.Close(); _ = db.Close() })
+	t.Cleanup(func() { f.mu.Lock(); defer f.mu.Unlock(); _ = f.peer.Close(); _ = db.Close() })
 	return f
 }
 func awaitPeer(t *testing.T, what string, condition func() bool) {
@@ -300,16 +300,26 @@ func (j *joinedTransport) RecvDatagram(ctx context.Context) ([]byte, error) {
 	}
 }
 func TestRunPeerJoinsReceiversOnErrorAndCancellation(t *testing.T) {
-	for _, mode := range []string{"cancel", "stream-error", "datagram-error"} {
+	for _, mode := range []string{"cancel", "stream-error", "datagram-error", "hook-error"} {
 		t.Run(mode, func(t *testing.T) {
-			f := openFilePeer(t, false)
+			f := openFilePeer(t, mode == "hook-error")
 			tr := &joinedTransport{fail: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{}), datagramFailure: mode == "datagram-error"}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			done := startPeer(t, ctx, f, tr, false, nil, nil)
+			link := transport.NewLink(tr)
+			link.OwnerLock = &f.mu
+			if mode == "hook-error" {
+				link.OnPeerInitialized = func() error {
+					f.mu.Lock()
+					defer f.mu.Unlock()
+					return errors.New("controlled hook error")
+				}
+			}
+			done := make(chan error, 1)
+			go func() { done <- link.RunPeer(ctx, f.peer, mode == "hook-error", nil, nil) }()
 			if mode == "cancel" {
 				cancel()
-			} else {
+			} else if mode != "hook-error" {
 				close(tr.fail)
 			}
 			select {
@@ -334,6 +344,9 @@ func TestRunPeerJoinsReceiversOnErrorAndCancellation(t *testing.T) {
 					if tr.datagramFailure {
 						want = "controlled datagram error"
 					}
+					if mode == "hook-error" {
+						want = "controlled hook error"
+					}
 					if err == nil || err.Error() != want {
 						t.Fatalf("result=%v want %s", err, want)
 					}
@@ -345,5 +358,153 @@ func TestRunPeerJoinsReceiversOnErrorAndCancellation(t *testing.T) {
 				t.Fatalf("joined %d receivers", tr.exits.Load())
 			}
 		})
+	}
+}
+
+// Both runs begin with identical replicas, so their initial subscription
+// notifications must come from entering Live, not a changed-row shortcut.
+func TestRunPeerSubscriptionBootstrapAndReconnect(t *testing.T) {
+	c, s := openFilePeer(t, true), openFilePeer(t, false)
+	for run := 0; run < 2; run++ {
+		func() {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			a, b := newOrderedPair(ctx)
+			var done []chan error
+			defer func() {
+				cancel()
+				for _, d := range done {
+					<-d
+				}
+			}()
+			var hooks [2]atomic.Int32
+			notified := []chan struct{}{make(chan struct{}, 4), make(chan struct{}, 4)}
+			flush := []chan struct{}{make(chan struct{}, 1), make(chan struct{}, 1)}
+			for i, side := range []struct {
+				f      *filePeer
+				tr     transport.Transport
+				client bool
+				table  string
+			}{
+				{c, a, true, "s_rows"}, {s, b, false, "c_rows"},
+			} {
+				link := transport.NewLink(side.tr)
+				link.OwnerLock = &side.f.mu
+				link.OnPeerInitialized = func() error {
+					side.f.mu.Lock()
+					defer side.f.mu.Unlock()
+					if side.f.peer.State() == sqlpipe.PeerLive {
+						return errors.New("bootstrap arrived after Live")
+					}
+					if _, err := side.f.peer.Subscribe("SELECT id FROM " + side.table); err != nil {
+						return err
+					}
+					if _, err := side.f.db.Query("SELECT id FROM " + side.table); err != nil {
+						return err
+					}
+					hooks[i].Add(1)
+					return nil
+				}
+				d := make(chan error, 1)
+				done = append(done, d)
+				go func() {
+					d <- link.RunPeer(ctx, side.f.peer, side.client, flush[i], func(hr sqlpipe.PeerHandleResult) error {
+						if len(hr.Subscriptions) > 0 {
+							select {
+							case notified[i] <- struct{}{}:
+							case <-ctx.Done():
+							}
+						}
+						return nil
+					})
+				}()
+			}
+			for i := range notified {
+				select {
+				case <-notified[i]:
+				case <-ctx.Done():
+					t.Fatal("empty handshake did not produce initial subscription", ctx.Err())
+				}
+				if hooks[i].Load() != 1 {
+					t.Fatalf("run %d side %d hooks=%d", run, i, hooks[i].Load())
+				}
+			}
+			for i, side := range []struct {
+				f     *filePeer
+				table string
+			}{{c, "c_rows"}, {s, "s_rows"}} {
+				side.f.mu.Lock()
+				err := side.f.db.Exec("INSERT INTO "+side.table+" VALUES (?, 'after-bootstrap')", run+1)
+				side.f.mu.Unlock()
+				if err != nil {
+					t.Fatal(err)
+				}
+				flush[i] <- struct{}{}
+			}
+			for i := range notified {
+				select {
+				case <-notified[i]:
+				case <-ctx.Done():
+					t.Fatal("bootstrapped subscription missed later write", ctx.Err())
+				}
+				if hooks[i].Load() != 1 {
+					t.Fatal("hook repeated after initialization")
+				}
+			}
+		}()
+		for _, f := range []*filePeer{c, s} {
+			f.mu.Lock()
+			f.peer.Reset()
+			f.mu.Unlock()
+		}
+	}
+}
+
+func TestRunPeerRejectedHandshakeDoesNotInitializeHook(t *testing.T) {
+	c, s := openFilePeer(t, true), openFilePeer(t, false)
+	// Claim the wrong table; the real server's ownership callback rejects it.
+	if err := c.peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	c.peer, err = sqlpipe.NewPeer(c.db, sqlpipe.PeerConfig{OwnedTables: map[string]bool{"s_rows": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	a, b := newOrderedPair(ctx)
+	link := transport.NewLink(b)
+	link.OwnerLock = &s.mu
+	var hooks atomic.Int32
+	link.OnPeerInitialized = func() error { hooks.Add(1); return nil }
+	done := make(chan error, 1)
+	go func() { done <- link.RunPeer(ctx, s.peer, false, nil, nil) }()
+	defer func() { cancel(); <-done }()
+	messages, err := c.peer.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range messages {
+		if err := a.Send(ctx, sqlpipe.SerializePeer(msg.Msg)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := a.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sqlpipe.DeserializePeer(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := msg.Payload.(sqlpipe.ErrorMsg); !ok {
+		t.Fatalf("expected rejection, got %T", msg.Payload)
+	}
+	s.mu.Lock()
+	state := s.peer.State()
+	s.mu.Unlock()
+	if state != sqlpipe.PeerError || hooks.Load() != 0 {
+		t.Fatalf("state=%v hooks=%d", state, hooks.Load())
 	}
 }
