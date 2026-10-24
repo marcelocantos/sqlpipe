@@ -257,12 +257,23 @@ type joinedTransport struct {
 	fail               chan struct{}
 	cancelled, release chan struct{}
 	exits              atomic.Int32
+	datagramFailure    bool
+	datagrams          atomic.Int32
 }
 
 func (*joinedTransport) Send(context.Context, []byte) error { return nil }
 func (*joinedTransport) SendDatagram([]byte) error          { return nil }
+func (j *joinedTransport) awaitCancellation(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	close(j.cancelled)
+	<-j.release
+	return nil, ctx.Err()
+}
 func (j *joinedTransport) Recv(ctx context.Context) ([]byte, error) {
 	defer j.exits.Add(1)
+	if j.datagramFailure {
+		return j.awaitCancellation(ctx)
+	}
 	select {
 	case <-j.fail:
 		return nil, errors.New("controlled stream error")
@@ -271,24 +282,35 @@ func (j *joinedTransport) Recv(ctx context.Context) ([]byte, error) {
 	}
 }
 func (j *joinedTransport) RecvDatagram(ctx context.Context) ([]byte, error) {
+	if !j.datagramFailure {
+		defer j.exits.Add(1)
+		return j.awaitCancellation(ctx)
+	}
+	// A malformed BestEffort payload is dropped, not confused with a failed
+	// receive channel. The following I/O error must be the terminal result.
+	if j.datagrams.Add(1) == 1 {
+		return []byte{0}, nil
+	}
 	defer j.exits.Add(1)
-	<-ctx.Done()
-	close(j.cancelled)
-	<-j.release
-	return nil, ctx.Err()
+	select {
+	case <-j.fail:
+		return nil, errors.New("controlled datagram error")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 func TestRunPeerJoinsReceiversOnErrorAndCancellation(t *testing.T) {
-	for _, failure := range []bool{false, true} {
-		t.Run(map[bool]string{false: "cancel", true: "stream-error"}[failure], func(t *testing.T) {
+	for _, mode := range []string{"cancel", "stream-error", "datagram-error"} {
+		t.Run(mode, func(t *testing.T) {
 			f := openFilePeer(t, false)
-			tr := &joinedTransport{fail: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{})}
+			tr := &joinedTransport{fail: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{}), datagramFailure: mode == "datagram-error"}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			done := startPeer(t, ctx, f, tr, false, nil, nil)
-			if failure {
-				close(tr.fail)
-			} else {
+			if mode == "cancel" {
 				cancel()
+			} else {
+				close(tr.fail)
 			}
 			select {
 			case <-tr.cancelled:
@@ -303,11 +325,18 @@ func TestRunPeerJoinsReceiversOnErrorAndCancellation(t *testing.T) {
 			close(tr.release)
 			select {
 			case err := <-done:
-				if failure && (err == nil || err.Error() != "controlled stream error") {
-					t.Fatal(err)
-				}
-				if !failure && !errors.Is(err, context.Canceled) {
-					t.Fatal(err)
+				if mode == "cancel" {
+					if !errors.Is(err, context.Canceled) {
+						t.Fatal(err)
+					}
+				} else {
+					want := "controlled stream error"
+					if tr.datagramFailure {
+						want = "controlled datagram error"
+					}
+					if err == nil || err.Error() != want {
+						t.Fatalf("result=%v want %s", err, want)
+					}
 				}
 			case <-time.After(10 * time.Second):
 				t.Fatal("RunPeer did not return")

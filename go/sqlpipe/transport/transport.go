@@ -311,7 +311,9 @@ type PeerHandler func(hr sqlpipe.PeerHandleResult) error
 //
 // flushCh should emit whenever the peer has new local data to flush.
 // handler is called for each PeerHandleResult with changes or subscriptions.
-// Handlers may acquire OwnerLock but must not wait for later link progress.
+// Receive-channel errors terminate the link; malformed BestEffort payloads
+// are dropped. Handlers may acquire OwnerLock but must not wait for later
+// link progress.
 // Cancel ctx to stop the link. All receivers are joined before return, so
 // callers can then close the peer/database (under their owner lock).
 func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flushCh <-chan struct{}, handler PeerHandler) error {
@@ -340,9 +342,6 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 				data, err = l.t.RecvDatagram(ctx)
 			} else {
 				data, err = l.t.Recv(ctx)
-			}
-			if bestEffort && err != nil && ctx.Err() == nil {
-				continue
 			}
 			select {
 			case incoming <- received{data, bestEffort, err}:
