@@ -4328,7 +4328,8 @@ struct QueryWatch::Impl {
         std::uint64_t h = detail::kFnv64Offset;
         sqlite3_reset(sub.stmt.get());
         int ncols = static_cast<int>(sub.columns.size());
-        while (sqlite3_step(sub.stmt.get()) == SQLITE_ROW) {
+        int rc;
+        while ((rc = sqlite3_step(sub.stmt.get())) == SQLITE_ROW) {
             detail::fnv64_byte(h, 0xFF);  // row separator
             std::vector<Value> row;
             row.reserve(static_cast<std::size_t>(ncols));
@@ -4339,6 +4340,8 @@ struct QueryWatch::Impl {
             }
             result.rows.push_back(std::move(row));
         }
+        if (rc != SQLITE_DONE)
+            throw Error(ErrorCode::SqliteError, sqlite3_errmsg(db));
         return {std::move(result), h};
     }
 
@@ -4366,9 +4369,10 @@ struct QueryWatch::Impl {
         // Also include any newly registered subscriptions that haven't
         // been evaluated yet (their initial result delivery).
         ids.insert(pending_new.begin(), pending_new.end());
-        pending_new.clear();
+
 
         std::vector<QueryResult> results;
+        std::vector<std::pair<SubscriptionId, std::uint64_t>> hashes;
         for (auto id : ids) {
             auto it = subscriptions.find(id);
             if (it == subscriptions.end()) continue;
@@ -4376,10 +4380,14 @@ struct QueryWatch::Impl {
 
             auto [result, hash] = evaluate_query(sub);
             if (hash != sub.result_hash) {
-                sub.result_hash = hash;
+                hashes.emplace_back(id, hash);
                 results.push_back(std::move(result));
             }
         }
+        // Publish hashes only after the whole batch succeeds. A runtime SQL
+        // error must leave every subscription eligible for the next retry.
+        for (const auto& [id, hash] : hashes) subscriptions.at(id).result_hash = hash;
+        pending_new.clear();
         return results;
     }
 };

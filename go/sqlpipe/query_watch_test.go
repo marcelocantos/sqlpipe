@@ -206,3 +206,57 @@ func TestQueryWatchScalarSubqueryAndTransactionBoundary(t *testing.T) {
 	}
 	exec("ROLLBACK")
 }
+
+func TestQueryWatchRuntimeErrorsPreserveRetry(t *testing.T) {
+	db, err := OpenDatabase(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exec := func(sql string) {
+		t.Helper()
+		if err := db.Exec(sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`CREATE TABLE items(id INTEGER PRIMARY KEY,value TEXT); INSERT INTO items VALUES(1,'{')`)
+	w, err := NewQueryWatch(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	query := `SELECT json_extract(value,'$.x') FROM items`
+	if _, err := w.Subscribe(query); err == nil {
+		t.Fatal("malformed initial JSON reported success")
+	}
+	exec(`UPDATE items SET value='{"x":1}'`)
+	first, err := w.Subscribe(`SELECT value FROM items`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken, err := w.Subscribe(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Notify(); err != nil {
+		t.Fatal(err)
+	}
+	exec(`UPDATE items SET value='{'`)
+	if _, err := w.Notify(); err == nil {
+		t.Fatal("malformed live JSON reported success")
+	}
+	// Removing the broken query makes the same captured commit deliverable;
+	// an earlier result in the failed batch must not have advanced its hash.
+	w.Unsubscribe(broken.ID)
+	results, err := w.Notify()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ID != first.ID || results[0].Rows[0][0] != "{" {
+		t.Fatalf("retry lost successful query result: %+v", results)
+	}
+	exec(`UPDATE items SET value='{"x":2}'`)
+	if _, err := w.Subscribe(query); err != nil {
+		t.Fatal(err)
+	}
+}
