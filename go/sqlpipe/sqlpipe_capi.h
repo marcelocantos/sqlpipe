@@ -23,6 +23,7 @@ typedef struct sqlite3 sqlite3;
 typedef struct sqlpipe_master  sqlpipe_master;
 typedef struct sqlpipe_replica sqlpipe_replica;
 typedef struct sqlpipe_peer    sqlpipe_peer;
+typedef struct sqlpipe_query_watch sqlpipe_query_watch;
 
 // ── Byte buffer ─────────────────────────────────────────────────
 
@@ -216,6 +217,15 @@ void sqlpipe_peer_owned_tables(
 void sqlpipe_peer_remote_tables(
     sqlpipe_peer* p, char*** out_tables, size_t* out_count);
 void sqlpipe_free_string_array(char** arr, size_t count);
+
+// A database-lifetime native query watch. Tracks net committed changes using
+// SQLite sessions; notify inside a transaction leaves changes pending.
+sqlpipe_error sqlpipe_query_watch_new(sqlite3* db, sqlpipe_query_watch** out);
+void sqlpipe_query_watch_free(sqlpipe_query_watch* watch);
+sqlpipe_error sqlpipe_query_watch_subscribe(sqlpipe_query_watch* watch, const char* sql, sqlpipe_buf* out);
+void sqlpipe_query_watch_unsubscribe(sqlpipe_query_watch* watch, uint64_t id);
+// Encoded [u32 count][QueryResult...]. Only changed results are returned.
+sqlpipe_error sqlpipe_query_watch_notify(sqlpipe_query_watch* watch, sqlpipe_buf* out);
 
 // ── Database utilities ──────────────────────────────────────────
 

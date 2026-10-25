@@ -74,6 +74,11 @@ type Link struct {
 	// Errors terminate the runner. The hook must not wait for link progress.
 	OnPeerInitialized func() error
 
+	// OnPeerUpdate runs under OwnerLock after each successful received message.
+	// Database watches may notify when state is Live, and defer otherwise.
+	// Errors terminate the link even for best-effort messages.
+	OnPeerUpdate func(sqlpipe.PeerState) error
+
 	// ReConvergeInterval controls how often the replica re-probes while
 	// not Live. Zero means DefaultReConvergeInterval.
 	ReConvergeInterval time.Duration
@@ -435,7 +440,15 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 			lock.Lock()
 			result, err := p.HandleMessage(message)
 			state := p.State()
+			var updateErr error
+			if err == nil && l.OnPeerUpdate != nil {
+				updateErr = l.OnPeerUpdate(state)
+			}
 			lock.Unlock()
+			// An application/database failure is never a droppable datagram.
+			if updateErr != nil {
+				return updateErr
+			}
 			if err != nil {
 				if event.bestEffort {
 					continue

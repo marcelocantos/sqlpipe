@@ -28,6 +28,28 @@ struct sqlpipe_peer {
         : impl(db, std::move(cfg)) {}
 };
 
+// One native dependency/hash engine, independent of replication connections.
+struct sqlpipe_query_watch {
+    sqlite3* db;
+    sqlpipe::QueryWatch watch;
+    sqlite3_session* session = nullptr;
+
+    explicit sqlpipe_query_watch(sqlite3* handle) : db(handle), watch(handle) { reset(); }
+    ~sqlpipe_query_watch() { if (session) sqlite3session_delete(session); }
+
+    void reset() {
+        sqlite3_session* next = nullptr;
+        int rc = sqlite3session_create(db, "main", &next);
+        if (rc == SQLITE_OK) rc = sqlite3session_attach(next, nullptr);
+        if (rc != SQLITE_OK) {
+            if (next) sqlite3session_delete(next);
+            throw sqlpipe::Error(sqlpipe::ErrorCode::SqliteError, sqlite3_errstr(rc));
+        }
+        if (session) sqlite3session_delete(session);
+        session = next;
+    }
+};
+
 // ── Encoding helpers ────────────────────────────────────────────
 
 namespace {
@@ -648,6 +670,76 @@ void sqlpipe_peer_owned_tables(
 void sqlpipe_peer_remote_tables(
     sqlpipe_peer* p, char*** out_tables, size_t* out_count) {
     set_to_string_array(p->impl.remote_tables(), out_tables, out_count);
+}
+
+sqlpipe_error sqlpipe_query_watch_new(sqlite3* db, sqlpipe_query_watch** out) {
+    try { *out = new sqlpipe_query_watch(db); return ok(); }
+    catch (const sqlpipe::Error& e) { return make_error(e); }
+    catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+void sqlpipe_query_watch_free(sqlpipe_query_watch* w) { delete w; }
+sqlpipe_error sqlpipe_query_watch_subscribe(sqlpipe_query_watch* w, const char* sql, sqlpipe_buf* out) {
+    try {
+        if (!sqlite3_get_autocommit(w->db))
+            throw sqlpipe::Error(sqlpipe::ErrorCode::SqliteError, "subscribe requires a committed database");
+        auto id = w->watch.subscribe(sql);
+        // Evaluate only the new subscription, without draining changes or
+        // notifying existing subscriptions during incomplete replication.
+        try {
+            auto results = w->watch.notify({});
+            for (const auto& result : results) {
+                if (result.id == id) {
+                    Buf b;
+                    encode_query_result(b, result);
+                    *out = to_buf(std::move(b));
+                    return ok();
+                }
+            }
+            throw sqlpipe::Error(sqlpipe::ErrorCode::SqliteError, "missing initial query result");
+        } catch (...) { w->watch.unsubscribe(id); throw; }
+    }
+    catch (const sqlpipe::Error& e) { return make_error(e); }
+    catch (const std::exception& e) { return make_error(1, e.what()); }
+}
+void sqlpipe_query_watch_unsubscribe(sqlpipe_query_watch* w, uint64_t id) { w->watch.unsubscribe(id); }
+sqlpipe_error sqlpipe_query_watch_notify(sqlpipe_query_watch* w, sqlpipe_buf* out) {
+    try {
+        // A partial transaction is never a published observation. Session
+        // changesets compare the original and current rows, so rollback,
+        // savepoint rollback and same-value updates produce no dirty rows.
+        if (!sqlite3_get_autocommit(w->db)) { *out = {nullptr, 0}; return ok(); }
+        int size = 0;
+        void* raw = nullptr;
+        int rc = sqlite3session_changeset(w->session, &size, &raw);
+        if (rc != SQLITE_OK) throw sqlpipe::Error(sqlpipe::ErrorCode::SqliteError, sqlite3_errstr(rc));
+        std::unique_ptr<void, decltype(&sqlite3_free)> data(raw, sqlite3_free);
+        sqlite3_changeset_iter* iter = nullptr;
+        rc = sqlite3changeset_start(&iter, size, raw);
+        if (rc != SQLITE_OK) throw sqlpipe::Error(sqlpipe::ErrorCode::SqliteError, sqlite3_errstr(rc));
+        std::set<std::string> tables;
+        while ((rc = sqlite3changeset_next(iter)) == SQLITE_ROW) {
+            const char* table = nullptr;
+            int columns, operation, indirect;
+            int op_rc = sqlite3changeset_op(iter, &table, &columns, &operation, &indirect);
+            if (op_rc != SQLITE_OK) { rc = op_rc; break; }
+            tables.insert(table);
+        }
+        int finish_rc = sqlite3changeset_finalize(iter);
+        if (rc != SQLITE_DONE || finish_rc != SQLITE_OK)
+            throw sqlpipe::Error(sqlpipe::ErrorCode::SqliteError, sqlite3_errstr(rc != SQLITE_DONE ? rc : finish_rc));
+        // Table-level invalidation is conservative for arbitrary SQL, including
+        // scalar subqueries whose changed columns are not represented by the
+        // optional native predicate optimizer. Native result hashes still
+        // suppress unchanged projections.
+        auto results = w->watch.notify(tables);
+        w->reset();
+        Buf b;
+        put_u32(b, static_cast<uint32_t>(results.size()));
+        for (const auto& result : results) encode_query_result(b, result);
+        *out = to_buf(std::move(b));
+        return ok();
+    } catch (const sqlpipe::Error& e) { return make_error(e); }
+      catch (const std::exception& e) { return make_error(1, e.what()); }
 }
 
 // ── Database utilities ──────────────────────────────────────────

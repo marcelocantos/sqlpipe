@@ -4294,9 +4294,11 @@ struct QueryWatch::Impl {
             // After optimization, predicates are pushed to leaf Filters.
             // Collect them all for changeset checking.
             detail::collect_predicates(ra_out.get(), preds_out);
-        } else {
-            // RA transform failed (non-SELECT or parse error).
-            // Fall back to authorizer-based table discovery.
+        }
+        {
+            // RA can represent the outer SELECT while omitting dependencies
+            // inside scalar subqueries. SQLite's authorizer sees every read;
+            // union those tables even when RA analysis succeeded.
             sqlite3_set_authorizer(db, [](void* ctx, int action,
                     const char* a1, const char*, const char*, const char*) -> int {
                 if (action == SQLITE_READ && a1) {

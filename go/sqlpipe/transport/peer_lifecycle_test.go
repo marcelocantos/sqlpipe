@@ -508,3 +508,32 @@ func TestRunPeerRejectedHandshakeDoesNotInitializeHook(t *testing.T) {
 		t.Fatalf("state=%v hooks=%d", state, hooks.Load())
 	}
 }
+
+func TestRunPeerUpdateHookErrorIsTerminal(t *testing.T) {
+	c, s := openFilePeer(t, true), openFilePeer(t, false)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	a, b := newOrderedPair(ctx)
+	link := transport.NewLink(b)
+	link.OwnerLock = &s.mu
+	want := errors.New("native watch notification failed")
+	link.OnPeerUpdate = func(state sqlpipe.PeerState) error {
+		if s.mu.TryLock() {
+			s.mu.Unlock()
+			t.Error("update hook ran without owner lock")
+		}
+		return want
+	}
+	done := make(chan error, 1)
+	go func() { done <- link.RunPeer(ctx, s.peer, false, nil, nil) }()
+	clientDone := startPeer(t, ctx, c, a, true, nil, nil)
+	defer func() { cancel(); <-clientDone }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, want) {
+			t.Fatalf("hook error=%v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("hook failure did not end link")
+	}
+}
