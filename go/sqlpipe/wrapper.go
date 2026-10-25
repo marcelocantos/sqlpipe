@@ -1353,7 +1353,11 @@ func (r *Replica) HandleMessages(msgs []Message) (HandleResult, error) {
 // sync completes. After Live, the subscription is evaluated on the next
 // HandleMessage call.
 func (r *Replica) Subscribe(sql string) (SubscriptionID, error) {
-	csql := C.CString(sql)
+	tsql, err := transpile(sql)
+	if err != nil {
+		return 0, err
+	}
+	csql := C.CString(tsql)
 	defer C.free(unsafe.Pointer(csql))
 	var id C.uint64_t
 	if err := convertError(C.sqlpipe_replica_subscribe(r.ptr, csql, &id)); err != nil {
@@ -1475,7 +1479,11 @@ func (p *Peer) Flush() ([]PeerOutMessage, error) {
 // Subscribe registers a query on the peer's replica side. Returns the
 // subscription ID. Results arrive via PeerHandleResult.Subscriptions.
 func (p *Peer) Subscribe(sql string) (SubscriptionID, error) {
-	csql := C.CString(sql)
+	tsql, err := transpile(sql)
+	if err != nil {
+		return 0, err
+	}
+	csql := C.CString(tsql)
 	defer C.free(unsafe.Pointer(csql))
 	var id C.uint64_t
 	if err := convertError(C.sqlpipe_peer_subscribe(p.ptr, csql, &id)); err != nil {

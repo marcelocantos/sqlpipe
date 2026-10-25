@@ -276,82 +276,95 @@ func TestLiveStreamingEndToEnd(t *testing.T) {
 }
 
 func TestSubscriptions(t *testing.T) {
-	mDB := openMemory(t)
-	rDB := openMemory(t)
+	for _, sqldeep := range []bool{false, true} {
+		query := "SELECT id, val FROM t1 ORDER BY id"
+		if sqldeep {
+			query = "SELECT {id, val} FROM t1 ORDER BY id"
+		}
+		t.Run(query, func(t *testing.T) {
+			mDB := openMemory(t)
+			rDB := openMemory(t)
 
-	if err := mDB.Exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)"); err != nil {
-		t.Fatal(err)
-	}
-	if err := rDB.Exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)"); err != nil {
-		t.Fatal(err)
-	}
+			if err := mDB.Exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)"); err != nil {
+				t.Fatal(err)
+			}
+			if err := rDB.Exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)"); err != nil {
+				t.Fatal(err)
+			}
 
-	m, err := NewMaster(mDB, MasterConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Close()
+			m, err := NewMaster(mDB, MasterConfig{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
 
-	r, err := NewReplica(rDB, ReplicaConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
+			r, err := NewReplica(rDB, ReplicaConfig{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
 
-	// Subscribe before handshake — no evaluation yet.
-	subID, err := r.Subscribe("SELECT * FROM t1 ORDER BY id")
-	if err != nil {
-		t.Fatal(err)
-	}
+			// Subscribe before handshake — no evaluation yet.
+			subID, err := r.Subscribe(query)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	if err := SyncHandshake(m, r); err != nil {
-		t.Fatal(err)
-	}
+			if err := SyncHandshake(m, r); err != nil {
+				t.Fatal(err)
+			}
 
-	// Insert and flush.
-	if err := mDB.Exec("INSERT INTO t1 VALUES (1, 'a')"); err != nil {
-		t.Fatal(err)
-	}
-	msgs, err := m.Flush()
-	if err != nil {
-		t.Fatal(err)
-	}
-	hr, err := r.HandleMessage(msgs[0].Msg)
-	if err != nil {
-		t.Fatal(err)
-	}
+			// Insert and flush.
+			if err := mDB.Exec("INSERT INTO t1 VALUES (1, 'a')"); err != nil {
+				t.Fatal(err)
+			}
+			msgs, err := m.Flush()
+			if err != nil {
+				t.Fatal(err)
+			}
+			hr, err := r.HandleMessage(msgs[0].Msg)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	// Subscription should fire.
-	if len(hr.Subscriptions) != 1 {
-		t.Fatalf("expected 1 subscription update, got %d", len(hr.Subscriptions))
-	}
-	sub := hr.Subscriptions[0]
-	if sub.ID != subID {
-		t.Errorf("subscription id = %d, want %d", sub.ID, subID)
-	}
-	if len(sub.Rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(sub.Rows))
-	}
+			// Subscription should fire.
+			if len(hr.Subscriptions) != 1 {
+				t.Fatalf("expected 1 subscription update, got %d", len(hr.Subscriptions))
+			}
+			sub := hr.Subscriptions[0]
+			if sub.ID != subID {
+				t.Errorf("subscription id = %d, want %d", sub.ID, subID)
+			}
+			if len(sub.Rows) != 1 {
+				t.Fatalf("expected 1 row, got %d", len(sub.Rows))
+			}
 
-	// Unsubscribe.
-	if err := r.Unsubscribe(subID); err != nil {
-		t.Fatal(err)
-	}
+			if sqldeep && (len(sub.Rows[0]) != 1 || string(sub.Rows[0][0].([]byte)) != `{"id":1,"val":"a"}`) {
+				t.Fatalf("sqldeep result = %v", sub.Rows)
+			}
 
-	// Another insert should not trigger subscription.
-	if err := mDB.Exec("INSERT INTO t1 VALUES (2, 'b')"); err != nil {
-		t.Fatal(err)
-	}
-	msgs, err = m.Flush()
-	if err != nil {
-		t.Fatal(err)
-	}
-	hr, err = r.HandleMessage(msgs[0].Msg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(hr.Subscriptions) != 0 {
-		t.Errorf("expected 0 subscription updates after unsubscribe, got %d", len(hr.Subscriptions))
+			// Unsubscribe.
+			if err := r.Unsubscribe(subID); err != nil {
+				t.Fatal(err)
+			}
+
+			// Another insert should not trigger subscription.
+			if err := mDB.Exec("INSERT INTO t1 VALUES (2, 'b')"); err != nil {
+				t.Fatal(err)
+			}
+			msgs, err = m.Flush()
+			if err != nil {
+				t.Fatal(err)
+			}
+			hr, err = r.HandleMessage(msgs[0].Msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(hr.Subscriptions) != 0 {
+				t.Errorf("expected 0 subscription updates after unsubscribe, got %d", len(hr.Subscriptions))
+			}
+
+		})
 	}
 }
 
@@ -597,93 +610,106 @@ func TestMasterExecWithFlushCallback(t *testing.T) {
 }
 
 func TestPeerSubscribe(t *testing.T) {
-	sDB := openMemory(t)
-	cDB := openMemory(t)
-
-	for _, db := range []*Database{sDB, cDB} {
-		if err := db.Exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)"); err != nil {
-			t.Fatal(err)
+	for _, sqldeep := range []bool{false, true} {
+		query := "SELECT id, val FROM t1 ORDER BY id"
+		if sqldeep {
+			query = "SELECT {id, val} FROM t1 ORDER BY id"
 		}
-		if err := db.Exec("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)"); err != nil {
-			t.Fatal(err)
-		}
-	}
+		t.Run(query, func(t *testing.T) {
+			sDB := openMemory(t)
+			cDB := openMemory(t)
 
-	server, err := NewPeer(sDB, PeerConfig{
-		ApproveOwnership: func(tables map[string]bool) bool { return true },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer server.Close()
+			for _, db := range []*Database{sDB, cDB} {
+				if err := db.Exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)"); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Exec("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)"); err != nil {
+					t.Fatal(err)
+				}
+			}
 
-	client, err := NewPeer(cDB, PeerConfig{
-		OwnedTables: map[string]bool{"t2": true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
+			server, err := NewPeer(sDB, PeerConfig{
+				ApproveOwnership: func(tables map[string]bool) bool { return true },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer server.Close()
 
-	if err := SyncPeerHandshake(client, server); err != nil {
-		t.Fatal(err)
-	}
+			client, err := NewPeer(cDB, PeerConfig{
+				OwnedTables: map[string]bool{"t2": true},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
 
-	// Subscribe on client after handshake (t1 is owned by server).
-	subID, err := client.Subscribe("SELECT * FROM t1 ORDER BY id")
-	if err != nil {
-		t.Fatal(err)
-	}
+			if err := SyncPeerHandshake(client, server); err != nil {
+				t.Fatal(err)
+			}
 
-	// Insert on server's t1, flush, apply on client.
-	if err := sDB.Exec("INSERT INTO t1 VALUES (1, 'x')"); err != nil {
-		t.Fatal(err)
-	}
-	sMsgs, err := server.Flush()
-	if err != nil {
-		t.Fatal(err)
-	}
+			// Subscribe on client after handshake (t1 is owned by server).
+			subID, err := client.Subscribe(query)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	var gotSubs []QueryResult
-	for _, om := range sMsgs {
-		hr, err := client.HandleMessage(om.Msg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		gotSubs = append(gotSubs, hr.Subscriptions...)
-	}
+			// Insert on server's t1, flush, apply on client.
+			if err := sDB.Exec("INSERT INTO t1 VALUES (1, 'x')"); err != nil {
+				t.Fatal(err)
+			}
+			sMsgs, err := server.Flush()
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	if len(gotSubs) != 1 {
-		t.Fatalf("expected 1 subscription update, got %d", len(gotSubs))
-	}
-	if gotSubs[0].ID != subID {
-		t.Errorf("subscription id = %d, want %d", gotSubs[0].ID, subID)
-	}
-	if len(gotSubs[0].Rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(gotSubs[0].Rows))
-	}
+			var gotSubs []QueryResult
+			for _, om := range sMsgs {
+				hr, err := client.HandleMessage(om.Msg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				gotSubs = append(gotSubs, hr.Subscriptions...)
+			}
 
-	// Unsubscribe.
-	if err := client.Unsubscribe(subID); err != nil {
-		t.Fatal(err)
-	}
+			if len(gotSubs) != 1 {
+				t.Fatalf("expected 1 subscription update, got %d", len(gotSubs))
+			}
+			if gotSubs[0].ID != subID {
+				t.Errorf("subscription id = %d, want %d", gotSubs[0].ID, subID)
+			}
+			if len(gotSubs[0].Rows) != 1 {
+				t.Fatalf("expected 1 row, got %d", len(gotSubs[0].Rows))
+			}
 
-	// Another insert on server's t1 should not fire subscription.
-	if err := sDB.Exec("INSERT INTO t1 VALUES (2, 'y')"); err != nil {
-		t.Fatal(err)
-	}
-	sMsgs, err = server.Flush()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, om := range sMsgs {
-		hr, err := client.HandleMessage(om.Msg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(hr.Subscriptions) != 0 {
-			t.Errorf("expected 0 subscription updates after unsubscribe, got %d", len(hr.Subscriptions))
-		}
+			if sqldeep && (len(gotSubs[0].Rows[0]) != 1 || string(gotSubs[0].Rows[0][0].([]byte)) != `{"id":1,"val":"x"}`) {
+				t.Fatalf("sqldeep result = %v", gotSubs[0].Rows)
+			}
+
+			// Unsubscribe.
+			if err := client.Unsubscribe(subID); err != nil {
+				t.Fatal(err)
+			}
+
+			// Another insert on server's t1 should not fire subscription.
+			if err := sDB.Exec("INSERT INTO t1 VALUES (2, 'y')"); err != nil {
+				t.Fatal(err)
+			}
+			sMsgs, err = server.Flush()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, om := range sMsgs {
+				hr, err := client.HandleMessage(om.Msg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(hr.Subscriptions) != 0 {
+					t.Errorf("expected 0 subscription updates after unsubscribe, got %d", len(hr.Subscriptions))
+				}
+			}
+
+		})
 	}
 }
 
