@@ -20,6 +20,7 @@ let package = Package(
             exclude: [
                 "sqldeep.cpp",
                 "sqlift.cpp",
+                "sqlpipe_pg.cpp",
                 "deepparser/lp_lempar.c",
             ],
             publicHeadersPath: "include",

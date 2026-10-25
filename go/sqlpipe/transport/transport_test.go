@@ -285,10 +285,12 @@ func TestLinkMasterReplicaLossyDatagrams(t *testing.T) {
 }
 
 // TestLinkMasterReplicaDropEveryOtherDatagram stresses re-converge under
-// sustained ~50% BestEffort loss after the first datagram.
+// BestEffort loss. An empty handshake is one datagram per side, so
+// dropEveryNth=2 alone never drops it. Drop the first probe as well, then
+// every later even probe, and still reach the inserted row.
 func TestLinkMasterReplicaDropEveryOtherDatagram(t *testing.T) {
 	mDB, rDB, master, replica := setupMasterReplica(t)
-	mTransport, rTransport := newLossyPair(0, 2) // drop every 2nd outbound dg
+	mTransport, rTransport := newLossyPair(1, 2)
 	mLink := transport.NewLink(mTransport)
 	rLink := transport.NewLink(rTransport)
 	rLink.ReConvergeInterval = 15 * time.Millisecond

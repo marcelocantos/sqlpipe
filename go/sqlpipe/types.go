@@ -172,7 +172,8 @@ type FlushCallback func(messages []OutMessage)
 
 // Protocol constants.
 const (
-	ProtocolVersion = 7
+	ProtocolVersion         = 7
+	PostgresProtocolVersion = 8
 	DefaultBucketSize int64  = 1024
 	MaxMessageSize    uint32 = 64 * 1024 * 1024
 	MaxArrayCount     uint32 = 10_000_000

@@ -17,6 +17,7 @@
 #define SQLDEEP_VERSION_PATCH 0
 
 typedef struct sqlite3 sqlite3;
+typedef struct pg_conn PGconn;
 
 #ifdef __cplusplus
 extern "C" {
@@ -117,8 +118,26 @@ typedef struct sqlift_apply_options {
 
 typedef struct sqlift_db sqlift_db;
 
+enum sqlift_engine {
+    SQLIFT_ENGINE_SQLITE   = 0,
+    SQLIFT_ENGINE_POSTGRES = 1,
+};
+typedef struct sqlift_exec {
+    void* ctx;
+    int (*exec)(void* ctx, const char* sql, char** err_msg);
+    int (*query)(void* ctx, const char* sql,
+                 void (*row)(void* row_ctx, int ncols, const char* const* cols),
+                 void* row_ctx, char** err_msg);
+} sqlift_exec;
 sqlift_db* sqlift_db_open(const char* path, int flags,
                           int* err_type, char** err_msg);
+typedef struct sqlite3 sqlite3;
+sqlift_db* sqlift_db_wrap_sqlite(sqlite3* handle,
+                                 int* err_type, char** err_msg);
+sqlift_db* sqlift_db_wrap_exec(int engine, sqlift_exec exec,
+                               int* err_type, char** err_msg);
+char* sqlift_parse_on(sqlift_db* db, const char* ddl,
+                      int* err_type, char** err_msg);
 void sqlift_db_close(sqlift_db* db);
 int sqlift_db_exec(sqlift_db* db, const char* sql, char** err_msg);
 char* sqlift_parse(const char* ddl, int* err_type, char** err_msg);
@@ -192,7 +211,13 @@ using SchemaVersion = std::vector<std::uint8_t>;
 
 /// Algorithm ids for the leading byte of a SchemaVersion fingerprint.
 enum class SchemaFingerprintAlgo : std::uint8_t {
-    SqliftSha256 = 0x01,  ///< sqlift structural hash, SHA-256 digest (32 bytes).
+    SqliftSha256   = 0x01,  ///< sqlift structural hash, SHA-256 digest (32 bytes).
+    SqliftPgSha256 = 0x02,  ///< sqlift Postgres IR hash, SHA-256 digest (32 bytes).
+};
+
+enum class Engine : std::uint8_t {
+    Sqlite   = 0,
+    Postgres = 1,
 };
 
 /// A byte buffer holding a raw SQLite changeset blob.
@@ -366,6 +391,10 @@ public:
     /// (creates tables if new, alters if existing schema differs).
     explicit Database(const std::string& path,
                       const std::string& schema_ddl = {});
+#ifndef EMSCRIPTEN
+    static Database postgres(const std::string& conninfo,
+                             const std::string& schema_ddl = {});
+#endif
     ~Database();
 
     Database(Database&&) noexcept;
@@ -394,9 +423,24 @@ public:
     /// Convenience overload when you don't know which tables changed.
     void notify();
 
+    /// Active subscription registrations. Zero after each Subscription
+    /// is destroyed or the database is closed.
+    std::size_t subscription_count() const;
+
     /// Access the underlying sqlite3 handle for use with
     /// Master/Replica/Peer constructors.
     sqlite3* handle() const;
+
+    /// Engine this Database was opened against.
+    Engine engine() const;
+
+    /// SQLite handle, or nullptr when engine() is Postgres.
+    sqlite3* sqlite_handle() const;
+
+#ifndef EMSCRIPTEN
+    /// Postgres handle, or nullptr when engine() is Sqlite.
+    PGconn* postgres_handle() const;
+#endif
 
     /// Generate schema migration SQL from old DDL to new DDL using sqlift.
     /// Returns empty string if schemas are equivalent.
@@ -407,6 +451,7 @@ private:
     friend class Subscription;
     struct Impl;
     std::shared_ptr<Impl> impl_;
+    Database() = default;
 };
 
 } // namespace sqlpipe
@@ -427,10 +472,26 @@ namespace sqlpipe {
 ///   // ... perform writes ...
 ///   auto changed = w.notify({"items"});  // re-evaluates affected queries
 ///
+/// Delivery is synchronous backpressure. `notify` evaluates and returns
+/// before the caller continues, and the watch keeps no queue of pending
+/// payloads (structural bound: zero buffered results). A slow consumer
+/// stalls the caller; it does not accumulate results. Unchanged hashes
+/// are omitted. Latest-state delivery may therefore skip intermediate
+/// results when the caller applies a burst and notifies once
+/// (`Replica::handle_messages` does that). This is not exactly-once
+/// event delivery.
+///
+/// Evaluation failure throws `ErrorCode::QueryFailed`, publishes nothing,
+/// and does not advance the last successful result hash. The next
+/// `notify` retries. An empty vector means "unchanged", never "failed".
+///
 /// Does NOT own the sqlite3* handle.
 class QueryWatch {
 public:
     explicit QueryWatch(sqlite3* db);
+#ifndef EMSCRIPTEN
+    explicit QueryWatch(PGconn* conn);
+#endif
     ~QueryWatch();
 
     QueryWatch(const QueryWatch&) = delete;
@@ -458,6 +519,9 @@ public:
     /// Returns true if there are no active subscriptions.
     bool empty() const;
 
+    /// Active registrations. Does not grow with producer writes.
+    std::size_t subscription_count() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -477,6 +541,11 @@ enum class ErrorCode : int {
     InvalidState,       ///< Operation not valid in the current state.
     OwnershipRejected,  ///< Peer ownership request was rejected by the server.
     WithoutRowidTable,  ///< Table uses WITHOUT ROWID (not supported).
+    PostgresError,      ///< A libpq / Postgres call failed.
+    UnsupportedTable,   ///< PK or column type rejected by the engine gate.
+    QueryFailed,        ///< Subscription SQL failed to prepare or evaluate.
+                        ///< Local only: not a wire ErrorMsg. Distinct from a
+                        ///< healthy notify that returns no rows.
 };
 
 /// Exception thrown by sqlpipe operations.
@@ -496,7 +565,8 @@ private:
 // ── protocol.h ──────────────────────────────────────────────────
 namespace sqlpipe {
 
-inline constexpr std::uint32_t kProtocolVersion = 7;
+inline constexpr std::uint32_t kProtocolVersion         = 7;
+inline constexpr std::uint32_t kPostgresProtocolVersion = 8;
 
 // ── Message types ───────────────────────────────────────────────────
 
@@ -729,6 +799,9 @@ struct MasterConfig {
 class Master {
 public:
     explicit Master(sqlite3* db, MasterConfig config = {});
+#ifndef EMSCRIPTEN
+    explicit Master(PGconn* conn, MasterConfig config = {});
+#endif
     ~Master();
 
     Master(const Master&) = delete;
@@ -798,6 +871,21 @@ struct ReplicaConfig {
     bool queue_while_predicting = false;
 };
 
+/// Protocol progress visible without reading `_sqlpipe_meta`.
+/// `Live` means the handshake finished, not that the replica has every
+/// committed row and not that the source data is fresh. Compare
+/// `current_seq()` with the writer's sequence; remote progress stays
+/// unknown (`observed_remote_seq() == nullopt`) until a Hello, DiffReady,
+/// or applied changeset supplies one. The core does not time out a link.
+/// The caller detects transport loss or a stall and calls `reset()`,
+/// which returns the replica to `Unsynchronized`.
+enum class SyncStatus : std::uint8_t {
+    Unsynchronized,  ///< Init, or reset() after the caller reports link loss.
+    Synchronizing,   ///< Handshake or diff in progress.
+    Live,            ///< Handshake complete. Not a freshness certificate.
+    Failed,          ///< Terminal protocol error (State::Error).
+};
+
 /// Return type for Replica::handle_message.
 struct HandleResult {
     std::vector<OutMessage>   messages;       ///< Tagged protocol responses to send back.
@@ -812,6 +900,9 @@ struct HandleResult {
 class Replica {
 public:
     explicit Replica(sqlite3* db, ReplicaConfig config = {});
+#ifndef EMSCRIPTEN
+    explicit Replica(PGconn* conn, ReplicaConfig config = {});
+#endif
     ~Replica();
 
     Replica(const Replica&) = delete;
@@ -886,13 +977,20 @@ public:
     /// Whether this replica was constructed with queue_while_predicting.
     bool queues_while_predicting() const;
 
-    /// Reset to Init state for reconnection. Subscriptions are preserved;
-    /// they will re-evaluate after the next handshake applies changes.
-    /// Also rolls back any active prediction and drops any queued inbound
-    /// messages without applying them (reconnect/diff will resync).
+    /// Reset to Init state for reconnection. Call this when the transport
+    /// reports disconnect or a stalled link; sqlpipe does not detect that
+    /// itself. Subscriptions are preserved; they re-evaluate after the next
+    /// handshake applies changes. Also rolls back any active prediction and
+    /// drops any queued inbound messages without applying them
+    /// (reconnect/diff will resync). Clears observed remote progress.
     void reset();
 
     Seq current_seq() const;
+
+    /// Last remote sequence observed from the master. `nullopt` until a
+    /// Hello, DiffReady, or applied changeset reports one (unknown).
+    std::optional<Seq> observed_remote_seq() const;
+
     SchemaVersion schema_version() const;
 
     /// Replica connection lifecycle state.
@@ -906,6 +1004,12 @@ public:
     };
 
     State state() const;
+
+    /// `state()` grouped for callers that should not treat Live as freshness.
+    SyncStatus sync_status() const;
+
+    /// Active query registrations on this replica. Unchanged by writes.
+    std::size_t subscription_count() const;
 
 private:
     struct Impl;
@@ -1015,6 +1119,9 @@ struct PeerHandleResult {
 class Peer {
 public:
     explicit Peer(sqlite3* db, PeerConfig config = {});
+#ifndef EMSCRIPTEN
+    explicit Peer(PGconn* conn, PeerConfig config = {});
+#endif
     ~Peer();
 
     Peer(const Peer&) = delete;
@@ -1040,8 +1147,10 @@ public:
     /// Remove a subscription.
     void unsubscribe(SubscriptionId id);
 
-    /// Reset to Init state for reconnection. Call start() again to
-    /// re-handshake. Table ownership is preserved from the previous session.
+    /// Reset to Init for reconnection. Call start() again to re-handshake.
+    /// Table ownership is preserved. Subscriptions are not: they belong to
+    /// the internal Replica, which this destroys. Subscribe again after
+    /// start(); there is no subscription cache to repair by polling.
     void reset();
 
     /// Peer lifecycle state.
@@ -1054,6 +1163,13 @@ public:
     };
 
     State state() const;
+
+    /// `state()` grouped the same way as `Replica::sync_status`.
+    SyncStatus sync_status() const;
+
+    /// Registrations on the internal replica. Zero after `reset()` until
+    /// the caller subscribes again.
+    std::size_t subscription_count() const;
 
     /// The tables this peer owns (mastering).
     const std::set<std::string>& owned_tables() const;

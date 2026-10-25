@@ -14,16 +14,22 @@ struct sqlpipe_master {
     sqlpipe::Master impl;
     sqlpipe_master(sqlite3* db, sqlpipe::MasterConfig cfg)
         : impl(db, std::move(cfg)) {}
+    sqlpipe_master(PGconn* conn, sqlpipe::MasterConfig cfg)
+        : impl(conn, std::move(cfg)) {}
 };
 
 struct sqlpipe_replica {
     sqlpipe::Replica impl;
     sqlpipe_replica(sqlite3* db, sqlpipe::ReplicaConfig cfg)
         : impl(db, std::move(cfg)) {}
+    sqlpipe_replica(PGconn* conn, sqlpipe::ReplicaConfig cfg)
+        : impl(conn, std::move(cfg)) {}
 };
 
 struct sqlpipe_peer {
     sqlpipe::Peer impl;
+    sqlpipe_peer(PGconn* conn, sqlpipe::PeerConfig cfg)
+        : impl(conn, std::move(cfg)) {}
     sqlpipe_peer(sqlite3* db, sqlpipe::PeerConfig cfg)
         : impl(db, std::move(cfg)) {}
 };
@@ -417,6 +423,20 @@ sqlpipe_error sqlpipe_master_new(
     }
 }
 
+sqlpipe_error sqlpipe_master_new_pg(
+    PGconn* conn, sqlpipe_master_config cfg, sqlpipe_master** out) {
+    try {
+        *out = new sqlpipe_master(conn, to_master_config(cfg));
+        return ok();
+    } catch (const sqlpipe::Error& e) {
+        *out = nullptr;
+        return make_error(e);
+    } catch (const std::exception& e) {
+        *out = nullptr;
+        return make_error(1, e.what());
+    }
+}
+
 void sqlpipe_master_free(sqlpipe_master* m) { delete m; }
 
 sqlpipe_error sqlpipe_master_flush(sqlpipe_master* m, sqlpipe_buf* out) {
@@ -464,6 +484,20 @@ sqlpipe_error sqlpipe_replica_new(
     sqlite3* db, sqlpipe_replica_config cfg, sqlpipe_replica** out) {
     try {
         *out = new sqlpipe_replica(db, to_replica_config(cfg));
+        return ok();
+    } catch (const sqlpipe::Error& e) {
+        *out = nullptr;
+        return make_error(e);
+    } catch (const std::exception& e) {
+        *out = nullptr;
+        return make_error(1, e.what());
+    }
+}
+
+sqlpipe_error sqlpipe_replica_new_pg(
+    PGconn* conn, sqlpipe_replica_config cfg, sqlpipe_replica** out) {
+    try {
+        *out = new sqlpipe_replica(conn, to_replica_config(cfg));
         return ok();
     } catch (const sqlpipe::Error& e) {
         *out = nullptr;
@@ -613,6 +647,20 @@ sqlpipe_error sqlpipe_peer_new(
     sqlite3* db, sqlpipe_peer_config cfg, sqlpipe_peer** out) {
     try {
         *out = new sqlpipe_peer(db, to_peer_config(cfg));
+        return ok();
+    } catch (const sqlpipe::Error& e) {
+        *out = nullptr;
+        return make_error(e);
+    } catch (const std::exception& e) {
+        *out = nullptr;
+        return make_error(1, e.what());
+    }
+}
+
+sqlpipe_error sqlpipe_peer_new_pg(
+    PGconn* conn, sqlpipe_peer_config cfg, sqlpipe_peer** out) {
+    try {
+        *out = new sqlpipe_peer(conn, to_peer_config(cfg));
         return ok();
     } catch (const sqlpipe::Error& e) {
         *out = nullptr;

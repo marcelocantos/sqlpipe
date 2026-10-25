@@ -17,6 +17,7 @@ extern "C" {
 
 // Forward-declare sqlite3 (defined in go-sqlite3's compiled binding).
 typedef struct sqlite3 sqlite3;
+typedef struct pg_conn PGconn;
 
 // ── Opaque handles ──────────────────────────────────────────────
 
@@ -135,6 +136,8 @@ typedef struct {
 
 sqlpipe_error sqlpipe_master_new(
     sqlite3* db, sqlpipe_master_config cfg, sqlpipe_master** out);
+sqlpipe_error sqlpipe_master_new_pg(
+    PGconn* conn, sqlpipe_master_config cfg, sqlpipe_master** out);
 void sqlpipe_master_free(sqlpipe_master* m);
 
 // Returns serialized messages: [u32 count][msg1][msg2]...
@@ -157,6 +160,8 @@ sqlpipe_buf sqlpipe_master_schema_version(sqlpipe_master* m);
 
 sqlpipe_error sqlpipe_replica_new(
     sqlite3* db, sqlpipe_replica_config cfg, sqlpipe_replica** out);
+sqlpipe_error sqlpipe_replica_new_pg(
+    PGconn* conn, sqlpipe_replica_config cfg, sqlpipe_replica** out);
 void sqlpipe_replica_free(sqlpipe_replica* r);
 
 // Returns a single serialized HelloMsg.
@@ -202,6 +207,8 @@ uint8_t sqlpipe_replica_queues_while_predicting(sqlpipe_replica* r);
 
 sqlpipe_error sqlpipe_peer_new(
     sqlite3* db, sqlpipe_peer_config cfg, sqlpipe_peer** out);
+sqlpipe_error sqlpipe_peer_new_pg(
+    PGconn* conn, sqlpipe_peer_config cfg, sqlpipe_peer** out);
 void sqlpipe_peer_free(sqlpipe_peer* p);
 
 // Returns serialized PeerMessages: [u32 count][pmsg1][pmsg2]...

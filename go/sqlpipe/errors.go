@@ -16,6 +16,9 @@ const (
 	ErrInvalidState     ErrorCode = 4
 	ErrOwnershipReject  ErrorCode = 5
 	ErrWithoutRowidTbl  ErrorCode = 6
+	ErrPostgres         ErrorCode = 7
+	ErrUnsupportedTable ErrorCode = 8
+	ErrQueryFailed      ErrorCode = 9
 )
 
 // Error is the error type returned by sqlpipe operations.

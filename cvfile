@@ -13,6 +13,12 @@ sqldeep     = ../sqldeep
 deepparser  = $vendor/github.com/marcelocantos/deepparser
 incflags    = -Idist -I$vendor/include -I$deepparser/src
 
+# Optional live Postgres engine (tests/test_postgres_sync.cpp). Absent libpq →
+# constructors throw; the suite skips at runtime / compile-time.
+lazy pq_cflags = $[shell pkg-config --cflags libpq 2>/dev/null || (test -d /opt/homebrew/opt/libpq && echo -I/opt/homebrew/opt/libpq/include) || echo ""]
+lazy pq_libs   = $[shell pkg-config --libs libpq 2>/dev/null || (test -d /opt/homebrew/opt/libpq && echo -L/opt/homebrew/opt/libpq/lib -Wl,-rpath,/opt/homebrew/opt/libpq/lib -lpq) || echo ""]
+lazy pq_def    = $[shell pkg-config --exists libpq && echo -DSQLPIPE_HAVE_POSTGRES || (test -d /opt/homebrew/opt/libpq && echo -DSQLPIPE_HAVE_POSTGRES) || echo ""]
+
 # ── Sources ──────────────────────────────────────────────────────────
 test_srcs = tests/doctest_main.cpp $[wildcard tests/test_*.cpp]
 test_objs = $[patsubst %.cpp,build/%.o,$test_srcs]
@@ -28,6 +34,10 @@ build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlpipe.o $dp_objs
 !test: build/sqlpipe_tests
     ./$input
 
+# Owner gate. Postgres is an ephemeral docker postgres:16 (not host :5432).
+!gate:
+    ./scripts/with-postgres.sh ./scripts/gate.sh
+
 !example: build/loopback
     ./$input
 
@@ -42,10 +52,13 @@ build/libsqlpipe.a: build/sqlite3.o build/lz4.o build/sqlpipe.o $dp_objs
 
 # ── Binaries ─────────────────────────────────────────────────────────
 build/sqlpipe_tests: $test_objs build/libsqlpipe.a
-    $cxx $cxxflags -o $target $inputs
+    $cxx $cxxflags -o $target $inputs $pq_libs
 
 build/loopback: build/examples/loopback.o build/libsqlpipe.a
-    $cxx $cxxflags -o $target $inputs
+    $cxx $cxxflags -o $target $inputs $pq_libs
+
+build/fault_consumer: build/examples/fault_consumer.o build/libsqlpipe.a
+    $cxx $cxxflags -o $target $inputs $pq_libs
 
 build/fuzz_deserialize: build/tests/fuzz_deserialize.o build/libsqlpipe.a
     $cxx $cxxflags -fsanitize=fuzzer,address -o $target $inputs
@@ -87,11 +100,11 @@ build/sqlite3.o: $vendor/src/sqlite3.c
 build/lz4.o: $vendor/src/lz4.c
     $cc $cflags -I$vendor/include -c $input -o $target
 
-build/sqlpipe.o: dist/sqlpipe.cpp
-    $cxx $cxxflags $incflags -c $input -o $target
+build/sqlpipe.o: dist/sqlpipe.cpp dist/sqlpipe_pg.cpp
+    $cxx $cxxflags $incflags $pq_cflags $pq_def -c $input -o $target
 
 build/tests/{name}.o: tests/{name}.cpp
-    $cxx $cxxflags $incflags -c $input -o $target
+    $cxx $cxxflags $incflags $pq_cflags $pq_def -c $input -o $target
 
 build/examples/{name}.o: examples/{name}.cpp
     $cxx $cxxflags $incflags -c $input -o $target

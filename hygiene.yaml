@@ -3,16 +3,16 @@
 # Validate: ~/.claude/skills/hygiene/hygiene_check.py
 #
 # Honest init (2026-08-22): floors are the held tier this tree already reaches.
-# Gaps sit above the floor in the aspires band. Shipped C++ gate is `cv test`;
-# `cv example` does not compile and is not in CI. Do not read this file as a
-# promise to add scanners, a release workflow, or a format/lint job.
+# Gaps sit above the floor in the aspires band. Owner oracle is `make gate`
+# (docker Postgres + cv test + go test). `cv example` does not compile.
+# Do not read this file as a promise to add scanners or a format/lint job.
 
 schema_version: 1
 
 repo: sqlpipe
 aspires: 3
 floors:            # per-dimension held-tier ratchet; below floor => DRIFT
-  correctness: 1   # cv test + go test in CI; example stale; fuzz/TLA not in CI
+  correctness: 1   # make gate is the owner oracle; example stale; fuzz/TLA not in gate
   security: 2      # vendor + go.sum; GitHub secret scan is T3 with planned SAST
   quality: 1       # -Wall -Wextra -Wpedantic in cvfile; no format/lint CI gate
   deps: 2          # vendor + go.sum + NOTICES; no Dependabot
@@ -34,21 +34,21 @@ items:
   # ============================== CORRECTNESS =============================
   - id: correctness.cv-test
     dim: correctness
-    desc: C++ doctest suite (cv test) runs on every push/PR
+    desc: C++ doctest suite runs in the local owner gate
     state: enforced
     cadence: continuous
     enforce: blocking
     tier: 1
-    evidence: {ci_step: {workflow: ci.yml, name: Build and test}}
+    evidence: {make_target: gate}
 
   - id: correctness.go-test
     dim: correctness
-    desc: Go CGo wrapper tests (go test ./...) run in CI
+    desc: Go CGo wrapper tests (go test ./...) run in the local owner gate
     state: enforced
     cadence: continuous
     enforce: blocking
     tier: 1
-    evidence: {ci_step: {workflow: ci.yml, name: Go test}}
+    evidence: {file: {path: scripts/gate.sh, matches: 'go test'}}
 
   - id: correctness.make-cv-test
     dim: correctness
@@ -61,30 +61,33 @@ items:
 
   - id: correctness.os-matrix
     dim: correctness
-    desc: cv test runs on ubuntu-latest and macos-latest
-    state: enforced
+    desc: C++/Go suite is re-run on Linux (Docker) as well as the host
+    state: planned
     cadence: continuous
-    enforce: blocking
+    enforce: informational
     tier: 2
-    evidence: {ci_job: ci.yml#test}
+    reason: >-
+      Owner gate is local make gate (host + docker Postgres).
+      make gate-linux exists but is opt-in, not part of the owner gate.
+    evidence: {absent: {file: {path: .github/workflows/ci.yml}}}
 
   - id: correctness.wasm
     dim: correctness
-    desc: Wasm module builds and TS smoke runs in CI
-    state: enforced
+    desc: Wasm module builds and TS smoke runs when emcc+node are present
+    state: present
     cadence: continuous
-    enforce: blocking
+    enforce: warning
     tier: 2
-    evidence: {ci_job: ci.yml#wasm}
+    evidence: {file: {path: scripts/gate.sh, matches: 'cv wasm'}}
 
   - id: correctness.swift-build
     dim: correctness
-    desc: Swift package (swift build) compiles in CI
-    state: enforced
+    desc: Swift package (swift build) compiles when swift is on PATH
+    state: present
     cadence: continuous
-    enforce: blocking
+    enforce: warning
     tier: 2
-    evidence: {ci_job: ci.yml#swift}
+    evidence: {file: {path: scripts/gate.sh, matches: 'swift build'}}
 
   - id: correctness.examples
     dim: correctness
@@ -128,6 +131,15 @@ items:
     reason: formal/Convergence.tla exists; TLC is not a CI job (AGENTS.md).
     evidence: {absent: {ci_job: ci.yml#tlc}}
 
+  - id: correctness.postgres-live
+    dim: correctness
+    desc: PostgreSQL backend is executed in an ephemeral docker postgres
+    state: present
+    cadence: continuous
+    enforce: warning
+    tier: 3
+    evidence: {file: {path: scripts/with-postgres.sh, matches: 'postgres:16'}}
+
   - id: correctness.swift-tests
     dim: correctness
     desc: Swift package has an in-package test target run in CI
@@ -140,15 +152,15 @@ items:
 
   - id: correctness.windows
     dim: correctness
-    desc: Windows CI job
-    state: skipped
+    desc: Windows verification on the local Parallels VM
+    state: planned
     cadence: continuous
     enforce: informational
     tier: 3
     reason: >-
-      Shipped matrix is Ubuntu + macOS (C++), Ubuntu (Go, Wasm), macOS (Swift).
-      Windows is not a supported host for this library.
-    evidence: {absent: {ci_job: ci.yml#windows}}
+      make gate-windows exists (ssh hms-vm) but the VM has no C++/cv
+      toolchain for this repo yet.
+    evidence: {absent: {file: {path: .github/workflows/ci.yml}}}
 
   # =========================== SECURITY / SUPPLY ==========================
   - id: security.vendor
@@ -228,14 +240,12 @@ items:
   - id: security.actions-perms
     dim: security
     desc: GitHub Actions default token permissions scoped to least privilege
-    state: planned
+    state: skipped
     cadence: once-must-hold
-    enforce: warning
+    enforce: informational
     tier: 3
-    reason: ci.yml has no top-level permissions block.
-    evidence:
-      absent:
-        file: {path: .github/workflows/ci.yml, matches: '(?m)^permissions:'}
+    reason: No GitHub Actions workflows remain; the owner gate is local.
+    evidence: {absent: {file: {path: .github/workflows/ci.yml}}}
 
   - id: security.signed-releases
     dim: security
@@ -455,12 +465,12 @@ items:
 
   - id: build.ci
     dim: build
-    desc: CI workflow builds C++, Go, Swift, and Wasm
+    desc: Local owner gate builds C++ and Go (Swift/Wasm when toolchains exist)
     state: enforced
     cadence: continuous
     enforce: blocking
     tier: 2
-    evidence: {ci_job: ci.yml#test}
+    evidence: {make_target: gate}
 
   - id: build.make-bullseye
     dim: build
@@ -563,24 +573,25 @@ items:
   - id: vcs.branch-protection
     dim: vcs
     desc: master is protected and requires the CI test job
-    state: planned
+    state: skipped
     cadence: once-must-hold
-    enforce: warning
+    enforce: informational
     tier: 3
-    reason: Branch protection 404; CI runs on push/PR but is not a required check.
+    reason: >-
+      Owner shipping is gated-push; the oracle is local make gate, not a
+      required GitHub check. Branch protection is not used.
     evidence:
       absent:
         command: gh api repos/marcelocantos/sqlpipe/branches/master/protection --jq .url
 
   - id: vcs.pre-commit-hook
     dim: vcs
-    desc: Committed git hooks (scripts/hooks) gate locally before commit
-    state: planned
+    desc: Committed git hooks (scripts/hooks) gate locally before push
+    state: present
     cadence: once-must-hold
     enforce: informational
     tier: 3
-    reason: No scripts/hooks; core.hooksPath is the default .git/hooks samples.
-    evidence: {absent: {file: {path: scripts/hooks/pre-commit}}}
+    evidence: {file: {path: scripts/hooks/pre-push, matches: 'make gate'}}
 
   # =================== AGENT-READINESS / ONBOARDING ====================
   - id: agent.claude-md

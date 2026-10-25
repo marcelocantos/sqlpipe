@@ -186,35 +186,13 @@ head -n "$((MARKER_LINE + 1))" dist/sqlpipe.cpp > dist/sqlpipe.cpp.tmp
     ' vendor/src/sqlift.cpp
 } >> dist/sqlpipe.cpp.tmp
 
-# Patch sqlift_db and sqlift_db_close to support borrowed handles,
-# and append sqlift_db_wrap.
-# TODO: upstream to sqlift — the C API should accept sqlite3* directly.
-gsed -i -E '
-    # Add owns flag to sqlift_db struct
-    s/^(struct sqlift_db \{)/\1\n    bool owns = true;/
-
-    # Patch sqlift_db_close to skip close for borrowed handles
-    /^void sqlift_db_close\(sqlift_db\* db\) \{/{
-        N
-        s/delete db;/if (!db->owns) { \/* borrowed — null out handle so ~Database skips close *\/\n        sqlite3 *null = nullptr;\n        memcpy(static_cast<void*>(\&db->db), \&null, sizeof(sqlite3*));\n    }\n    delete db;/
-    }
-' dist/sqlpipe.cpp.tmp
-
 cat <<'SHIM' >> dist/sqlpipe.cpp.tmp
 
 // ── sqlift_db_wrap (sqlpipe shim) ───────────────────────────────────
-// Wraps an existing sqlite3* for use with sqlift C API functions.
-// The handle is NOT owned — sqlift_db_close will not close it.
-// TODO: upstream to sqlift — the C API should accept sqlite3* directly.
+// Forwards to sqlift_db_wrap_sqlite (borrowed handle, not owned).
 
 extern "C" sqlift_db* sqlift_db_wrap(sqlite3* handle) {
-    auto* sdb = new sqlift_db(":memory:", 0);
-    // Close the dummy :memory: db and swap in the borrowed handle.
-    sqlite3_close(sdb->db.get());
-    sqlite3** pdb = reinterpret_cast<sqlite3**>(&sdb->db);
-    *pdb = handle;
-    sdb->owns = false;
-    return sdb;
+    return sqlift_db_wrap_sqlite(handle, nullptr, nullptr);
 }
 SHIM
 
@@ -253,7 +231,9 @@ echo "Bundled sqlift + sqldeep + sqldeep_xml into dist/sqlpipe.cpp"
 
 # ── 5. Copy to wrappers ───────────────────────────────────────
 cp dist/sqlpipe.{h,cpp} go/sqlpipe/internal/c/
+cp dist/sqlpipe_pg.cpp go/sqlpipe/internal/c/
 cp dist/sqlpipe.{h,cpp} swift/Sources/CSqlpipe/
+cp dist/sqlpipe_pg.cpp swift/Sources/CSqlpipe/
 cp dist/sqlpipe.h swift/Sources/CSqlpipe/include/
 
 # The Go module vendors a copy of the C-API shim under internal/c/ as well as

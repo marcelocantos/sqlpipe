@@ -909,3 +909,15 @@ TEST_CASE("handshake rejects a mismatched protocol version (T24)") {
     REQUIRE(std::holds_alternative<ErrorMsg>(resp[0].msg));
     CHECK(std::get<ErrorMsg>(resp[0].msg).code == ErrorCode::ProtocolError);
 }
+
+TEST_CASE("sqlite peer rejects postgres protocol v8 Hello (T34)") {
+    DB master_db;
+    master_db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    Master master(master_db.db);
+
+    auto resp = master.handle_message(
+        HelloMsg{kPostgresProtocolVersion, SchemaVersion{0x02}, {}});
+    REQUIRE(resp.size() == 1);
+    REQUIRE(std::holds_alternative<ErrorMsg>(resp[0].msg));
+    CHECK(std::get<ErrorMsg>(resp[0].msg).code == ErrorCode::ProtocolError);
+}

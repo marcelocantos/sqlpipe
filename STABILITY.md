@@ -82,7 +82,7 @@ Snapshot as of v0.31.0. Items annotated with stability assessments.
 | `Delivery` | `Reliable=0, BestEffort=1` | **Fluid** (introduced v0.15.0, removed v0.17.0, reinstated v0.24.0) |
 | `ConflictAction` | `Omit, Replace, Abort` | **Stable** |
 | `ConflictType` | `Data, NotFound, Conflict, Constraint, ForeignKey` | **Stable** |
-| `ErrorCode` | `Ok=0, SqliteError, ProtocolError, SchemaMismatch, InvalidState, OwnershipRejected, WithoutRowidTable` | **Stable** |
+| `ErrorCode` | `Ok=0, SqliteError, ProtocolError, SchemaMismatch, InvalidState, OwnershipRejected, WithoutRowidTable, PostgresError, UnsupportedTable, QueryFailed` | **Stable** (`QueryFailed` is local; it is not a wire `ErrorMsg`) |
 | `DiffPhase` | `ComputingBuckets, ComparingBuckets, ComputingRowHashes, BuildingPatchset, ApplyingPatchset` | **Stable** |
 | `LogLevel` | `Debug=0, Info, Warn, Error` | **Stable** |
 | `MessageTag` | `Hello=0x01, Changeset=0x03, Ack=0x08, Error=0x09, BucketHashes=0x0A, NeedBuckets=0x0B, RowHashes=0x0C, DiffReady=0x0D` | **Stable** |
@@ -194,8 +194,11 @@ class Replica {
     bool queues_while_predicting() const;
     void reset();
     Seq current_seq() const;
+    std::optional<Seq> observed_remote_seq() const;
     SchemaVersion schema_version() const;
     State state() const;
+    SyncStatus sync_status() const;
+    std::size_t subscription_count() const;
 };
 ```
 
@@ -219,6 +222,8 @@ class Peer {
     void unsubscribe(SubscriptionId id);
     void reset();
     State state() const;
+    SyncStatus sync_status() const;
+    std::size_t subscription_count() const;
     const std::set<std::string>& owned_tables() const;
     const std::set<std::string>& remote_tables() const;
 };
@@ -263,6 +268,7 @@ class QueryWatch {
     std::vector<QueryResult> notify(const std::set<std::string>& affected_tables,
                                     const Changeset& changeset_data);
     bool empty() const;
+    std::size_t subscription_count() const;
 };
 ```
 
@@ -282,6 +288,7 @@ class Database {
     Subscription subscribe(const std::string& sql, SubscriptionCallback cb);
     void notify(const std::set<std::string>& affected_tables);
     void notify();
+    std::size_t subscription_count() const;
     sqlite3* handle() const;
     static std::string migration(const std::string& from_ddl, const std::string& to_ddl);
 };
@@ -353,6 +360,20 @@ The following C APIs are bundled into `dist/sqlpipe.h` and available to consumer
 | `_sqlpipe_meta` | `CREATE TABLE _sqlpipe_meta(key TEXT PRIMARY KEY, value)` | **Stable** |
 
 Keys: `seq` (Master/Replica solo), `master_seq` / `replica_seq` (Peer mode).
+
+## Recovery contract
+
+Normative text for resynchronization versus transport reconnect, replication
+progress versus source freshness, and latest-state subscriptions versus
+exactly-once events lives in `README.md` ("Recovery, health, and
+subscriptions"). `SyncStatus::Live` is not source freshness. Subscription
+delivery is synchronous backpressure with no result queue;
+`handle_messages` coalesces a burst to the latest result and may omit
+intermediates. The C++ fault suite claims are listed there. Go `RunPeer`
+(T36), dual-channel ordering (T37), T39 and T40 outside C++ SQLite
+`QueryWatch` (including a scalar override after peer closure, and
+one-shot `Query`), Swift, Wasm, and Postgres fault injection are not
+claimed by that suite.
 
 ## Gaps
 

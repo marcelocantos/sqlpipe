@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -134,6 +135,7 @@ void write_seq(sqlite3* db, Seq seq, const std::string& key = "seq");
 /// If filter is non-null, only include tables in the filter.
 SchemaVersion compute_schema_fingerprint(
     sqlite3* db, const std::set<std::string>* filter = nullptr);
+SchemaVersion compute_schema_fingerprint_pg(const sqlift_exec& ex);
 
 /// Get all user table names (excludes _sqlpipe_* and sqlite_* tables).
 /// Only includes tables with explicit PRIMARY KEYs.
@@ -764,6 +766,53 @@ SchemaVersion compute_schema_fingerprint(
         fp.push_back(static_cast<std::uint8_t>(
             (nibble(p[0]) << 4) | nibble(p[1])));
     }
+    sqlift_free(hex);
+    return fp;
+}
+
+SchemaVersion fingerprint_from_sqlift_hex(
+        SchemaFingerprintAlgo algo, const char* hex) {
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return 0;
+    };
+    SchemaVersion fp;
+    fp.push_back(static_cast<std::uint8_t>(algo));
+    for (const char* p = hex; p[0] && p[1]; p += 2) {
+        fp.push_back(static_cast<std::uint8_t>(
+            (nibble(p[0]) << 4) | nibble(p[1])));
+    }
+    return fp;
+}
+
+SchemaVersion compute_schema_fingerprint_pg(const sqlift_exec& ex) {
+    int err_type = 0;
+    char* err_msg = nullptr;
+    sqlift_db* sdb = sqlift_db_wrap_exec(SQLIFT_ENGINE_POSTGRES, ex,
+                                         &err_type, &err_msg);
+    if (!sdb) {
+        std::string msg = err_msg ? err_msg : "wrap_exec failed";
+        sqlift_free(err_msg);
+        throw Error(ErrorCode::SqliteError, "sqlift_db_wrap_exec: " + msg);
+    }
+    char* json = sqlift_extract(sdb, &err_type, &err_msg);
+    sqlift_db_close(sdb);
+    if (!json) {
+        std::string msg = err_msg ? err_msg : "extract failed";
+        sqlift_free(err_msg);
+        throw Error(ErrorCode::SqliteError, "sqlift_extract: " + msg);
+    }
+    char* hex = sqlift_schema_hash(json, &err_type, &err_msg);
+    sqlift_free(json);
+    if (!hex) {
+        std::string msg = err_msg ? err_msg : "hash failed";
+        sqlift_free(err_msg);
+        throw Error(ErrorCode::SqliteError, "sqlift_schema_hash: " + msg);
+    }
+    auto fp = fingerprint_from_sqlift_hex(
+        SchemaFingerprintAlgo::SqliftPgSha256, hex);
     sqlift_free(hex);
     return fp;
 }
@@ -1438,8 +1487,20 @@ std::vector<ChangeEvent> collect_events(const Changeset& data) {
 // ── master.cpp ──────────────────────────────────────────────────
 namespace sqlpipe {
 
+#ifndef EMSCRIPTEN
+#ifdef SQLPIPE_HAVE_POSTGRES
+struct PgMasterState;
+struct PgReplicaState;
+#endif
+#endif
+
 struct Master::Impl {
-    sqlite3*                 db;
+    sqlite3*                 db = nullptr;
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    std::unique_ptr<PgMasterState> pg;
+#endif
+#endif
     MasterConfig             config;
     detail::SessionGuard     session;
     std::vector<std::string> tracked_tables;
@@ -1969,7 +2030,31 @@ struct Master::Impl {
     }
 };
 
+} // namespace sqlpipe
+
+#ifndef EMSCRIPTEN
+#ifdef SQLPIPE_HAVE_POSTGRES
+#include "sqlpipe_pg.cpp"
+#endif
+#endif
+
+namespace sqlpipe {
+
 // ── Public API ──────────────────────────────────────────────────────
+
+#ifndef EMSCRIPTEN
+Master::Master(PGconn* conn, MasterConfig config) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+    impl_ = std::make_unique<Impl>();
+    impl_->pg = std::make_unique<PgMasterState>(conn, std::move(config));
+#else
+    (void)conn;
+    (void)config;
+    throw Error(ErrorCode::PostgresError,
+                "sqlpipe built without Postgres support (-DSQLPIPE_HAVE_POSTGRES)");
+#endif
+}
+#endif
 
 Master::Master(sqlite3* db, MasterConfig config)
     : impl_(std::make_unique<Impl>()) {
@@ -1979,7 +2064,7 @@ Master::Master(sqlite3* db, MasterConfig config)
 }
 
 Master::~Master() {
-    if (impl_ && impl_->config.on_flush) {
+    if (impl_ && impl_->db && impl_->config.on_flush) {
         sqlite3_commit_hook(impl_->db, nullptr, nullptr);
     }
 }
@@ -1987,6 +2072,14 @@ Master::Master(Master&&) noexcept = default;
 Master& Master::operator=(Master&&) noexcept = default;
 
 void Master::exec(const std::string& sql) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) {
+        impl_->pg->exec(sql);
+        return;
+    }
+#endif
+#endif
     detail::exec(impl_->db, sql.c_str());
     // Auto-flush only after a real commit: flush_pending was set by the commit
     // hook (which fires on COMMIT, not ROLLBACK), and the connection must be
@@ -1999,6 +2092,11 @@ void Master::exec(const std::string& sql) {
 }
 
 std::vector<OutMessage> Master::flush() {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) return impl_->pg->flush();
+#endif
+#endif
     // If DDL ran since last flush, the tracked table set may have changed.
     auto sv = detail::compute_schema_fingerprint(impl_->db, impl_->filter());
     if (sv != impl_->cached_sv) {
@@ -2023,6 +2121,11 @@ std::vector<OutMessage> Master::flush() {
 }
 
 std::vector<OutMessage> Master::handle_message(const Message& msg) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) return impl_->pg->handle_message(msg);
+#endif
+#endif
     return std::visit([&](const auto& m) -> std::vector<OutMessage> {
         using T = std::decay_t<decltype(m)>;
 
@@ -2046,9 +2149,21 @@ std::vector<OutMessage> Master::handle_message(const Message& msg) {
     }, msg);
 }
 
-Seq Master::current_seq() const { return impl_->seq; }
+Seq Master::current_seq() const {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) return impl_->pg->seq;
+#endif
+#endif
+    return impl_->seq;
+}
 
 SchemaVersion Master::schema_version() const {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) return impl_->pg->fingerprint();
+#endif
+#endif
     return detail::compute_schema_fingerprint(impl_->db, impl_->filter());
 }
 
@@ -4189,7 +4304,12 @@ std::set<SubscriptionId> evaluate_changeset(
 namespace sqlpipe {
 
 struct QueryWatch::Impl {
-    sqlite3* db;
+    sqlite3* db = nullptr;
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    PGconn* pg = nullptr;
+#endif
+#endif
     detail::SchemaMap schema;
 
     struct Subscription {
@@ -4265,11 +4385,82 @@ struct QueryWatch::Impl {
             if (stmt) sqlite3_finalize(stmt);
             sqlite3_set_authorizer(db, nullptr, nullptr);
         }
+        // SQLPIPE_NESTED_DEP_UNION_BEGIN
+        // Expression and nested subqueries are not always scans in the RA
+        // tree. Union every table SQLite reads while preparing so a write
+        // that touches only the inner table still invalidates.
+        {
+            std::set<std::string> extra;
+            sqlite3_set_authorizer(db, [](void* ctx, int action,
+                    const char* a1, const char*, const char*, const char*) -> int {
+                if (action == SQLITE_READ && a1) {
+                    std::string name(a1);
+                    if (name.compare(0, 9, "_sqlpipe_") != 0 &&
+                        name.compare(0, 7, "sqlite_") != 0) {
+                        static_cast<std::set<std::string>*>(ctx)->insert(name);
+                    }
+                }
+                return SQLITE_OK;
+            }, &extra);
+            sqlite3_stmt* probe = nullptr;
+            sqlite3_prepare_v2(db, sql.c_str(), -1, &probe, nullptr);
+            if (probe) sqlite3_finalize(probe);
+            sqlite3_set_authorizer(db, nullptr, nullptr);
+            tables.insert(extra.begin(), extra.end());
+        }
+        // SQLPIPE_NESTED_DEP_UNION_END
         return tables;
     }
 
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    std::pair<QueryResult, std::uint64_t> evaluate_query_pg(Subscription& sub) {
+        QueryResult result;
+        result.id = sub.id;
+        PGresult* r = PQexec(pg, sub.sql.c_str());
+        if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+            std::string msg = PQresultErrorMessage(r);
+            PQclear(r);
+            throw Error(ErrorCode::PostgresError, "subscribe query: " + msg);
+        }
+        int ncols = PQnfields(r);
+        if (sub.columns.empty()) {
+            sub.columns.reserve(static_cast<size_t>(ncols));
+            for (int i = 0; i < ncols; ++i) {
+                const char* name = PQfname(r, i);
+                sub.columns.push_back(name ? name : "");
+            }
+        }
+        result.columns = sub.columns;
+        std::uint64_t h = detail::kFnv64Offset;
+        int nt = PQntuples(r);
+        for (int i = 0; i < nt; ++i) {
+            detail::fnv64_byte(h, 0xFF);
+            std::vector<Value> row;
+            row.reserve(static_cast<size_t>(ncols));
+            for (int j = 0; j < ncols; ++j) {
+                if (PQgetisnull(r, i, j)) {
+                    row.emplace_back(std::monostate{});
+                } else {
+                    row.emplace_back(std::string(PQgetvalue(r, i, j)));
+                }
+                detail::hash_value(h, row.back());
+            }
+            result.rows.push_back(std::move(row));
+        }
+        PQclear(r);
+        return {std::move(result), h};
+    }
+#endif
+#endif
+
     // Evaluate a subscription query. Returns the result and its hash.
     std::pair<QueryResult, std::uint64_t> evaluate_query(Subscription& sub) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+        if (pg) return evaluate_query_pg(sub);
+#endif
+#endif
         QueryResult result;
         result.id = sub.id;
         result.columns = sub.columns;
@@ -4277,7 +4468,17 @@ struct QueryWatch::Impl {
         std::uint64_t h = detail::kFnv64Offset;
         sqlite3_reset(sub.stmt.get());
         int ncols = static_cast<int>(sub.columns.size());
-        while (sqlite3_step(sub.stmt.get()) == SQLITE_ROW) {
+        while (true) {
+            int rc = sqlite3_step(sub.stmt.get());
+            if (rc == SQLITE_DONE) break;
+            if (rc != SQLITE_ROW) {
+                // SQLPIPE_EVAL_STEP_CHECK: do not return a partial result.
+                // The caller leaves result_hash unchanged because this throws
+                // before the hash is stored.
+                throw Error(ErrorCode::QueryFailed,
+                            std::string("subscription query: ") +
+                            sqlite3_errmsg(db));
+            }
             detail::fnv64_byte(h, 0xFF);  // row separator
             std::vector<Value> row;
             row.reserve(static_cast<std::size_t>(ncols));
@@ -4304,11 +4505,24 @@ struct QueryWatch::Impl {
                 db, *changeset, prog_index, table_subs);
         } else {
             // No changeset or no predicates — table-level invalidation.
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+            if (pg && affected.empty()) {
+                for (const auto& [id, _] : subscriptions) ids.insert(id);
+            } else
+#endif
+#endif
+            {
             for (const auto& table : affected) {
                 auto it = table_subs.find(table);
                 if (it != table_subs.end()) {
                     ids.insert(it->second.begin(), it->second.end());
                 }
+            }
+            // Fail-closed subscriptions (no extractable tables) re-eval always.
+            for (const auto& [id, sub] : subscriptions) {
+                if (sub.tables.empty()) ids.insert(id);
+            }
             }
         }
 
@@ -4338,18 +4552,56 @@ QueryWatch::QueryWatch(sqlite3* db)
     impl_->db = db;
 }
 
+#ifndef EMSCRIPTEN
+QueryWatch::QueryWatch(PGconn* conn)
+    : impl_(std::make_unique<Impl>()) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+    impl_->pg = conn;
+#else
+    (void)conn;
+    throw Error(ErrorCode::PostgresError,
+                "sqlpipe built without Postgres support (-DSQLPIPE_HAVE_POSTGRES)");
+#endif
+}
+#endif
+
 QueryWatch::~QueryWatch() = default;
 QueryWatch::QueryWatch(QueryWatch&&) noexcept = default;
 QueryWatch& QueryWatch::operator=(QueryWatch&&) noexcept = default;
 
 SubscriptionId QueryWatch::subscribe(const std::string& sql) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg && !impl_->db) {
+        detail::SchemaMap empty;
+        detail::RAPtr ra;
+        std::vector<detail::ResolvedPredicate> predicates;
+        std::set<std::string> tables;
+        ra = detail::sql_to_ra(sql, empty);
+        if (ra) ra->collect_tables(tables);
+        // empty tables = fail closed (re-evaluate on any notify)
+        auto id = impl_->next_sub_id++;
+        for (const auto& t : tables)
+            impl_->table_subs[t].insert(id);
+        impl_->subscriptions[id] = {id, sql, std::move(tables), std::move(ra),
+                                    std::move(predicates), {}, {}, 0};
+        impl_->pending_new.insert(id);
+        return id;
+    }
+#endif
+#endif
     detail::RAPtr ra;
     std::vector<detail::ResolvedPredicate> predicates;
     auto tables = impl_->analyze_query(sql, ra, predicates);
     auto id = impl_->next_sub_id++;
 
     // Prepare statement once and cache column names.
-    auto stmt = detail::prepare(impl_->db, sql.c_str());
+    detail::StmtGuard stmt;
+    try {
+        stmt = detail::prepare(impl_->db, sql.c_str());
+    } catch (const Error& e) {
+        throw Error(ErrorCode::QueryFailed, e.what());
+    }
     int ncols = sqlite3_column_count(stmt.get());
     std::vector<std::string> columns;
     columns.reserve(static_cast<std::size_t>(ncols));
@@ -4407,6 +4659,10 @@ bool QueryWatch::empty() const {
     return impl_->subscriptions.empty();
 }
 
+std::size_t QueryWatch::subscription_count() const {
+    return impl_->subscriptions.size();
+}
+
 
 // ── query (one-shot) ────────────────────────────────────────────
 
@@ -4422,7 +4678,13 @@ QueryResult query(sqlite3* db, const std::string& sql) {
         result.columns.push_back(name ? name : "");
     }
 
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+    while (true) {
+        int rc = sqlite3_step(stmt.get());
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            throw Error(ErrorCode::QueryFailed,
+                        std::string("query: ") + sqlite3_errmsg(db));
+        }
         std::vector<Value> row;
         row.reserve(static_cast<std::size_t>(ncols));
         for (int i = 0; i < ncols; ++i) {
@@ -4443,14 +4705,33 @@ namespace sqlpipe {
 struct Database::Impl {
     sqlite3*                    db = nullptr;
     bool                        owns_db = true;
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    PGconn*                     pg = nullptr;
+    bool                        owns_pg = false;
+#endif
+#endif
+    Engine                      engine = Engine::Sqlite;
     QueryWatch                  watch;
     std::map<SubscriptionId, SubscriptionCallback> callbacks;
     std::set<std::string>       dirty_tables;
 
     Impl(sqlite3* db_) : db(db_), watch(db_) {}
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    Impl(PGconn* conn, bool own)
+        : db(nullptr), owns_db(false), pg(conn), owns_pg(own),
+          engine(Engine::Postgres), watch(conn) {}
+#endif
+#endif
 
     ~Impl() {
         if (owns_db && db) sqlite3_close(db);
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+        if (owns_pg && pg) PQfinish(pg);
+#endif
+#endif
     }
 
     void unsubscribe(SubscriptionId id) {
@@ -4469,10 +4750,13 @@ struct Database::Impl {
 
     /// Transpile SQL through sqldeep. Returns the input unchanged if it
     /// contains no sqldeep syntax (sqldeep returns NULL on plain SQL).
-    static std::string transpile(const std::string& sql) {
+    static std::string transpile(const std::string& sql,
+                                Engine engine = Engine::Sqlite) {
         char* err_msg = nullptr;
         int err_line = 0, err_col = 0;
-        char* result = sqldeep_transpile(sql.c_str(),
+        auto backend = engine == Engine::Postgres ? SQLDEEP_POSTGRES
+                                                  : SQLDEEP_SQLITE;
+        char* result = sqldeep_transpile_backend(sql.c_str(), backend,
                                          &err_msg, &err_line, &err_col);
         if (result) {
             std::string out(result);
@@ -4657,12 +4941,156 @@ Database::Database(const std::string& path, const std::string& schema_ddl)
     detail::ensure_meta_table(db);
 }
 
+#ifndef EMSCRIPTEN
+Database Database::postgres(const std::string& conninfo,
+                            const std::string& schema_ddl) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+    PGconn* conn = PQconnectdb(conninfo.c_str());
+    if (!conn || PQstatus(conn) != CONNECTION_OK) {
+        std::string msg = conn ? PQerrorMessage(conn) : "out of memory";
+        if (conn) PQfinish(conn);
+        throw Error(ErrorCode::PostgresError,
+                    "failed to connect: " + msg);
+    }
+    Database db;
+    db.impl_ = std::make_shared<Impl>(conn, true);
+    {
+        PGresult* r = PQexec(conn, "SET search_path TO public");
+        if (PQresultStatus(r) != PGRES_COMMAND_OK) {
+            std::string msg = PQresultErrorMessage(r);
+            PQclear(r);
+            throw Error(ErrorCode::PostgresError,
+                        "SET search_path: " + msg);
+        }
+        PQclear(r);
+    }
+
+    if (!schema_ddl.empty()) {
+        sqlift_exec ex{
+            conn,
+            [](void* ctx, const char* sql, char** err_msg) -> int {
+                auto* c = static_cast<PGconn*>(ctx);
+                PGresult* r = PQexec(c, sql);
+                auto st = PQresultStatus(r);
+                if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK) {
+                    if (err_msg) *err_msg = strdup(PQresultErrorMessage(r));
+                    PQclear(r);
+                    return 1;
+                }
+                PQclear(r);
+                return 0;
+            },
+            [](void* ctx, const char* sql,
+               void (*row)(void*, int, const char* const*),
+               void* row_ctx, char** err_msg) -> int {
+                auto* c = static_cast<PGconn*>(ctx);
+                PGresult* r = PQexec(c, sql);
+                if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+                    if (err_msg) *err_msg = strdup(PQresultErrorMessage(r));
+                    PQclear(r);
+                    return 1;
+                }
+                int nt = PQntuples(r);
+                int nc = PQnfields(r);
+                std::vector<const char*> cols(static_cast<size_t>(nc));
+                for (int i = 0; i < nt; ++i) {
+                    for (int j = 0; j < nc; ++j)
+                        cols[static_cast<size_t>(j)] =
+                            PQgetisnull(r, i, j) ? nullptr : PQgetvalue(r, i, j);
+                    row(row_ctx, nc, cols.data());
+                }
+                PQclear(r);
+                return 0;
+            }
+        };
+        int err_type = 0;
+        char* err_msg = nullptr;
+        sqlift_db* sdb = sqlift_db_wrap_exec(SQLIFT_ENGINE_POSTGRES, ex,
+                                             &err_type, &err_msg);
+        if (!sdb) {
+            std::string msg = err_msg ? err_msg : "wrap_exec failed";
+            sqlift_free(err_msg);
+            throw Error(ErrorCode::PostgresError,
+                        "sqlift_db_wrap_exec: " + msg);
+        }
+        char* current_json = sqlift_extract(sdb, &err_type, &err_msg);
+        if (!current_json) {
+            std::string error = format_sqlift_failure(
+                "failed to extract current schema", err_type, err_msg);
+            sqlift_free(err_msg);
+            sqlift_db_close(sdb);
+            throw Error(ErrorCode::PostgresError, std::move(error));
+        }
+        char* desired_json = sqlift_parse_on(sdb, schema_ddl.c_str(),
+                                             &err_type, &err_msg);
+        if (!desired_json) {
+            std::string error = format_sqlift_failure(
+                "failed to parse schema DDL", err_type, err_msg);
+            sqlift_free(err_msg);
+            sqlift_free(current_json);
+            sqlift_db_close(sdb);
+            throw Error(ErrorCode::PostgresError, std::move(error));
+        }
+        char* plan_json = sqlift_diff(current_json, desired_json,
+                                      &err_type, &err_msg);
+        sqlift_free(current_json);
+        sqlift_free(desired_json);
+        if (!plan_json) {
+            std::string error = format_sqlift_failure(
+                "failed to diff schemas", err_type, err_msg);
+            sqlift_free(err_msg);
+            sqlift_db_close(sdb);
+            throw Error(ErrorCode::PostgresError, std::move(error));
+        }
+        int rc = sqlift_apply(sdb, plan_json,
+                              {.allow = SQLIFT_ALLOW_REBUILD},
+                              &err_type, &err_msg);
+        if (rc != 0) {
+            std::string error = format_sqlift_failure(
+                "failed to apply migration", err_type, err_msg, plan_json);
+            sqlift_free(err_msg);
+            sqlift_free(plan_json);
+            sqlift_db_close(sdb);
+            throw Error(ErrorCode::PostgresError, std::move(error));
+        }
+        sqlift_free(plan_json);
+        sqlift_db_close(sdb);
+    }
+    return db;
+#else
+    (void)conninfo;
+    (void)schema_ddl;
+    throw Error(ErrorCode::PostgresError,
+                "sqlpipe built without Postgres support (-DSQLPIPE_HAVE_POSTGRES)");
+#endif
+}
+#endif
+
 Database::~Database() = default;
 Database::Database(Database&&) noexcept = default;
 Database& Database::operator=(Database&&) noexcept = default;
 
 void Database::exec(const std::string& sql) {
-    auto tsql = Impl::transpile(sql);
+    auto tsql = Impl::transpile(sql, impl_->engine);
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->engine == Engine::Postgres) {
+        PGresult* r = PQexec(impl_->pg, tsql.c_str());
+        auto st = PQresultStatus(r);
+        if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK) {
+            std::string msg = PQresultErrorMessage(r);
+            PQclear(r);
+            throw Error(ErrorCode::PostgresError, msg);
+        }
+        PQclear(r);
+        if (!impl_->callbacks.empty()) {
+            auto results = impl_->watch.notify(std::set<std::string>{});
+            impl_->dispatch(results);
+        }
+        return;
+    }
+#endif
+#endif
     impl_->dirty_tables.clear();
     auto stmt = detail::prepare(impl_->db, tsql.c_str());
     detail::step_done(impl_->db, stmt.get());
@@ -4675,19 +5103,66 @@ void Database::exec(const std::string& sql) {
 }
 
 QueryResult Database::query(const std::string& sql) const {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->engine == Engine::Postgres) {
+        auto tsql = Impl::transpile(sql, Engine::Postgres);
+        PGresult* r = PQexec(impl_->pg, tsql.c_str());
+        if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+            std::string msg = PQresultErrorMessage(r);
+            PQclear(r);
+            throw Error(ErrorCode::PostgresError, msg);
+        }
+        QueryResult out;
+        int ncols = PQnfields(r);
+        for (int i = 0; i < ncols; ++i) {
+            const char* name = PQfname(r, i);
+            out.columns.push_back(name ? name : "");
+        }
+        int nt = PQntuples(r);
+        for (int i = 0; i < nt; ++i) {
+            std::vector<Value> row;
+            for (int j = 0; j < ncols; ++j) {
+                if (PQgetisnull(r, i, j))
+                    row.emplace_back(std::monostate{});
+                else
+                    row.emplace_back(std::string(PQgetvalue(r, i, j)));
+            }
+            out.rows.push_back(std::move(row));
+        }
+        PQclear(r);
+        return out;
+    }
+#endif
+#endif
     return sqlpipe::query(impl_->db, Impl::transpile(sql));
 }
 
 Subscription Database::subscribe(const std::string& sql,
                                   SubscriptionCallback cb) {
-    auto tsql = Impl::transpile(sql);
+    auto tsql = Impl::transpile(sql, impl_->engine);
     auto id = impl_->watch.subscribe(tsql);
     impl_->callbacks[id] = std::move(cb);
 
-    // Fire immediately with the initial result.
-    auto tables = detail::get_tracked_tables(impl_->db);
-    std::set<std::string> table_set(tables.begin(), tables.end());
-    auto results = impl_->watch.notify(table_set);
+    std::vector<QueryResult> results;
+    try {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+        if (impl_->engine == Engine::Postgres) {
+            results = impl_->watch.notify(std::set<std::string>{});
+        } else
+#endif
+#endif
+        {
+            // Fire immediately with the initial result.
+            auto tables = detail::get_tracked_tables(impl_->db);
+            std::set<std::string> table_set(tables.begin(), tables.end());
+            results = impl_->watch.notify(table_set);
+        }
+    } catch (...) {
+        impl_->unsubscribe(id);
+        throw;
+    }
     for (auto& r : results) {
         if (r.id == id) {
             impl_->callbacks[id](r);
@@ -4709,14 +5184,44 @@ void Database::notify(const std::set<std::string>& affected_tables) {
 
 void Database::notify() {
     if (impl_->callbacks.empty()) return;
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->engine == Engine::Postgres) {
+        notify(std::set<std::string>{});
+        return;
+    }
+#endif
+#endif
     auto tables = detail::get_tracked_tables(impl_->db);
     std::set<std::string> table_set(tables.begin(), tables.end());
     notify(table_set);
 }
 
+std::size_t Database::subscription_count() const {
+    return impl_->callbacks.size();
+}
+
 sqlite3* Database::handle() const {
     return impl_->db;
 }
+
+Engine Database::engine() const {
+    return impl_->engine;
+}
+
+sqlite3* Database::sqlite_handle() const {
+    return impl_->db;
+}
+
+#ifndef EMSCRIPTEN
+PGconn* Database::postgres_handle() const {
+#ifdef SQLPIPE_HAVE_POSTGRES
+    return impl_->pg;
+#else
+    return nullptr;
+#endif
+}
+#endif
 
 std::string Database::migration(const std::string& from_ddl,
                                 const std::string& to_ddl) {
@@ -4763,11 +5268,18 @@ std::string Database::migration(const std::string& from_ddl,
 namespace sqlpipe {
 
 struct Replica::Impl {
-    sqlite3*       db;
+    sqlite3*       db = nullptr;
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    std::unique_ptr<PgReplicaState> pg;
+#endif
+#endif
     ReplicaConfig  config;
     Seq            seq = 0;
     Replica::State state = Replica::State::Init;
     QueryWatch     watch;
+    /// Remote sequence last supplied by the master. Empty until known.
+    std::optional<Seq> observed_remote_seq;
 
     // Prediction state.
     enum class PredictionState : uint8_t { None, Drafting, Committed };
@@ -4778,6 +5290,15 @@ struct Replica::Impl {
 
     Impl(sqlite3* db_, ReplicaConfig cfg)
         : db(db_), config(std::move(cfg)), watch(db_) {}
+#ifndef EMSCRIPTEN
+#ifdef SQLPIPE_HAVE_POSTGRES
+    Impl(PGconn* conn, ReplicaConfig cfg)
+        : db(nullptr), config(cfg), watch(conn) {
+        pg = std::make_unique<PgReplicaState>(conn, std::move(cfg));
+        config = pg->config;
+    }
+#endif
+#endif
 
     const std::set<std::string>* filter() const {
         return config.table_filter ? &*config.table_filter : nullptr;
@@ -4809,6 +5330,20 @@ struct Replica::Impl {
                         std::to_string(seq + 1) + ", got " +
                         std::to_string(new_seq));
         }
+        // One transaction for the rows and the sequence. A failure rolls
+        // both back so a partial apply is not committed and the persisted
+        // sequence does not move past unapplied data.
+        detail::exec(db, "BEGIN");
+        bool committed = false;
+        struct TxGuard {
+            sqlite3* db;
+            bool* committed;
+            ~TxGuard() {
+                if (*committed) return;
+                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            }
+        } tx_guard{db, &committed};
+
         int rc = sqlite3changeset_apply(
             db,
             static_cast<int>(data.size()),
@@ -4850,8 +5385,13 @@ struct Replica::Impl {
 
         auto events = detail::collect_events(data);
 
+        // SQLPIPE_SEQ_AFTER_APPLY: persisted seq moves only with the
+        // committed rows, never before apply succeeds.
+        detail::write_seq(db, new_seq, config.seq_key);
+        detail::exec(db, "COMMIT");
+        committed = true;
         seq = new_seq;
-        detail::write_seq(db, seq, config.seq_key);
+        observed_remote_seq = new_seq;
         return events;
     }
 
@@ -4866,6 +5406,9 @@ struct Replica::Impl {
             return {{tagged(Message{ErrorMsg{ErrorCode::ProtocolError,
                 "unsupported protocol version"}})}, {}, {}};
         }
+
+        // -1 means the master did not report a sequence (unknown).
+        if (m.last_seq >= 0) observed_remote_seq = m.last_seq;
 
         // Fast reconnect: master confirmed seq match — skip to Live.
         if (m.last_seq > 0 && m.last_seq == seq) {
@@ -5055,12 +5598,14 @@ struct Replica::Impl {
             }
         }
 
-        // Update seq.
-        seq = m.seq;
-        detail::write_seq(db, seq, config.seq_key);
+        // Update seq inside the same transaction as the patch. The
+        // in-memory sequence moves only after COMMIT.
+        detail::write_seq(db, m.seq, config.seq_key);
 
         detail::exec(db, "COMMIT");
         committed = true;
+        seq = m.seq;
+        observed_remote_seq = m.seq;
 
         if (fk_was_on) {
             detail::exec(db, "PRAGMA foreign_keys = ON");
@@ -5075,6 +5620,19 @@ struct Replica::Impl {
 
 // ── Public API ──────────────────────────────────────────────────────
 
+#ifndef EMSCRIPTEN
+Replica::Replica(PGconn* conn, ReplicaConfig config) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+    impl_ = std::make_unique<Impl>(conn, std::move(config));
+#else
+    (void)conn;
+    (void)config;
+    throw Error(ErrorCode::PostgresError,
+                "sqlpipe built without Postgres support (-DSQLPIPE_HAVE_POSTGRES)");
+#endif
+}
+#endif
+
 Replica::Replica(sqlite3* db, ReplicaConfig config)
     : impl_(std::make_unique<Impl>(db, std::move(config))) {
     impl_->init();
@@ -5085,6 +5643,11 @@ Replica::Replica(Replica&&) noexcept = default;
 Replica& Replica::operator=(Replica&&) noexcept = default;
 
 OutMessage Replica::hello() const {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) return impl_->pg->hello();
+#endif
+#endif
     impl_->state = State::Handshake;
     const auto* f = impl_->config.table_filter
         ? &*impl_->config.table_filter : nullptr;
@@ -5094,6 +5657,11 @@ OutMessage Replica::hello() const {
 }
 
 std::vector<OutMessage> Replica::converge() {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) return impl_->pg->converge();
+#endif
+#endif
     // Compute bucket hashes and transition to DiffBuckets, waiting for
     // the master's NeedBuckets response. Can be called in any state.
     const auto* f = impl_->config.table_filter
@@ -5117,6 +5685,33 @@ std::vector<OutMessage> Replica::converge() {
 }
 
 HandleResult Replica::handle_message(const Message& msg) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) {
+        if (impl_->config.queue_while_predicting &&
+            impl_->prediction != Impl::PredictionState::None) {
+            impl_->prediction_queue.push_back(msg);
+            return {};
+        }
+        if (impl_->prediction == Impl::PredictionState::Committed) {
+            impl_->pg->rollback_prediction();
+            impl_->prediction = Impl::PredictionState::None;
+        }
+        auto result = impl_->pg->handle_message(msg);
+        impl_->state = impl_->pg->state;
+        impl_->seq = impl_->pg->seq;
+        if (impl_->state == State::Live && !impl_->watch.empty() &&
+            !result.changes.empty()) {
+            std::set<std::string> affected;
+            for (const auto& ev : result.changes) {
+                if (!ev.table.empty()) affected.insert(ev.table);
+            }
+            result.subscriptions = impl_->watch.notify(affected);
+        }
+        return result;
+    }
+#endif
+#endif
     // Optional: hold inbound truth while a prediction sandbox is open.
     if (impl_->config.queue_while_predicting &&
         impl_->prediction != Impl::PredictionState::None) {
@@ -5225,6 +5820,23 @@ HandleResult Replica::handle_message(const Message& msg) {
 }
 
 HandleResult Replica::handle_messages(std::span<const Message> msgs) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) {
+        HandleResult combined;
+        for (const auto& msg : msgs) {
+            auto r = handle_message(msg);
+            combined.messages.insert(combined.messages.end(),
+                r.messages.begin(), r.messages.end());
+            combined.changes.insert(combined.changes.end(),
+                r.changes.begin(), r.changes.end());
+            combined.subscriptions.insert(combined.subscriptions.end(),
+                r.subscriptions.begin(), r.subscriptions.end());
+        }
+        return combined;
+    }
+#endif
+#endif
     if (impl_->config.queue_while_predicting &&
         impl_->prediction != Impl::PredictionState::None) {
         impl_->prediction_queue.insert(impl_->prediction_queue.end(),
@@ -5335,6 +5947,19 @@ void Replica::unsubscribe(SubscriptionId id) {
 }
 
 void Replica::begin_prediction() {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) {
+        using PS = Impl::PredictionState;
+        if (impl_->prediction != PS::None) {
+            throw Error(ErrorCode::InvalidState, "prediction already active");
+        }
+        impl_->pg->begin_prediction();
+        impl_->prediction = PS::Drafting;
+        return;
+    }
+#endif
+#endif
     using PS = Impl::PredictionState;
     if (impl_->prediction != PS::None) {
         throw Error(ErrorCode::InvalidState,
@@ -5366,6 +5991,18 @@ HandleResult Replica::end_prediction() {
         throw Error(ErrorCode::InvalidState,
                     "no active prediction to end");
     }
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) {
+        impl_->pg->rollback_prediction();
+        impl_->prediction = PS::None;
+        if (impl_->prediction_queue.empty()) return {};
+        auto queued = std::move(impl_->prediction_queue);
+        impl_->prediction_queue.clear();
+        return handle_messages(queued);
+    }
+#endif
+#endif
     detail::exec(impl_->db, "ROLLBACK TO _sqlpipe_prediction");
     detail::exec(impl_->db, "RELEASE _sqlpipe_prediction");
     impl_->prediction = PS::None;
@@ -5397,6 +6034,22 @@ bool Replica::queues_while_predicting() const {
 }
 
 void Replica::reset() {
+    impl_->observed_remote_seq.reset();
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) {
+        if (impl_->prediction != Impl::PredictionState::None) {
+            impl_->pg->rollback_prediction();
+            impl_->prediction = Impl::PredictionState::None;
+        }
+        impl_->prediction_queue.clear();
+        impl_->pg->reset();
+        impl_->state = impl_->pg->state;
+        impl_->seq = impl_->pg->seq;
+        return;
+    }
+#endif
+#endif
     // Rollback any active prediction before resetting.
     if (impl_->prediction != Impl::PredictionState::None) {
         detail::exec(impl_->db, "ROLLBACK TO _sqlpipe_prediction");
@@ -5410,15 +6063,54 @@ void Replica::reset() {
     SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info, "replica reset to Init at seq={}", impl_->seq);
 }
 
-Seq Replica::current_seq() const { return impl_->seq; }
+Seq Replica::current_seq() const {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) return impl_->pg->seq;
+#endif
+#endif
+    return impl_->seq;
+}
+
+std::optional<Seq> Replica::observed_remote_seq() const {
+    return impl_->observed_remote_seq;
+}
+
+SyncStatus Replica::sync_status() const {
+    switch (state()) {
+    case State::Init: return SyncStatus::Unsynchronized;
+    case State::Handshake:
+    case State::DiffBuckets:
+    case State::DiffRows: return SyncStatus::Synchronizing;
+    case State::Live: return SyncStatus::Live;
+    case State::Error: return SyncStatus::Failed;
+    }
+    return SyncStatus::Failed;
+}
+
+std::size_t Replica::subscription_count() const {
+    return impl_->watch.subscription_count();
+}
 
 SchemaVersion Replica::schema_version() const {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) return impl_->pg->fingerprint();
+#endif
+#endif
     const auto* f = impl_->config.table_filter
         ? &*impl_->config.table_filter : nullptr;
     return detail::compute_schema_fingerprint(impl_->db, f);
 }
 
-Replica::State Replica::state() const { return impl_->state; }
+Replica::State Replica::state() const {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    if (impl_->pg) return impl_->pg->state;
+#endif
+#endif
+    return impl_->state;
+}
 
 } // namespace sqlpipe
 
@@ -5496,7 +6188,12 @@ PeerMessage deserialize_peer(std::span<const std::uint8_t> buf) {
 namespace sqlpipe {
 
 struct Peer::Impl {
-    sqlite3*    db;
+    sqlite3*    db = nullptr;
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+    PGconn*     pg = nullptr;
+#endif
+#endif
     PeerConfig  config;
     Peer::State state = Peer::State::Init;
 
@@ -5515,6 +6212,22 @@ struct Peer::Impl {
 
     /// Resolve owned_tables glob patterns against tracked tables in the db.
     std::set<std::string> resolve_owned_patterns() {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+        if (pg) {
+            auto all = pg_list_user_tables(
+                pg, config.table_filter ? &*config.table_filter : nullptr);
+            std::set<std::string> resolved;
+            for (const auto& pattern : config.owned_tables) {
+                for (const auto& table : all) {
+                    if (sqlite3_strglob(pattern.c_str(), table.c_str()) == 0)
+                        resolved.insert(table);
+                }
+            }
+            return resolved;
+        }
+#endif
+#endif
         auto all = detail::get_tracked_tables(db,
             config.table_filter ? &*config.table_filter : nullptr);
         std::set<std::string> resolved;
@@ -5535,6 +6248,14 @@ struct Peer::Impl {
         mc.on_progress = config.on_progress;
         mc.on_schema_mismatch = config.on_schema_mismatch;
         mc.on_log = config.on_log;
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+        if (pg) {
+            master = std::make_unique<Master>(pg, mc);
+            return;
+        }
+#endif
+#endif
         master = std::make_unique<Master>(db, mc);
     }
 
@@ -5546,6 +6267,14 @@ struct Peer::Impl {
         rc.on_progress = config.on_progress;
         rc.on_schema_mismatch = config.on_schema_mismatch;
         rc.on_log = config.on_log;
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+        if (pg) {
+            replica = std::make_unique<Replica>(pg, rc);
+            return;
+        }
+#endif
+#endif
         replica = std::make_unique<Replica>(db, rc);
     }
 
@@ -5565,6 +6294,13 @@ struct Peer::Impl {
             all.assign(config.table_filter->begin(),
                        config.table_filter->end());
         } else {
+#ifdef SQLPIPE_HAVE_POSTGRES
+#ifndef EMSCRIPTEN
+            if (pg) {
+                all = pg_list_user_tables(pg, nullptr);
+            } else
+#endif
+#endif
             all = detail::get_tracked_tables(db);
         }
         std::set<std::string> result;
@@ -5726,6 +6462,23 @@ struct Peer::Impl {
 
 // ── Peer public API ─────────────────────────────────────────────────
 
+#ifndef EMSCRIPTEN
+Peer::Peer(PGconn* conn, PeerConfig config)
+    : impl_(std::make_unique<Impl>()) {
+#ifdef SQLPIPE_HAVE_POSTGRES
+    impl_->pg = conn;
+    impl_->config = std::move(config);
+    SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info, "pg peer created ({})",
+                impl_->is_server() ? "server" : "client");
+#else
+    (void)conn;
+    (void)config;
+    throw Error(ErrorCode::PostgresError,
+                "sqlpipe built without Postgres support (-DSQLPIPE_HAVE_POSTGRES)");
+#endif
+}
+#endif
+
 Peer::Peer(sqlite3* db, PeerConfig config)
     : impl_(std::make_unique<Impl>()) {
     impl_->db = db;
@@ -5818,6 +6571,22 @@ void Peer::reset() {
 }
 
 Peer::State Peer::state() const { return impl_->state; }
+
+SyncStatus Peer::sync_status() const {
+    switch (impl_->state) {
+    case State::Init: return SyncStatus::Unsynchronized;
+    case State::Negotiating:
+    case State::Diffing: return SyncStatus::Synchronizing;
+    case State::Live: return SyncStatus::Live;
+    case State::Error: return SyncStatus::Failed;
+    }
+    return SyncStatus::Failed;
+}
+
+std::size_t Peer::subscription_count() const {
+    if (!impl_->replica) return 0;
+    return impl_->replica->subscription_count();
+}
 
 const std::set<std::string>& Peer::owned_tables() const {
     return impl_->my_tables;
@@ -5990,6 +6759,7 @@ void sync_handshake(Master& master, Relay& relay) {
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -6046,6 +6816,7 @@ class Database {
 public:
     explicit Database(const std::string& path,
                       int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+    explicit Database(sqlite3* borrowed);
     ~Database();
 
     Database(Database&& other) noexcept;
@@ -6060,6 +6831,7 @@ public:
 
 private:
     sqlite3* db_ = nullptr;
+    bool owns_ = true;
 };
 
 // RAII wrapper for sqlite3_stmt*.
@@ -6200,6 +6972,8 @@ struct Schema {
     std::map<std::string, View>          views;
     std::map<std::string, Trigger>       triggers;
     std::map<std::string, VirtualTable>  virtual_tables;
+    std::string dialect = "sqlite"; // "sqlite" | "postgres"
+    std::string schema_name;        // postgres search-path schema (v1: public)
 
     bool operator==(const Schema&) const = default;
 
@@ -6241,6 +7015,14 @@ enum class OpType {
     DropTrigger,
     CreateVirtualTable,
     DropVirtualTable,
+    DropColumn,
+    AlterColumnType,
+    SetNotNull,
+    DropNotNull,
+    SetDefault,
+    DropDefault,
+    AddConstraint,
+    DropConstraint,
 };
 
 struct Operation {
@@ -6292,6 +7074,12 @@ void apply(sqlite3* db, const MigrationPlan& plan, const ApplyOptions& opts = {}
 
 int64_t migration_version(sqlite3* db);
 
+Schema extract_exec(const sqlift_exec& ex, const std::string& schema_name);
+Schema parse_on_exec(const sqlift_exec& ex, const std::string& ddl);
+void apply_exec(const sqlift_exec& ex, const MigrationPlan& plan,
+                const ApplyOptions& opts);
+int64_t migration_version_exec(const sqlift_exec& ex);
+
 // --- json.h ---
 
 std::string to_string(OpType type);
@@ -6305,6 +7093,7 @@ Schema schema_from_json(const std::string& json_str);
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -6333,19 +7122,27 @@ Database::Database(const std::string& path, int flags) {
     }
 }
 
-Database::~Database() {
-    if (db_) sqlite3_close(db_);
+Database::Database(sqlite3* borrowed) : db_(borrowed), owns_(false) {
+    if (!db_) throw Error("sqlift_db_wrap_sqlite: null handle");
 }
 
-Database::Database(Database&& other) noexcept : db_(other.db_) {
+Database::~Database() {
+    if (owns_ && db_) sqlite3_close(db_);
+}
+
+Database::Database(Database&& other) noexcept
+    : db_(other.db_), owns_(other.owns_) {
     other.db_ = nullptr;
+    other.owns_ = false;
 }
 
 Database& Database::operator=(Database&& other) noexcept {
     if (this != &other) {
-        if (db_) sqlite3_close(db_);
+        if (owns_ && db_) sqlite3_close(db_);
         db_ = other.db_;
+        owns_ = other.owns_;
         other.db_ = nullptr;
+        other.owns_ = false;
     }
     return *this;
 }
@@ -6511,6 +7308,8 @@ std::string sha256(const std::string& input) {
 
 std::string Schema::hash() const {
     std::ostringstream oss;
+    if (dialect == "postgres")
+        oss << "DIALECT postgres\n";
 
     for (const auto& [name, table] : tables) {
         oss << "TABLE " << name << '\n';
@@ -6594,6 +7393,16 @@ std::string to_upper(const std::string& s) {
 }
 
 // Quote an identifier for use in SQL.
+std::string quote_lit(const std::string& s) {
+    std::string result = "'";
+    for (char c : s) {
+        if (c == '\'') result += "''";
+        else result += c;
+    }
+    result += "'";
+    return result;
+}
+
 std::string quote_id(const std::string& name) {
     // Use double quotes, escaping embedded double quotes.
     std::string result = "\"";
@@ -7325,6 +8134,250 @@ std::string add_column_sql(const std::string& table_name, const Column& col) {
     return oss.str();
 }
 
+bool schema_empty(const Schema& s) {
+    return s.tables.empty() && s.indexes.empty() && s.views.empty()
+        && s.triggers.empty() && s.virtual_tables.empty();
+}
+
+std::string create_table_sql_from_ir(const Table& table) {
+    if (!table.raw_sql.empty()) return table.raw_sql;
+    std::ostringstream oss;
+    oss << "CREATE TABLE " << quote_id(table.name) << " (";
+    for (size_t i = 0; i < table.columns.size(); ++i) {
+        if (i) oss << ", ";
+        const auto& col = table.columns[i];
+        oss << quote_id(col.name);
+        if (!col.type.empty()) oss << ' ' << col.type;
+        if (col.notnull) oss << " NOT NULL";
+        if (!col.default_value.empty()) oss << " DEFAULT " << col.default_value;
+    }
+    std::vector<std::string> pk;
+    for (const auto& col : table.columns)
+        if (col.pk > 0) pk.push_back(col.name);
+    if (!pk.empty()) {
+        oss << ", PRIMARY KEY (";
+        for (size_t i = 0; i < pk.size(); ++i) {
+            if (i) oss << ", ";
+            oss << quote_id(pk[i]);
+        }
+        oss << ")";
+    }
+    for (const auto& fk : table.foreign_keys) {
+        oss << ", ";
+        if (!fk.constraint_name.empty())
+            oss << "CONSTRAINT " << quote_id(fk.constraint_name) << ' ';
+        oss << "FOREIGN KEY (";
+        for (size_t i = 0; i < fk.from_columns.size(); ++i) {
+            if (i) oss << ", ";
+            oss << quote_id(fk.from_columns[i]);
+        }
+        oss << ") REFERENCES " << quote_id(fk.to_table) << " (";
+        for (size_t i = 0; i < fk.to_columns.size(); ++i) {
+            if (i) oss << ", ";
+            oss << quote_id(fk.to_columns[i]);
+        }
+        oss << ")";
+        if (!fk.on_update.empty() && fk.on_update != "NO ACTION")
+            oss << " ON UPDATE " << fk.on_update;
+        if (!fk.on_delete.empty() && fk.on_delete != "NO ACTION")
+            oss << " ON DELETE " << fk.on_delete;
+    }
+    for (const auto& chk : table.check_constraints) {
+        oss << ", ";
+        if (!chk.name.empty())
+            oss << "CONSTRAINT " << quote_id(chk.name) << ' ';
+        oss << "CHECK (" << chk.expression << ")";
+    }
+    oss << ")";
+    return oss.str();
+}
+
+std::vector<Operation> emit_pg_table_ops(const Table& current,
+                       const Table& desired,
+                       const std::vector<std::string>& violations) {
+    std::vector<Operation> ops;
+    const std::string& name = desired.name;
+    bool data_dependent = !violations.empty();
+    auto annotate = [&](std::string desc) {
+        if (!data_dependent) return desc;
+        desc += " [data-dependent:";
+        for (const auto& v : violations) desc += " " + v + ";";
+        desc += "]";
+        return desc;
+    };
+
+    std::map<std::string, const Column*> cur_cols, des_cols;
+    for (const auto& c : current.columns) cur_cols[c.name] = &c;
+    for (const auto& c : desired.columns) des_cols[c.name] = &c;
+
+    for (const auto& [cname, col] : cur_cols) {
+        if (des_cols.count(cname)) continue;
+        ops.push_back({
+            .type = OpType::DropColumn,
+            .object_name = name,
+            .description = annotate("Drop column " + cname + " from " + name),
+            .sql = {"ALTER TABLE " + quote_id(name) +
+                    " DROP COLUMN " + quote_id(cname)},
+            .destructive = true,
+        });
+    }
+
+    for (const auto& col : desired.columns) {
+        if (cur_cols.count(col.name)) continue;
+        bool dd = col.notnull && col.default_value.empty() && col.pk == 0;
+        ops.push_back({
+            .type = OpType::AddColumn,
+            .object_name = name,
+            .description = annotate("Add column " + col.name + " to " + name),
+            .sql = {add_column_sql(name, col)},
+            .data_dependent = dd || data_dependent,
+        });
+    }
+
+    for (const auto& col : desired.columns) {
+        auto it = cur_cols.find(col.name);
+        if (it == cur_cols.end()) continue;
+        const Column& cur = *it->second;
+        if (cur == col) continue;
+        if (cur.type != col.type) {
+            ops.push_back({
+                .type = OpType::AlterColumnType,
+                .object_name = name,
+                .description = annotate("Alter column " + col.name +
+                                        " type on " + name),
+                .sql = {"ALTER TABLE " + quote_id(name) + " ALTER COLUMN " +
+                        quote_id(col.name) + " TYPE " + col.type},
+                .requires_rebuild = true,
+            });
+        }
+        if (cur.notnull && !col.notnull) {
+            ops.push_back({
+                .type = OpType::DropNotNull,
+                .object_name = name,
+                .description = annotate("Drop NOT NULL on " + name + "." +
+                                        col.name),
+                .sql = {"ALTER TABLE " + quote_id(name) + " ALTER COLUMN " +
+                        quote_id(col.name) + " DROP NOT NULL"},
+                .loosens_only = true,
+            });
+        }
+        if (!cur.notnull && col.notnull) {
+            ops.push_back({
+                .type = OpType::SetNotNull,
+                .object_name = name,
+                .description = annotate("Set NOT NULL on " + name + "." +
+                                        col.name),
+                .sql = {"ALTER TABLE " + quote_id(name) + " ALTER COLUMN " +
+                        quote_id(col.name) + " SET NOT NULL"},
+                .data_dependent = true,
+            });
+        }
+        if (cur.default_value != col.default_value) {
+            if (col.default_value.empty()) {
+                ops.push_back({
+                    .type = OpType::DropDefault,
+                    .object_name = name,
+                    .description = annotate("Drop default on " + name + "." +
+                                            col.name),
+                    .sql = {"ALTER TABLE " + quote_id(name) + " ALTER COLUMN " +
+                            quote_id(col.name) + " DROP DEFAULT"},
+                });
+            } else {
+                ops.push_back({
+                    .type = OpType::SetDefault,
+                    .object_name = name,
+                    .description = annotate("Set default on " + name + "." +
+                                            col.name),
+                    .sql = {"ALTER TABLE " + quote_id(name) + " ALTER COLUMN " +
+                            quote_id(col.name) + " SET DEFAULT " +
+                            col.default_value},
+                });
+            }
+        }
+    }
+
+    for (const auto& fk : current.foreign_keys) {
+        bool found = false;
+        for (const auto& d : desired.foreign_keys)
+            if (d == fk) { found = true; break; }
+        if (found) continue;
+        std::string cname = fk.constraint_name.empty()
+            ? (name + "_" + fk.from_columns[0] + "_fkey")
+            : fk.constraint_name;
+        ops.push_back({
+            .type = OpType::DropConstraint,
+            .object_name = name,
+            .description = annotate("Drop foreign key on " + name),
+            .sql = {"ALTER TABLE " + quote_id(name) +
+                    " DROP CONSTRAINT " + quote_id(cname)},
+            .destructive = false,
+            .loosens_only = true,
+        });
+    }
+    for (const auto& fk : desired.foreign_keys) {
+        bool found = false;
+        for (const auto& c : current.foreign_keys)
+            if (c == fk) { found = true; break; }
+        if (found) continue;
+        std::ostringstream oss;
+        oss << "ALTER TABLE " << quote_id(name) << " ADD";
+        if (!fk.constraint_name.empty())
+            oss << " CONSTRAINT " << quote_id(fk.constraint_name);
+        oss << " FOREIGN KEY (";
+        for (size_t i = 0; i < fk.from_columns.size(); ++i) {
+            if (i) oss << ", ";
+            oss << quote_id(fk.from_columns[i]);
+        }
+        oss << ") REFERENCES " << quote_id(fk.to_table) << " (";
+        for (size_t i = 0; i < fk.to_columns.size(); ++i) {
+            if (i) oss << ", ";
+            oss << quote_id(fk.to_columns[i]);
+        }
+        oss << ")";
+        ops.push_back({
+            .type = OpType::AddConstraint,
+            .object_name = name,
+            .description = annotate("Add foreign key on " + name),
+            .sql = {oss.str()},
+            .data_dependent = true,
+        });
+    }
+
+    for (const auto& chk : current.check_constraints) {
+        bool found = false;
+        for (const auto& d : desired.check_constraints)
+            if (d == chk) { found = true; break; }
+        if (found || chk.name.empty()) continue;
+        ops.push_back({
+            .type = OpType::DropConstraint,
+            .object_name = name,
+            .description = annotate("Drop CHECK on " + name),
+            .sql = {"ALTER TABLE " + quote_id(name) +
+                    " DROP CONSTRAINT " + quote_id(chk.name)},
+            .loosens_only = true,
+        });
+    }
+    for (const auto& chk : desired.check_constraints) {
+        bool found = false;
+        for (const auto& c : current.check_constraints)
+            if (c == chk) { found = true; break; }
+        if (found) continue;
+        std::ostringstream oss;
+        oss << "ALTER TABLE " << quote_id(name) << " ADD";
+        if (!chk.name.empty())
+            oss << " CONSTRAINT " << quote_id(chk.name);
+        oss << " CHECK (" << chk.expression << ")";
+        ops.push_back({
+            .type = OpType::AddConstraint,
+            .object_name = name,
+            .description = annotate("Add CHECK on " + name),
+            .sql = {oss.str()},
+            .data_dependent = true,
+        });
+    }
+    return ops;
+}
+
 // Build the SQL for a 12-step table rebuild.
 std::vector<std::string> rebuild_table_sql(
     const Table& current, const Table& desired,
@@ -7533,6 +8586,14 @@ bool MigrationPlan::has_rebuild_operations() const {
 MigrationPlan diff(const Schema& current, const Schema& desired) {
     MigrationPlan plan;
 
+    if (current.dialect != desired.dialect &&
+        !schema_empty(current) && !schema_empty(desired)) {
+        throw DiffError("cannot diff " + current.dialect +
+                        " schema against " + desired.dialect + " schema");
+    }
+    const bool is_pg = current.dialect == "postgres" ||
+                       desired.dialect == "postgres";
+
     // Build known names for dependency analysis
     std::set<std::string> known_names;
     for (const auto& [n, _] : current.tables) known_names.insert(n);
@@ -7566,11 +8627,15 @@ MigrationPlan diff(const Schema& current, const Schema& desired) {
         }
         auto sorted = topo_sort(to_drop, deps, true);
         for (const auto& name : sorted) {
+            std::string drop_sql = "DROP TRIGGER IF EXISTS " + quote_id(name);
+            if (is_pg)
+                drop_sql += " ON " +
+                    quote_id(current.triggers.at(name).table_name);
             plan.ops_.push_back({
                 .type = OpType::DropTrigger,
                 .object_name = name,
                 .description = "Drop trigger " + name,
-                .sql = {"DROP TRIGGER IF EXISTS " + quote_id(name)},
+                .sql = {std::move(drop_sql)},
                 .destructive = drop_destructive[name],
             });
         }
@@ -7613,7 +8678,7 @@ MigrationPlan diff(const Schema& current, const Schema& desired) {
     for (const auto& [name, table] : desired.tables) {
         auto it = current.tables.find(name);
         if (it != current.tables.end() && !(it->second == table)) {
-            if (!is_append_only(it->second, table)) {
+            if (!is_pg && !is_append_only(it->second, table)) {
                 tables_to_rebuild.insert(name);
             }
         }
@@ -7652,7 +8717,7 @@ MigrationPlan diff(const Schema& current, const Schema& desired) {
                 .type = OpType::CreateTable,
                 .object_name = name,
                 .description = "Create table " + name,
-                .sql = {table.raw_sql},
+                .sql = {create_table_sql_from_ir(table)},
                 .destructive = false,
             });
         }
@@ -7758,6 +8823,14 @@ MigrationPlan diff(const Schema& current, const Schema& desired) {
                     .destructive = false,
                 });
             }
+        } else if (is_pg) {
+            auto vit = data_dependent_violations.find(name);
+            std::vector<std::string> violations;
+            if (vit != data_dependent_violations.end())
+                violations = vit->second;
+            for (auto& op : emit_pg_table_ops(current_table, desired_table,
+                                              violations))
+                plan.ops_.push_back(std::move(op));
         } else {
             // Full rebuild
             auto vit = data_dependent_violations.find(name);
@@ -8281,6 +9354,14 @@ constexpr OpTypeEntry op_type_names[] = {
     {OpType::DropTrigger,        "DropTrigger"},
     {OpType::CreateVirtualTable, "CreateVirtualTable"},
     {OpType::DropVirtualTable,   "DropVirtualTable"},
+    {OpType::DropColumn,         "DropColumn"},
+    {OpType::AlterColumnType,    "AlterColumnType"},
+    {OpType::SetNotNull,         "SetNotNull"},
+    {OpType::DropNotNull,        "DropNotNull"},
+    {OpType::SetDefault,         "SetDefault"},
+    {OpType::DropDefault,        "DropDefault"},
+    {OpType::AddConstraint,      "AddConstraint"},
+    {OpType::DropConstraint,     "DropConstraint"},
 };
 
 } // namespace
@@ -8430,6 +9511,15 @@ MigrationPlan from_json(const std::string& json_str) {
                 case OpType::DropTrigger:   expected_prefix = "DROP TRIGGER"; break;
                 case OpType::CreateVirtualTable: expected_prefix = "CREATE VIRTUAL TABLE"; break;
                 case OpType::DropVirtualTable:   expected_prefix = "DROP TABLE"; break;
+                case OpType::DropColumn:
+                case OpType::AlterColumnType:
+                case OpType::SetNotNull:
+                case OpType::DropNotNull:
+                case OpType::SetDefault:
+                case OpType::DropDefault:
+                case OpType::AddConstraint:
+                case OpType::DropConstraint:
+                    expected_prefix = "ALTER TABLE"; break;
             }
             if (!starts_with(first_sql, expected_prefix)) {
                 throw JsonError(
@@ -8467,6 +9557,10 @@ MigrationPlan from_json(const std::string& json_str) {
 
 std::string schema_to_json(const Schema& schema) {
     nlohmann::json j;
+    if (schema.dialect != "sqlite")
+        j["dialect"] = schema.dialect;
+    if (!schema.schema_name.empty())
+        j["schema"] = schema.schema_name;
 
     // Tables
     auto& jt = j["tables"];
@@ -8585,6 +9679,8 @@ Schema schema_from_json(const std::string& json_str) {
         throw JsonError("Expected top-level JSON object");
 
     Schema schema;
+    schema.dialect = j.value("dialect", "sqlite");
+    schema.schema_name = j.value("schema", "");
 
     // Tables
     if (j.contains("tables") && j["tables"].is_object()) {
@@ -8689,6 +9785,414 @@ Schema schema_from_json(const std::string& json_str) {
 }
 
 
+// --- postgres extract / apply / parse_on ---
+
+namespace {
+
+struct RowSink {
+    std::vector<std::vector<std::string>> rows;
+};
+
+void row_cb(void* ctx, int ncols, const char* const* cols) {
+    auto* sink = static_cast<RowSink*>(ctx);
+    std::vector<std::string> row;
+    row.reserve(static_cast<size_t>(ncols));
+    for (int i = 0; i < ncols; ++i)
+        row.emplace_back(cols[i] ? cols[i] : "");
+    sink->rows.push_back(std::move(row));
+}
+
+void exec_via(const sqlift_exec& ex, const std::string& sql) {
+    if (!ex.exec) throw Error("sqlift_exec.exec is null");
+    char* err = nullptr;
+    int rc = ex.exec(ex.ctx, sql.c_str(), &err);
+    if (rc != 0) {
+        std::string msg = err ? err : "exec failed";
+        std::free(err);
+        throw Error(msg + "; SQL: " + sql);
+    }
+}
+
+std::vector<std::vector<std::string>>
+query_via(const sqlift_exec& ex, const std::string& sql) {
+    if (!ex.query) throw Error("sqlift_exec.query is null");
+    RowSink sink;
+    char* err = nullptr;
+    int rc = ex.query(ex.ctx, sql.c_str(), row_cb, &sink, &err);
+    if (rc != 0) {
+        std::string msg = err ? err : "query failed";
+        std::free(err);
+        throw Error(msg + "; SQL: " + sql);
+    }
+    return sink.rows;
+}
+
+std::string normalize_pg_type(std::string t) {
+    t = trim(t);
+    std::string lower;
+    lower.reserve(t.size());
+    for (char c : t) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    if (lower == "int8") return "bigint";
+    if (lower == "int4" || lower == "int") return "integer";
+    if (lower == "int2") return "smallint";
+    if (lower == "float8") return "double precision";
+    if (lower == "float4") return "real";
+    if (lower == "bool") return "boolean";
+    if (lower == "timestamptz") return "timestamp with time zone";
+    if (lower == "timestamp") return "timestamp without time zone";
+    if (lower.rfind("character varying", 0) == 0) {
+        if (lower.size() == 17) return "varchar";
+        return "varchar" + t.substr(17);
+    }
+    if (lower.rfind("character(", 0) == 0 || lower.rfind("character (", 0) == 0)
+        return t;
+    return lower;
+}
+
+std::string strip_check_def(const std::string& def) {
+    // "CHECK (expr)" or "CONSTRAINT name CHECK (expr)"
+    auto pos = to_upper(def).find("CHECK");
+    if (pos == std::string::npos) return def;
+    auto open = def.find('(', pos);
+    if (open == std::string::npos) return def;
+    int depth = 0;
+    for (size_t i = open; i < def.size(); ++i) {
+        if (def[i] == '(') ++depth;
+        else if (def[i] == ')') {
+            --depth;
+            if (depth == 0)
+                return trim(def.substr(open + 1, i - open - 1));
+        }
+    }
+    return def;
+}
+
+} // namespace
+
+Schema extract_exec(const sqlift_exec& ex, const std::string& schema_name) {
+    Schema schema;
+    schema.dialect = "postgres";
+    schema.schema_name = schema_name.empty() ? "public" : schema_name;
+    const std::string nsp = quote_lit(schema.schema_name);
+
+    auto tables = query_via(ex,
+        "SELECT c.relname FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = " + nsp + " AND c.relkind = 'r' "
+        "AND c.relname <> '_sqlift_state' "
+        "ORDER BY c.relname");
+
+    for (const auto& tr : tables) {
+        if (tr.empty() || tr[0].empty()) continue;
+        Table table;
+        table.name = tr[0];
+        const std::string tlit = quote_lit(table.name);
+
+        auto cols = query_via(ex,
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), "
+            "a.attnotnull, "
+            "pg_get_expr(ad.adbin, ad.adrelid), "
+            "COALESCE((SELECT a2.attnum FROM pg_index i "
+            " JOIN pg_attribute a2 ON a2.attrelid = i.indrelid "
+            "  AND a2.attnum = ANY (i.indkey) "
+            " WHERE i.indrelid = c.oid AND i.indisprimary "
+            "  AND a2.attnum = a.attnum), 0) "
+            "FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_attribute a ON a.attrelid = c.oid "
+            "LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum "
+            "WHERE n.nspname = " + nsp + " AND c.relname = " + tlit + " "
+            "AND a.attnum > 0 AND NOT a.attisdropped "
+            "ORDER BY a.attnum");
+        int pk_ord = 0;
+        for (const auto& row : cols) {
+            Column col;
+            col.name = row[0];
+            col.type = normalize_pg_type(row[1]);
+            col.notnull = (row[2] == "t" || row[2] == "true" || row[2] == "1");
+            col.default_value = row.size() > 3 ? row[3] : "";
+            bool is_pk = row.size() > 4 && row[4] != "0" && !row[4].empty();
+            if (is_pk) col.pk = ++pk_ord;
+            table.columns.push_back(std::move(col));
+        }
+
+        auto fks = query_via(ex,
+            "SELECT con.conname, "
+            "pg_get_constraintdef(con.oid, true) "
+            "FROM pg_constraint con "
+            "JOIN pg_class c ON c.oid = con.conrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = " + nsp + " AND c.relname = " + tlit + " "
+            "AND con.contype = 'f' ORDER BY con.conname");
+        for (const auto& row : fks) {
+            ForeignKey fk;
+            fk.constraint_name = row[0];
+            // FOREIGN KEY (a, b) REFERENCES tbl(c, d) [ON DELETE ...] [ON UPDATE ...]
+            const std::string& def = row[1];
+            auto fk_pos = to_upper(def).find("FOREIGN KEY");
+            auto ref_pos = to_upper(def).find("REFERENCES");
+            if (fk_pos == std::string::npos || ref_pos == std::string::npos)
+                continue;
+            auto from_open = def.find('(', fk_pos);
+            auto from_close = def.find(')', from_open);
+            auto to_name_start = ref_pos + 10;
+            while (to_name_start < def.size() &&
+                   std::isspace(static_cast<unsigned char>(def[to_name_start])))
+                ++to_name_start;
+            auto to_open = def.find('(', to_name_start);
+            std::string to_table = trim(def.substr(to_name_start,
+                                                   to_open - to_name_start));
+            to_table = strip_quotes(to_table);
+            auto to_close = def.find(')', to_open);
+            auto split_cols = [](const std::string& inner) {
+                std::vector<std::string> out;
+                std::string cur;
+                for (char ch : inner) {
+                    if (ch == ',') {
+                        out.push_back(strip_quotes(trim(cur)));
+                        cur.clear();
+                    } else cur += ch;
+                }
+                if (!trim(cur).empty())
+                    out.push_back(strip_quotes(trim(cur)));
+                return out;
+            };
+            fk.from_columns = split_cols(def.substr(from_open + 1,
+                                                    from_close - from_open - 1));
+            fk.to_table = to_table;
+            fk.to_columns = split_cols(def.substr(to_open + 1,
+                                                  to_close - to_open - 1));
+            auto upd = to_upper(def).rfind("ON UPDATE ");
+            auto del = to_upper(def).rfind("ON DELETE ");
+            auto action = [&](size_t pos) {
+                if (pos == std::string::npos) return std::string("NO ACTION");
+                std::string rest = trim(def.substr(pos + 10));
+                if (to_upper(rest).rfind("CASCADE", 0) == 0) return std::string("CASCADE");
+                if (to_upper(rest).rfind("SET NULL", 0) == 0) return std::string("SET NULL");
+                if (to_upper(rest).rfind("SET DEFAULT", 0) == 0) return std::string("SET DEFAULT");
+                if (to_upper(rest).rfind("RESTRICT", 0) == 0) return std::string("RESTRICT");
+                return std::string("NO ACTION");
+            };
+            fk.on_update = action(upd);
+            fk.on_delete = action(del);
+            table.foreign_keys.push_back(std::move(fk));
+        }
+
+        auto checks = query_via(ex,
+            "SELECT con.conname, pg_get_constraintdef(con.oid, true) "
+            "FROM pg_constraint con "
+            "JOIN pg_class c ON c.oid = con.conrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = " + nsp + " AND c.relname = " + tlit + " "
+            "AND con.contype = 'c' ORDER BY con.conname");
+        for (const auto& row : checks) {
+            CheckConstraint chk;
+            chk.name = row[0];
+            chk.expression = strip_check_def(row[1]);
+            table.check_constraints.push_back(std::move(chk));
+        }
+
+        auto pkn = query_via(ex,
+            "SELECT con.conname FROM pg_constraint con "
+            "JOIN pg_class c ON c.oid = con.conrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = " + nsp + " AND c.relname = " + tlit + " "
+            "AND con.contype = 'p'");
+        if (!pkn.empty() && !pkn[0].empty())
+            table.pk_constraint_name = pkn[0][0];
+
+        table.raw_sql = create_table_sql_from_ir(table);
+        schema.tables[table.name] = std::move(table);
+    }
+
+    auto indexes = query_via(ex,
+        "SELECT i.relname, t.relname, ix.indisunique, "
+        "pg_get_indexdef(ix.indexrelid) "
+        "FROM pg_index ix "
+        "JOIN pg_class i ON i.oid = ix.indexrelid "
+        "JOIN pg_class t ON t.oid = ix.indrelid "
+        "JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "WHERE n.nspname = " + nsp + " "
+        "AND NOT ix.indisprimary "
+        "AND NOT EXISTS (SELECT 1 FROM pg_constraint co "
+        " WHERE co.conindid = ix.indexrelid) "
+        "ORDER BY i.relname");
+    for (const auto& row : indexes) {
+        Index idx;
+        idx.name = row[0];
+        idx.table_name = row[1];
+        idx.unique = (row[2] == "t" || row[2] == "true" || row[2] == "1");
+        idx.raw_sql = row[3];
+        auto cols = query_via(ex,
+            "SELECT a.attname FROM pg_index ix "
+            "JOIN pg_class i ON i.oid = ix.indexrelid "
+            "JOIN pg_attribute a ON a.attrelid = ix.indrelid "
+            " AND a.attnum = ANY (ix.indkey) "
+            "WHERE i.relname = " + quote_lit(idx.name) + " "
+            "ORDER BY array_position(ix.indkey, a.attnum)");
+        for (const auto& c : cols)
+            if (!c.empty()) idx.columns.push_back(c[0]);
+        auto upper = to_upper(idx.raw_sql);
+        auto w = upper.rfind(" WHERE ");
+        if (w != std::string::npos)
+            idx.where_clause = trim(idx.raw_sql.substr(w + 7));
+        schema.indexes[idx.name] = std::move(idx);
+    }
+
+    auto views = query_via(ex,
+        "SELECT c.relname, pg_get_viewdef(c.oid, true) "
+        "FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = " + nsp + " AND c.relkind = 'v' "
+        "ORDER BY c.relname");
+    for (const auto& row : views) {
+        View view;
+        view.name = row[0];
+        std::string def = trim(row[1]);
+        if (!def.empty() && def.back() == ';') def.pop_back();
+        view.sql = "CREATE VIEW " + quote_id(view.name) + " AS " + def;
+        schema.views[view.name] = std::move(view);
+    }
+
+    auto trigs = query_via(ex,
+        "SELECT t.tgname, c.relname, pg_get_triggerdef(t.oid, true) "
+        "FROM pg_trigger t "
+        "JOIN pg_class c ON c.oid = t.tgrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = " + nsp + " AND NOT t.tgisinternal "
+        "ORDER BY t.tgname");
+    for (const auto& row : trigs) {
+        Trigger trig;
+        trig.name = row[0];
+        trig.table_name = row[1];
+        trig.sql = row[2];
+        schema.triggers[trig.name] = std::move(trig);
+    }
+
+    return schema;
+}
+
+void apply_exec(const sqlift_exec& ex, const MigrationPlan& plan,
+                const ApplyOptions& opts) {
+    if (plan.empty()) return;
+
+    for (const auto& op : plan.operations()) {
+        if (op.requires_rebuild) {
+            bool rebuild_ok = opts.allow_rebuild ||
+                              (opts.allow_loosen && op.loosens_only);
+            if (!rebuild_ok) {
+                throw RebuildError(
+                    "Migration plan requires ALTER TYPE / rebuild for '" +
+                    op.object_name + "': " + op.description +
+                    ". Set SQLIFT_ALLOW_REBUILD in opts.allow to proceed.");
+            }
+        }
+        if (op.data_dependent && !opts.allow_data_dependent) {
+            throw BreakingChangeError(
+                "Migration plan contains data-dependent change on '" +
+                op.object_name + "': " + op.description +
+                ". Set SQLIFT_ALLOW_DATA_DEPENDENT in opts.allow to proceed "
+                "(success depends on existing data).");
+        }
+        if (op.destructive && !opts.allow_destructive) {
+            throw DestructiveError(
+                "Migration plan contains destructive operation on '" +
+                op.object_name + "': " + op.description +
+                ". Set SQLIFT_ALLOW_DESTRUCTIVE in opts.allow to proceed.");
+        }
+    }
+
+    Schema current = extract_exec(ex, "public");
+    std::string stored_hash;
+    try {
+        auto rows = query_via(ex,
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'sqlpipe' AND table_name = '_sqlift_state'");
+        if (!rows.empty()) {
+            auto hv = query_via(ex,
+                "SELECT value FROM sqlpipe._sqlift_state WHERE key = 'schema_hash'");
+            if (!hv.empty() && !hv[0].empty())
+                stored_hash = hv[0][0];
+        }
+    } catch (...) {
+        stored_hash.clear();
+    }
+    if (!stored_hash.empty()) {
+        std::string actual = current.hash();
+        if (stored_hash != actual) {
+            throw DriftError(
+                "Schema drift detected: the database schema has been modified "
+                "outside of sqlift. Stored hash: " + stored_hash +
+                ", actual hash: " + actual);
+        }
+    }
+
+    try {
+        exec_via(ex, "BEGIN");
+        for (const auto& op : plan.operations()) {
+            for (const auto& sql : op.sql) {
+                try {
+                    exec_via(ex, sql);
+                } catch (const std::exception& e) {
+                    throw ApplyError(
+                        std::string("Failed applying '") + op.object_name +
+                        "' (" + op.description + "): " + e.what() +
+                        "; SQL: " + sql);
+                }
+            }
+        }
+        exec_via(ex, "COMMIT");
+    } catch (...) {
+        try { exec_via(ex, "ROLLBACK"); } catch (...) {}
+        throw;
+    }
+
+    Schema after = extract_exec(ex, "public");
+    exec_via(ex, "CREATE SCHEMA IF NOT EXISTS sqlpipe");
+    exec_via(ex,
+        "CREATE TABLE IF NOT EXISTS sqlpipe._sqlift_state ("
+        "key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    exec_via(ex,
+        "INSERT INTO sqlpipe._sqlift_state (key, value) VALUES "
+        "('schema_hash', " + quote_lit(after.hash()) + ") "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value");
+    exec_via(ex,
+        "INSERT INTO sqlpipe._sqlift_state (key, value) "
+        "VALUES ('migration_version', '1') "
+        "ON CONFLICT (key) DO UPDATE SET "
+        "value = (EXCLUDED.value::integer + "
+        "sqlpipe._sqlift_state.value::integer)::text");
+}
+
+Schema parse_on_exec(const sqlift_exec& ex, const std::string& ddl) {
+    try {
+        exec_via(ex, "BEGIN");
+        exec_via(ex, "DROP SCHEMA IF EXISTS sqlift_parse_tmp CASCADE");
+        exec_via(ex, "CREATE SCHEMA sqlift_parse_tmp");
+        exec_via(ex, "SET LOCAL search_path TO sqlift_parse_tmp");
+        exec_via(ex, ddl);
+        Schema schema = extract_exec(ex, "sqlift_parse_tmp");
+        exec_via(ex, "DROP SCHEMA sqlift_parse_tmp CASCADE");
+        exec_via(ex, "COMMIT");
+        schema.schema_name = "public";
+        return schema;
+    } catch (...) {
+        try { exec_via(ex, "ROLLBACK"); } catch (...) {}
+        throw;
+    }
+}
+
+int64_t migration_version_exec(const sqlift_exec& ex) {
+    try {
+        auto rows = query_via(ex,
+            "SELECT value FROM sqlpipe._sqlift_state WHERE key = 'migration_version'");
+        if (rows.empty() || rows[0].empty()) return 0;
+        return std::stoll(rows[0][0]);
+    } catch (...) {
+        return 0;
+    }
+}
+
 } // namespace sqlift
 
 
@@ -8753,10 +10257,13 @@ std::string warnings_to_json(const std::vector<sqlift::Warning>& warnings) {
 // --- opaque handle -----------------------------------------------------------
 
 struct sqlift_db {
-    bool owns = true;
-    sqlift::Database db;
-    explicit sqlift_db(const std::string& path, int flags)
-        : db(path, flags ? flags : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)) {}
+    int engine = SQLIFT_ENGINE_SQLITE;
+    std::unique_ptr<sqlift::Database> sqlite;
+    sqlift_exec exec{};
+
+    sqlite3* sqlite_handle() const {
+        return sqlite ? sqlite->get() : nullptr;
+    }
 };
 
 // --- C API -------------------------------------------------------------------
@@ -8767,25 +10274,66 @@ sqlift_db* sqlift_db_open(const char* path, int flags,
                           int* err_type, char** err_msg) {
     sqlift_clear_error(err_type, err_msg);
     try {
-        return new sqlift_db(path, flags);
+        auto* h = new sqlift_db;
+        h->engine = SQLIFT_ENGINE_SQLITE;
+        h->sqlite = std::make_unique<sqlift::Database>(
+            path, flags ? flags : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE));
+        return h;
     } catch (const std::exception& e) {
         sqlift_set_error(err_type, err_msg, classify_exception(e), e.what());
         return nullptr;
     }
 }
 
-void sqlift_db_close(sqlift_db* db) {
-    if (!db->owns) { /* borrowed — null out handle so ~Database skips close */
-        sqlite3 *null = nullptr;
-        memcpy(static_cast<void*>(&db->db), &null, sizeof(sqlite3*));
+sqlift_db* sqlift_db_wrap_sqlite(sqlite3* handle,
+                                 int* err_type, char** err_msg) {
+    sqlift_clear_error(err_type, err_msg);
+    try {
+        auto* h = new sqlift_db;
+        h->engine = SQLIFT_ENGINE_SQLITE;
+        h->sqlite = std::make_unique<sqlift::Database>(handle);
+        return h;
+    } catch (const std::exception& e) {
+        sqlift_set_error(err_type, err_msg, classify_exception(e), e.what());
+        return nullptr;
     }
+}
+
+sqlift_db* sqlift_db_wrap_exec(int engine, sqlift_exec exec,
+                               int* err_type, char** err_msg) {
+    sqlift_clear_error(err_type, err_msg);
+    if (engine != SQLIFT_ENGINE_SQLITE && engine != SQLIFT_ENGINE_POSTGRES) {
+        sqlift_set_error(err_type, err_msg, SQLIFT_ERROR, "unknown sqlift_engine");
+        return nullptr;
+    }
+    if (!exec.exec || !exec.query) {
+        sqlift_set_error(err_type, err_msg, SQLIFT_ERROR,
+                  "sqlift_exec requires exec and query");
+        return nullptr;
+    }
+    auto* h = new sqlift_db;
+    h->engine = engine;
+    h->exec = exec;
+    return h;
+}
+
+void sqlift_db_close(sqlift_db* db) {
     delete db;
 }
 
 int sqlift_db_exec(sqlift_db* db, const char* sql, char** err_msg) {
     if (err_msg) *err_msg = nullptr;
     try {
-        db->db.exec(sql);
+        if (db->engine == SQLIFT_ENGINE_SQLITE) {
+            db->sqlite->exec(sql);
+        } else {
+            char* e = nullptr;
+            if (db->exec.exec(db->exec.ctx, sql, &e) != 0) {
+                if (err_msg) *err_msg = e;
+                else std::free(e);
+                return 1;
+            }
+        }
         return 0;
     } catch (const std::exception& e) {
         if (err_msg) *err_msg = sqlift_dup_str(e.what());
@@ -8807,7 +10355,26 @@ char* sqlift_parse(const char* ddl, int* err_type, char** err_msg) {
 char* sqlift_extract(sqlift_db* db, int* err_type, char** err_msg) {
     sqlift_clear_error(err_type, err_msg);
     try {
-        auto schema = sqlift::extract(db->db);
+        sqlift::Schema schema = (db->engine == SQLIFT_ENGINE_SQLITE)
+            ? sqlift::extract(db->sqlite_handle())
+            : sqlift::extract_exec(db->exec, "public");
+        return sqlift_dup_str(sqlift::schema_to_json(schema));
+    } catch (const std::exception& e) {
+        sqlift_set_error(err_type, err_msg, classify_exception(e), e.what());
+        return nullptr;
+    }
+}
+
+char* sqlift_parse_on(sqlift_db* db, const char* ddl,
+                      int* err_type, char** err_msg) {
+    sqlift_clear_error(err_type, err_msg);
+    try {
+        if (db->engine == SQLIFT_ENGINE_SQLITE) {
+            db->sqlite->exec(ddl);
+            auto schema = sqlift::extract(db->sqlite_handle());
+            return sqlift_dup_str(sqlift::schema_to_json(schema));
+        }
+        auto schema = sqlift::parse_on_exec(db->exec, ddl);
         return sqlift_dup_str(sqlift::schema_to_json(schema));
     } catch (const std::exception& e) {
         sqlift_set_error(err_type, err_msg, classify_exception(e), e.what());
@@ -8841,7 +10408,10 @@ int sqlift_apply(sqlift_db* db, const char* plan_json,
         opts.allow_rebuild = (c_opts.allow & SQLIFT_ALLOW_REBUILD) != 0;
         opts.allow_loosen = (c_opts.allow & SQLIFT_ALLOW_LOOSEN) != 0;
         opts.allow_data_dependent = (c_opts.allow & SQLIFT_ALLOW_DATA_DEPENDENT) != 0;
-        sqlift::apply(db->db, plan, opts);
+        if (db->engine == SQLIFT_ENGINE_SQLITE)
+            sqlift::apply(db->sqlite_handle(), plan, opts);
+        else
+            sqlift::apply_exec(db->exec, plan, opts);
         return 0;
     } catch (const std::exception& e) {
         sqlift_set_error(err_type, err_msg, classify_exception(e), e.what());
@@ -8852,7 +10422,9 @@ int sqlift_apply(sqlift_db* db, const char* plan_json,
 int64_t sqlift_migration_version(sqlift_db* db, int* err_type, char** err_msg) {
     sqlift_clear_error(err_type, err_msg);
     try {
-        return sqlift::migration_version(db->db);
+        if (db->engine == SQLIFT_ENGINE_SQLITE)
+            return sqlift::migration_version(db->sqlite_handle());
+        return sqlift::migration_version_exec(db->exec);
     } catch (const std::exception& e) {
         sqlift_set_error(err_type, err_msg, classify_exception(e), e.what());
         return -1;
@@ -8888,10 +10460,28 @@ int sqlift_db_query_int64(sqlift_db* db, const char* sql,
                           int64_t* result, char** err_msg) {
     if (err_msg) *err_msg = nullptr;
     try {
+        if (db->engine != SQLIFT_ENGINE_SQLITE) {
+            char* e = nullptr;
+            auto take = [](void* ctx, int ncols, const char* const* cols) {
+                auto* out = static_cast<std::pair<int64_t, bool>*>(ctx);
+                if (ncols > 0 && cols[0] && !out->second) {
+                    out->first = std::stoll(cols[0]);
+                    out->second = true;
+                }
+            };
+            std::pair<int64_t, bool> box{0, false};
+            if (db->exec.query(db->exec.ctx, sql, take, &box, &e) != 0) {
+                if (err_msg) *err_msg = e;
+                else std::free(e);
+                return 1;
+            }
+            if (result) *result = box.first;
+            return 0;
+        }
         sqlite3_stmt* stmt = nullptr;
-        int rc = sqlite3_prepare_v2(db->db.get(), sql, -1, &stmt, nullptr);
+        int rc = sqlite3_prepare_v2(db->sqlite_handle(), sql, -1, &stmt, nullptr);
         if (rc != SQLITE_OK) {
-            if (err_msg) *err_msg = sqlift_dup_str(sqlite3_errmsg(db->db.get()));
+            if (err_msg) *err_msg = sqlift_dup_str(sqlite3_errmsg(db->sqlite_handle()));
             return 1;
         }
         rc = sqlite3_step(stmt);
@@ -8906,7 +10496,7 @@ int sqlift_db_query_int64(sqlift_db* db, const char* sql,
             if (result) *result = 0;
             return 0;
         }
-        if (err_msg) *err_msg = sqlift_dup_str(sqlite3_errmsg(db->db.get()));
+        if (err_msg) *err_msg = sqlift_dup_str(sqlite3_errmsg(db->sqlite_handle()));
         return 1;
     } catch (const std::exception& e) {
         if (err_msg) *err_msg = sqlift_dup_str(e.what());
@@ -8917,10 +10507,25 @@ int sqlift_db_query_int64(sqlift_db* db, const char* sql,
 char* sqlift_db_query_text(sqlift_db* db, const char* sql, char** err_msg) {
     if (err_msg) *err_msg = nullptr;
     try {
+        if (db->engine != SQLIFT_ENGINE_SQLITE) {
+            char* e = nullptr;
+            std::string text;
+            auto take = [](void* ctx, int ncols, const char* const* cols) {
+                auto* out = static_cast<std::string*>(ctx);
+                if (out->empty() && ncols > 0 && cols[0])
+                    *out = cols[0];
+            };
+            if (db->exec.query(db->exec.ctx, sql, take, &text, &e) != 0) {
+                if (err_msg) *err_msg = e;
+                else std::free(e);
+                return nullptr;
+            }
+            return sqlift_dup_str(text);
+        }
         sqlite3_stmt* stmt = nullptr;
-        int rc = sqlite3_prepare_v2(db->db.get(), sql, -1, &stmt, nullptr);
+        int rc = sqlite3_prepare_v2(db->sqlite_handle(), sql, -1, &stmt, nullptr);
         if (rc != SQLITE_OK) {
-            if (err_msg) *err_msg = sqlift_dup_str(sqlite3_errmsg(db->db.get()));
+            if (err_msg) *err_msg = sqlift_dup_str(sqlite3_errmsg(db->sqlite_handle()));
             return nullptr;
         }
         rc = sqlite3_step(stmt);
@@ -8935,7 +10540,7 @@ char* sqlift_db_query_text(sqlift_db* db, const char* sql, char** err_msg) {
             // No rows -- return empty string.
             return sqlift_dup_str("");
         }
-        if (err_msg) *err_msg = sqlift_dup_str(sqlite3_errmsg(db->db.get()));
+        if (err_msg) *err_msg = sqlift_dup_str(sqlite3_errmsg(db->sqlite_handle()));
         return nullptr;
     } catch (const std::exception& e) {
         if (err_msg) *err_msg = sqlift_dup_str(e.what());
@@ -8950,18 +10555,10 @@ void sqlift_free(void* ptr) {
 } // extern "C"
 
 // ── sqlift_db_wrap (sqlpipe shim) ───────────────────────────────────
-// Wraps an existing sqlite3* for use with sqlift C API functions.
-// The handle is NOT owned — sqlift_db_close will not close it.
-// TODO: upstream to sqlift — the C API should accept sqlite3* directly.
+// Forwards to sqlift_db_wrap_sqlite (borrowed handle, not owned).
 
 extern "C" sqlift_db* sqlift_db_wrap(sqlite3* handle) {
-    auto* sdb = new sqlift_db(":memory:", 0);
-    // Close the dummy :memory: db and swap in the borrowed handle.
-    sqlite3_close(sdb->db.get());
-    sqlite3** pdb = reinterpret_cast<sqlite3**>(&sdb->db);
-    *pdb = handle;
-    sdb->owns = false;
-    return sdb;
+    return sqlift_db_wrap_sqlite(handle, nullptr, nullptr);
 }
 
 // ── sqldeep (query transpiler) ──────────────────────────────────

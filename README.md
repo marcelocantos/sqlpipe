@@ -195,7 +195,10 @@ example including handshake and change event handling.
 ```sh
 git clone --recurse-submodules https://github.com/marcelocantos/sqlpipe.git
 cd sqlpipe
-cv test     # build and run tests (146 test cases)
+make gate         # owner CI: ephemeral docker Postgres + cv test + go test
+make gate-linux   # optional: Ubuntu Docker
+make gate-windows # optional: Parallels VM
+cv test           # doctest only (SQLite always; live Postgres if PG* is set)
 cv example  # build and run the loopback demo
 cv wasm     # build Wasm module (requires emscripten)
 ```
@@ -515,6 +518,105 @@ peer.reset();              // preserves table ownership
 auto msgs = peer.start();  // re-initiate handshake
 ```
 
+## Recovery, health, and subscriptions
+
+sqlpipe already resynchronizes. These rules say what that does, and what it
+does not do. The fault suite in `tests/test_fault_suite.cpp` (`fault-suite:*`,
+run by `make gate`) drives the C++ `Master`, `Replica`, `Peer`, `Database`,
+and `QueryWatch` APIs on file-backed databases.
+
+### Three separations
+
+1. **Protocol resynchronization is sqlpipe's. Transport reconnection is the
+   caller's.** `Replica::hello`, `Replica::converge`, `Replica::reset`, and
+   `Peer::start` / `Peer::reset` are the resync API. sqlpipe does not open
+   sockets, retry authentication, or notice that a connection stalled. When
+   the transport reports disconnect or a stall, the caller reconnects and
+   calls `reset()` (then `hello()` / `converge()` / `start()`). `reset()` is
+   the library's unsynchronized state. There is no connection manager.
+2. **Replication progress is not source-data freshness.** `current_seq()` is
+   how far this database has applied the replication log. `SyncStatus::Live`
+   means the handshake finished, not that every committed row is present and
+   not that an upstream provider is up to date. Compare `current_seq()` with
+   the writer's sequence. `observed_remote_seq()` is `nullopt` until a Hello,
+   DiffReady, or applied changeset reports the other side (unknown, not zero).
+   A live socket with a lagging sequence is not healthy catch-up. sqlpipe does
+   not poll a provider and does not invalidate queries because time passed.
+3. **A subscription is the latest query result, not an event broker.**
+   Delivery may omit intermediate results. Consumers that need every
+   occurrence store immutable records in a table they own and replicate that
+   table. sqlpipe does not become an event-processing engine.
+
+### Health outcomes
+
+`Replica::sync_status()` / `Peer::sync_status()`:
+
+| `SyncStatus` | Meaning |
+|---|---|
+| `Unsynchronized` | Constructed, or `reset()` after the caller reports link loss |
+| `Synchronizing` | Handshake or diff in progress |
+| `Live` | Handshake complete. Not freshness |
+| `Failed` | Terminal protocol error (`State::Error`) |
+
+Query evaluation is a different axis. `ErrorCode::QueryFailed` is thrown for
+a subscription that fails to prepare or to evaluate. Nothing is published,
+and the last successful result hash is not advanced, so a later `notify` is
+not reported as "unchanged". Fix the SQL or the data and notify again; the
+next valid result is delivered. An empty `notify` result means the result
+set did not change.
+
+`Replica::subscribe` registrations survive `Replica::reset()`. They do not
+survive `Peer::reset()`, which destroys the internal replica. After
+`Peer::reset()`, call `start()` (or let `sync_handshake` do it) and
+`subscribe` again. There is no cached payload to repair by polling.
+
+Closing a `Database` drops its subscriptions. A `Subscription` destructor
+does not invoke the callback if the database is already gone.
+
+### Slow consumers
+
+`QueryWatch::notify`, `Database` callbacks, and `Replica::handle_message`
+evaluate synchronously (backpressure). The library keeps no queue of
+subscription payloads. `subscription_count()` is the registration count; it
+does not grow with writes. `prediction_queue_size()` is the separate
+prediction hold, and it is zero unless `queue_while_predicting` is set.
+
+`Replica::handle_messages` applies a burst and evaluates once, so
+intermediate results are omitted and the payload is the latest committed
+query result. Withholding messages in the caller's own transport buffer is
+the caller's bound, not a sqlpipe queue.
+
+### What the fault suite claims
+
+Claimed, on SQLite, through the C++ API: disconnect/reconnect (unchanged
+sequence and offline insert/update/delete), restart by reopening the
+persisted file in a new `Master` or `Replica`, interrupted diff and
+changeset apply (no partial commit, sequence not advanced), one-way
+blackhole visible as sequence lag and as `reset()` → `Unsynchronized`,
+loss of best-effort bucket hashes recovered by `converge()`, reliable
+changeset reorder rejected without applying, nested-subquery and
+scalar-subquery invalidation, query error and repair, slow-consumer
+coalescing, cancellation, database close, and explicit peer resubscribe.
+Expected rows come from a replay of the committed write log. Expected
+payloads come from a direct query.
+
+Not claimed, and not evidence:
+
+- Go `RunPeer` transport lifetime (T36), including any stalled-link policy
+  inside that runner. The Go `ErrorCode` integer matches `QueryFailed` (9)
+  but the Go, Swift, and Wasm wrappers are not in this suite.
+- Dual-channel ordering (T37). An ordered loopback does not prove it.
+- T39 and T40 on any surface other than C++ SQLite `QueryWatch`. This suite
+  does cover nested `IN (SELECT …)` and scalar-subquery invalidation, and
+  it does cover `QueryFailed` without a partial result or a moved result
+  hash. It does not cover T39's scalar override after a replication peer
+  is closed, and it does not cover one-shot `Query` outside `QueryWatch`.
+- Postgres fault injection. `make gate` still runs the existing live
+  Postgres tests; this suite does not.
+- Provider authentication, provider polling, or time-based invalidation.
+- A separate OS process per endpoint. Restart is a new `Master` / `Replica`
+  on the same file after the previous objects are destroyed.
+
 ## Error handling
 
 All operations may throw `sqlpipe::Error`, which carries an `ErrorCode` and a
@@ -537,6 +639,7 @@ try {
 | `InvalidState` | Operation not valid in current state | Bug in calling code |
 | `OwnershipRejected` | Peer ownership request rejected | Server's `approve_ownership` returned false |
 | `WithoutRowidTable` | Table uses `WITHOUT ROWID`, or its PK is not a single `INTEGER PRIMARY KEY` rowid alias | Use a rowid table with a single `INTEGER PRIMARY KEY` |
+| `QueryFailed` | Subscription SQL failed to prepare or evaluate. Not a wire `ErrorMsg` | Fix the SQL or the rows and notify again. An empty notify is not this error |
 
 ## Schema migration
 

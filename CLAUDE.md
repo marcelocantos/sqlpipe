@@ -1,5 +1,28 @@
 # sqlpipe
 
+release_shipping: gated-push
+
+## Delivery
+
+Owner ships to `master` by gated push (`make gate`, then
+`git push origin master`). Do not open an owner PR. Inbound PRs from
+others stay. After clone: `git config core.hooksPath scripts/hooks`.
+
+## Gates
+
+profile: library
+override:
+  - pr-workflow: skip
+  - ci-green: skip
+
+The owner gate is local `make gate` (ephemeral Docker Postgres +
+`cv test` + `go test` + Swift/Wasm when those toolchains are on PATH).
+`/release` runs that gate. There are no GitHub Actions workflows.
+`make gate-linux` (Docker Ubuntu) and `make gate-windows` (Parallels
+`hms-vm`) are optional extra OS checks; they are not part of `make gate`.
+`cv test` alone still runs the SQLite suite and skips live Postgres if
+`PG*` does not point at a server.
+
 ## Code Search
 
 Use Vera before opening many files or running broad text search when you need to find where logic lives or how a feature works.
@@ -19,7 +42,10 @@ Streaming replication protocol for SQLite. Two-file library: `dist/sqlpipe.h`
 ## Build
 
 ```sh
-cv test     # build and run all tests
+make gate         # owner CI: docker Postgres + cv test + go test (+ swift/wasm)
+make gate-linux   # optional: cv test + go test in Ubuntu Docker
+make gate-windows # optional: Parallels VM (not provisioned for C++/cv yet)
+cv test           # doctest only (SQLite always; Postgres if PG* is set)
 cv example  # build and run examples/loopback.cpp
 cv clean    # remove build/
 ```
@@ -245,6 +271,10 @@ Test cases across 8 files (all use doctest):
   already-in-sync, diff-then-live
 - `test_peer.cpp` — Peer handshake, ownership negotiation, bidirectional
   streaming, diff sync after reconnect, glob patterns
+- `test_postgres_sync.cpp` — live PG↔PG v8 loopback (fingerprint, live,
+  diff, Peer, Database). `make gate` starts an ephemeral `postgres:16`
+  container and points `PG*` at it. Bare `cv test` skips these cases
+  unless a server is already in the environment.
 
 Add new tests to the file matching the component under test.
 
