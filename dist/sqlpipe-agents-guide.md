@@ -355,7 +355,7 @@ for (auto& om : peer_msgs) {
 ### Go wrapper (`go/sqlpipe`)
 
 ```
-go get github.com/marcelocantos/sqlpipe/go/sqlpipe@v0.33.0
+go get github.com/marcelocantos/sqlpipe/go/sqlpipe@v0.34.0
 ```
 
 Self-contained CGo module (vendored SQLite with session/preupdate + FTS5).

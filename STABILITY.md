@@ -43,13 +43,13 @@ Eligible: 2026-10-06.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.33.0. Items annotated with stability assessments.
+Snapshot as of v0.34.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.33.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.34.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
 | `SQLPIPE_VERSION_MINOR` | `33` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
