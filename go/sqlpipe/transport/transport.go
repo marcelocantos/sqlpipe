@@ -38,16 +38,19 @@ const DefaultReConvergeInterval = 50 * time.Millisecond
 // Any stack with ordered reliable send/recv plus a datagram path
 // (QUIC, a test mock, etc.) can implement this.
 type Transport interface {
-	// Send writes data on the reliable ordered channel.
+	// Send writes data on the reliable ordered channel. It must honor ctx
+	// cancellation or otherwise return within a transport-defined bound.
 	Send(ctx context.Context, data []byte) error
 
-	// Recv reads the next message from the reliable channel.
+	// Recv reads the next message from the reliable channel. It must return
+	// promptly when ctx is cancelled so runners can join their receivers.
 	Recv(ctx context.Context) ([]byte, error)
 
-	// SendDatagram writes data on the unreliable channel.
+	// SendDatagram writes data on the unreliable channel. Sends must be bounded
+	// by the transport; this interface cannot interrupt an unbounded send.
 	SendDatagram(data []byte) error
 
-	// RecvDatagram reads the next datagram.
+	// RecvDatagram reads the next datagram and must return promptly on ctx cancellation.
 	RecvDatagram(ctx context.Context) ([]byte, error)
 }
 
@@ -56,40 +59,29 @@ type Transport interface {
 type Link struct {
 	t Transport
 
+	// OwnerLock optionally serializes RunPeer native calls with application DB
+	// access and subscription registration. It does not affect RunMaster or
+	// RunReplica. Configure before RunPeer, and use the same lock for every
+	// access to the peer and its database. PeerHandler runs outside this lock;
+	// native PeerConfig callbacks execute inside the native call and its lock.
+	OwnerLock sync.Locker
+
+	// OnPeerInitialized optionally runs once per RunPeer invocation, after the
+	// replica is initialized and before that step's messages are sent. It runs
+	// outside OwnerLock, so it may acquire that lock to Subscribe and query a
+	// local snapshot. That snapshot is not convergence evidence; subscriptions
+	// are reevaluated when the replica reaches Live, even without changes.
+	// Errors terminate the runner. The hook must not wait for link progress.
+	OnPeerInitialized func() error
+
+	// OnPeerUpdate runs under OwnerLock after each successful received message.
+	// Database watches may notify when state is Live, and defer otherwise.
+	// Errors terminate the link even for best-effort messages.
+	OnPeerUpdate func(sqlpipe.PeerState) error
+
 	// ReConvergeInterval controls how often the replica re-probes while
 	// not Live. Zero means DefaultReConvergeInterval.
 	ReConvergeInterval time.Duration
-
-	// mu serializes native peer calls made by RunPeer (stream, datagram,
-	// and flush). Callers share it around local writes and subscription
-	// registration. RunPeer handlers are called without mu held.
-	mu sync.Mutex
-}
-
-// Lock takes the owner lock shared with RunPeer.
-func (l *Link) Lock() { l.mu.Lock() }
-
-// Unlock releases the owner lock.
-func (l *Link) Unlock() { l.mu.Unlock() }
-
-// nativeEnter and nativeLeave bracket each native peer call inside RunPeer.
-// The default functions are empty. Tests replace them to observe overlap
-// on a single peer.
-var nativeEnter = func(*sqlpipe.Peer) {}
-var nativeLeave = func(*sqlpipe.Peer) {}
-
-// receiverExit runs at the end of each RunPeer goroutine, before the
-// runner's wait group is released.
-var receiverExit = func() {}
-
-func (l *Link) withNative(p *sqlpipe.Peer, fn func()) {
-	l.mu.Lock()
-	nativeEnter(p)
-	defer func() {
-		nativeLeave(p)
-		l.mu.Unlock()
-	}()
-	fn()
 }
 
 // NewLink creates a Link over the given Transport.
@@ -327,142 +319,163 @@ func (l *Link) RunReplica(ctx context.Context, r *sqlpipe.Replica, handler Repli
 type PeerHandler func(hr sqlpipe.PeerHandleResult) error
 
 // RunPeer runs a bidirectional peer replication protocol over the
-// transport. For client peers, it initiates the handshake. For server
+// transport. Pass a fresh or Reset peer; only Reset after the previous runner
+// has returned. Each new run invokes OnPeerInitialized again, allowing fresh
+// subscriptions after Reset. For client peers, it initiates the handshake. For server
 // peers, it waits for the client's hello.
 //
 // flushCh should emit whenever the peer has new local data to flush.
 // handler is called for each PeerHandleResult with changes or subscriptions.
-// Cancel ctx to stop the link.
+// Receive-channel errors terminate the link; malformed BestEffort payloads
+// are dropped. Handlers may acquire OwnerLock but must not wait for later
+// link progress.
+// Cancel ctx to stop the link. All receivers are joined before return, so
+// callers can then close the peer/database (under their owner lock).
 func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flushCh <-chan struct{}, handler PeerHandler) error {
-	runCtx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	lock := l.OwnerLock
+	if lock == nil {
+		lock = &sync.Mutex{}
+	}
 
-	if isClient {
-		var msgs []sqlpipe.PeerOutMessage
-		var err error
-		l.withNative(p, func() {
-			msgs, err = p.Start()
-		})
-		if err != nil {
-			return err
+	// Only receivers run concurrently. Native peer access and outgoing message
+	// ordering belong to this loop; local database users share OwnerLock.
+	type received struct {
+		data       []byte
+		bestEffort bool
+		err        error
+	}
+	incoming := make(chan received)
+	var receivers sync.WaitGroup
+	receive := func(bestEffort bool) {
+		defer receivers.Done()
+		for {
+			var data []byte
+			var err error
+			if bestEffort {
+				data, err = l.t.RecvDatagram(ctx)
+			} else {
+				data, err = l.t.Recv(ctx)
+			}
+			select {
+			case incoming <- received{data, bestEffort, err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
 		}
-		for _, pom := range msgs {
-			if err := l.sendPeer(runCtx, pom); err != nil {
+	}
+	receivers.Add(2)
+	go receive(false)
+	go receive(true)
+	defer func() { cancel(); receivers.Wait() }()
+
+	send := func(messages []sqlpipe.PeerOutMessage) error {
+		for _, message := range messages {
+			if err := l.sendPeer(ctx, message); err != nil {
 				return err
 			}
 		}
+		return nil
 	}
-
-	errc := make(chan error, 1)
-	var once sync.Once
-	fail := func(err error) {
-		once.Do(func() {
-			cancel()
-			errc <- err
-		})
-	}
-
-	dispatch := func(data []byte, bestEffort bool) {
-		msg, err := sqlpipe.DeserializePeer(data)
+	if isClient {
+		lock.Lock()
+		messages, err := p.Start()
+		lock.Unlock()
 		if err != nil {
-			if bestEffort {
-				return
-			}
-			fail(err)
-			return
+			return err
 		}
-		var hr sqlpipe.PeerHandleResult
-		l.withNative(p, func() {
-			hr, err = p.HandleMessage(msg)
-		})
-		if err != nil {
-			if bestEffort {
-				return
-			}
-			fail(err)
-			return
-		}
-		for _, pom := range hr.Messages {
-			if err := l.sendPeer(runCtx, pom); err != nil {
-				fail(err)
-				return
+		if l.OnPeerInitialized != nil {
+			if err := l.OnPeerInitialized(); err != nil {
+				return err
 			}
 		}
-		// Handler runs outside the owner lock so it can take that lock.
-		if handler != nil && (len(hr.Changes) > 0 || len(hr.Subscriptions) > 0) {
-			if err := handler(hr); err != nil {
-				fail(err)
-				return
-			}
+		if err := send(messages); err != nil {
+			return err
 		}
 	}
-
-	var wg sync.WaitGroup
-	wg.Add(3)
-
-	// Stream receiver. The exit hook is called through a closure so tests
-	// can replace receiverExit after the goroutines have started.
-	go func() {
-		defer wg.Done()
-		defer func() { receiverExit() }()
-		for {
-			data, err := l.t.Recv(runCtx)
-			if err != nil {
-				fail(err)
-				return
-			}
-			dispatch(data, false)
+	initialized := isClient
+	// A buffered flush may precede the handshake. Keep it until Live instead
+	// of consuming a wake whose Flush would return no changes yet.
+	pending := false
+	flush := func() error {
+		lock.Lock()
+		if !pending || p.State() != sqlpipe.PeerLive {
+			lock.Unlock()
+			return nil
 		}
-	}()
-
-	// Datagram receiver.
-	go func() {
-		defer wg.Done()
-		defer func() { receiverExit() }()
-		for {
-			data, err := l.t.RecvDatagram(runCtx)
-			if err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					fail(err)
-					return
-				}
-				continue
-			}
-			dispatch(data, true)
+		messages, err := p.Flush()
+		pending = false
+		lock.Unlock()
+		if err != nil {
+			return err
 		}
-	}()
-
-	// Flush forwarder.
-	go func() {
-		defer wg.Done()
-		defer func() { receiverExit() }()
-		for {
-			select {
-			case <-runCtx.Done():
-				fail(runCtx.Err())
-				return
-			case <-flushCh:
-				var msgs []sqlpipe.PeerOutMessage
-				var err error
-				l.withNative(p, func() {
-					msgs, err = p.Flush()
-				})
-				if err != nil {
-					fail(err)
-					return
+		return send(messages)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case _, ok := <-flushCh:
+			// A closed channel is a final flush request, not a permanently ready
+			// select case. Disable it after preserving that request.
+			pending = true
+			if !ok {
+				flushCh = nil
+			}
+		case event := <-incoming:
+			if event.err != nil {
+				return event.err
+			}
+			message, err := sqlpipe.DeserializePeer(event.data)
+			if err != nil {
+				if event.bestEffort {
+					continue
 				}
-				for _, pom := range msgs {
-					if err := l.sendPeer(runCtx, pom); err != nil {
-						fail(err)
-						return
+				return err
+			}
+			lock.Lock()
+			result, err := p.HandleMessage(message)
+			state := p.State()
+			var updateErr error
+			if err == nil && l.OnPeerUpdate != nil {
+				updateErr = l.OnPeerUpdate(state)
+			}
+			lock.Unlock()
+			// An application/database failure is never a droppable datagram.
+			if updateErr != nil {
+				return updateErr
+			}
+			if err != nil {
+				if event.bestEffort {
+					continue
+				}
+				return err
+			}
+			// An accepted server Hello creates the replica before Diffing/Live.
+			// A rejected Hello can return nil error with PeerError: never hook it.
+			if !initialized && (state == sqlpipe.PeerDiffing || state == sqlpipe.PeerLive) {
+				initialized = true
+				if l.OnPeerInitialized != nil {
+					if err := l.OnPeerInitialized(); err != nil {
+						return err
 					}
 				}
 			}
+			if err := send(result.Messages); err != nil {
+				return err
+			}
+			if handler != nil && (len(result.Changes) > 0 || len(result.Subscriptions) > 0) {
+				if err := handler(result); err != nil {
+					return err
+				}
+			}
 		}
-	}()
-
-	err := <-errc
-	cancel()
-	wg.Wait()
-	return err
+		if err := flush(); err != nil {
+			return err
+		}
+	}
 }

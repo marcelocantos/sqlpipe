@@ -43,15 +43,15 @@ Eligible: 2026-10-06.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.31.0. Items annotated with stability assessments.
+Snapshot as of v0.34.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.31.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.34.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `31` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `33` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 | `SQLDEEP_VERSION` | `"0.23.0"` | **Stable** (bundled) |
 | `SQLIFT_VERSION` | `"0.18.0"` | **Stable** (bundled) |
@@ -127,7 +127,7 @@ Snapshot as of v0.31.0. Items annotated with stability assessments.
 
 | Struct | Fields | Stability |
 |---|---|---|
-| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, on_flush, changeset_queue_size` | **Stable** |
+| `MasterConfig` | `table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, on_flush, changeset_queue_size, exclusive_replica` | **Stable** (`exclusive_replica` added for single-replica masters; Peer sets it) |
 | `ReplicaConfig` | `on_conflict, table_filter, seq_key, bucket_size, on_progress, on_schema_mismatch, on_log, queue_while_predicting` | **Stable** (`queue_while_predicting` added for prediction hold) |
 | `PeerConfig` | `role, owned_tables, table_filter, approve_ownership, on_conflict, on_progress, on_schema_mismatch, on_log` | **Stable** (owned_tables accepts glob patterns since v0.18.0) |
 | `RelayConfig` | `table_filter, on_conflict, on_schema_mismatch, on_log` | **Stable** |
@@ -162,8 +162,8 @@ class Master {
     Master& operator=(Master&&) noexcept;
 
     void exec(const std::string& sql);
-    std::vector<Message> flush();
-    std::vector<Message> handle_message(const Message& msg);
+    std::vector<OutMessage> flush();
+    std::vector<OutMessage> handle_message(const Message& msg);
     Seq current_seq() const;
     SchemaVersion schema_version() const;
 };
@@ -180,8 +180,8 @@ class Replica {
     Replica(Replica&&) noexcept;
     Replica& operator=(Replica&&) noexcept;
 
-    Message hello() const;
-    std::vector<Message> converge();
+    OutMessage hello() const;
+    std::vector<OutMessage> converge();
     HandleResult handle_message(const Message& msg);
     HandleResult handle_messages(std::span<const Message> msgs);
     SubscriptionId subscribe(const std::string& sql);
@@ -215,8 +215,8 @@ class Peer {
     Peer(Peer&&) noexcept;
     Peer& operator=(Peer&&) noexcept;
 
-    std::vector<PeerMessage> start();
-    std::vector<PeerMessage> flush();
+    std::vector<PeerOutMessage> start();
+    std::vector<PeerOutMessage> flush();
     PeerHandleResult handle_message(const PeerMessage& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
@@ -242,9 +242,9 @@ class Relay {
 
     std::size_t add_sink(SinkCallback cb);
     void remove_sink(std::size_t id);
-    Message hello();
-    std::vector<Message> handle_upstream(const Message& msg);
-    std::vector<Message> handle_downstream(const Message& msg);
+    OutMessage hello();
+    std::vector<OutMessage> handle_upstream(const Message& msg);
+    std::vector<OutMessage> handle_downstream(const Message& msg);
     SubscriptionId subscribe(const std::string& sql);
     void unsubscribe(SubscriptionId id);
     void reset();
@@ -376,6 +376,21 @@ initial delivery unchanged. Go `RunPeer` serializes native peer calls and
 joins its receivers before return; that runner has no stall timer. Swift,
 Wasm, Postgres fault injection, one-shot `Query`, provider auth, and a
 separate OS process per endpoint remain outside that evidence.
+
+## Language bindings (outside the C++ 1.0 contract)
+
+The catalogue above is `dist/sqlpipe.h`. Bindings are copies and FFI shims,
+not a second stability contract:
+
+| Surface | vs C++ HEAD |
+|---|---|
+| Go (`go/sqlpipe`) | C-API encodes HandleResult as `[u32 count][[serialized msg][u8 delivery]]…`. Go also has its own `Serialize`/`Deserialize`. Prediction is present. |
+| Swift (`swift/`) | SPM `CSqlpipe` + `Sqlpipe`. Prediction via `TruthReplica`. CI is `swift build` only — no in-package test target. |
+| Wasm/TS (`web/`) | **Reduced surface:** no prediction API (`begin_prediction` / `queue_while_predicting` are absent from `sqlpipe_wapi.cpp`). HandleResult encoding is `[u32 count][serialized msg]…` with **no** delivery byte (deliberate fork from the Go C-API). |
+| Relay | C++ only; no C ABI. |
+
+`scripts/bundle-deps.sh` copies `dist/sqlpipe.{h,cpp}` into Go and Swift.
+That copy is not a CI job.
 
 ## Gaps
 

@@ -290,6 +290,10 @@ func TestLinkMasterReplicaLossyDatagrams(t *testing.T) {
 // every later even probe, and still reach the inserted row.
 func TestLinkMasterReplicaDropEveryOtherDatagram(t *testing.T) {
 	mDB, rDB, master, replica := setupMasterReplica(t)
+	// Drop the first outbound datagram, then every 2nd. Without the first,
+	// a handshake whose opening converge probe gets through sees no loss
+	// at all, so the test would pass or fail on timing and never exercise
+	// recovery.
 	mTransport, rTransport := newLossyPair(1, 2)
 	mLink := transport.NewLink(mTransport)
 	rLink := transport.NewLink(rTransport)

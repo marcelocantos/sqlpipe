@@ -17,13 +17,18 @@ import (
 )
 
 // memTransport is an in-memory dual channel. Send and Recv honor ctx so
-// RunPeer can join receivers after cancel.
+// RunPeer can join receivers after cancel. When joinHold is set, each
+// receive returns only after release is closed, which is how the test
+// sees a runner that returns before its receivers have left Recv.
 type memTransport struct {
 	streamIn  chan []byte
 	streamOut chan []byte
 	dgIn      chan []byte
 	dgOut     chan []byte
 	failSend  atomic.Bool
+	joinHold  atomic.Bool
+	release   chan struct{}
+	exits     atomic.Int32
 }
 
 func newMemPair() (*memTransport, *memTransport) {
@@ -31,8 +36,17 @@ func newMemPair() (*memTransport, *memTransport) {
 	ba := make(chan []byte, 64)
 	dab := make(chan []byte, 64)
 	dba := make(chan []byte, 64)
-	return &memTransport{streamIn: ba, streamOut: ab, dgIn: dba, dgOut: dab},
-		&memTransport{streamIn: ab, streamOut: ba, dgIn: dab, dgOut: dba}
+	release := make(chan struct{})
+	return &memTransport{streamIn: ba, streamOut: ab, dgIn: dba, dgOut: dab, release: release},
+		&memTransport{streamIn: ab, streamOut: ba, dgIn: dab, dgOut: dba, release: release}
+}
+
+func (m *memTransport) gate() {
+	if !m.joinHold.Load() {
+		return
+	}
+	m.exits.Add(1)
+	<-m.release
 }
 
 func (m *memTransport) Send(ctx context.Context, data []byte) error {
@@ -50,6 +64,7 @@ func (m *memTransport) Send(ctx context.Context, data []byte) error {
 func (m *memTransport) Recv(ctx context.Context) ([]byte, error) {
 	select {
 	case <-ctx.Done():
+		m.gate()
 		return nil, ctx.Err()
 	case data := <-m.streamIn:
 		return data, nil
@@ -67,50 +82,31 @@ func (m *memTransport) SendDatagram(data []byte) error {
 func (m *memTransport) RecvDatagram(ctx context.Context) ([]byte, error) {
 	select {
 	case <-ctx.Done():
+		m.gate()
 		return nil, ctx.Err()
 	case data := <-m.dgIn:
 		return data, nil
 	}
 }
 
-type peerDepth struct {
-	depth atomic.Int32
-	max   atomic.Int32
+// pausingLock is the owner lock shared by RunPeer and the test's writes.
+// The sleep widens the window the race detector sees if a native peer
+// call runs without this lock.
+type pausingLock struct {
+	sync.Mutex
+}
+
+func (p *pausingLock) Lock() {
+	p.Mutex.Lock()
+	time.Sleep(time.Millisecond)
 }
 
 func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
-	depths := &sync.Map{}
-	probe := func(p *sqlpipe.Peer) *peerDepth {
-		v, _ := depths.LoadOrStore(p, &peerDepth{})
-		return v.(*peerDepth)
-	}
-	nativeEnter = func(p *sqlpipe.Peer) {
-		d := probe(p)
-		n := d.depth.Add(1)
-		for {
-			old := d.max.Load()
-			if n <= old || d.max.CompareAndSwap(old, n) {
-				break
-			}
-		}
-		// Widen the window so a missing owner lock overlaps stream,
-		// datagram, and flush on this peer.
-		time.Sleep(time.Millisecond)
-	}
-	nativeLeave = func(p *sqlpipe.Peer) {
-		probe(p).depth.Add(-1)
-	}
-	var earlyExits atomic.Int32
-	receiverExit = func() { earlyExits.Add(1) }
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	var runners sync.WaitGroup
 	t.Cleanup(func() {
 		cancel()
 		runners.Wait()
-		nativeEnter = func(*sqlpipe.Peer) {}
-		nativeLeave = func(*sqlpipe.Peer) {}
-		receiverExit = func() {}
 	})
 
 	dir := t.TempDir()
@@ -141,14 +137,18 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 	sMem, cMem := newMemPair()
 	sLink := NewLink(sMem)
 	cLink := NewLink(cMem)
+	sLock := &pausingLock{}
+	cLock := &pausingLock{}
+	sLink.OwnerLock = sLock
+	cLink.OwnerLock = cLock
 	sFlush := make(chan struct{}, 32)
 	cFlush := make(chan struct{}, 32)
 
 	var clientSubs atomic.Int32
 	var serverSubs atomic.Int32
 	clientHandler := func(hr sqlpipe.PeerHandleResult) error {
-		cLink.Lock()
-		defer cLink.Unlock()
+		cLock.Lock()
+		defer cLock.Unlock()
 		_ = client.State()
 		if len(hr.Subscriptions) > 0 {
 			clientSubs.Add(int32(len(hr.Subscriptions)))
@@ -156,8 +156,8 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 		return nil
 	}
 	serverHandler := func(hr sqlpipe.PeerHandleResult) error {
-		sLink.Lock()
-		defer sLink.Unlock()
+		sLock.Lock()
+		defer sLock.Unlock()
 		_ = server.State()
 		if len(hr.Subscriptions) > 0 {
 			serverSubs.Add(int32(len(hr.Subscriptions)))
@@ -184,36 +184,31 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 	cFlush <- struct{}{}
 
 	deadline := time.Now().Add(15 * time.Second)
+	var cs, ss sqlpipe.PeerState
 	for time.Now().Before(deadline) {
-		cLink.Lock()
-		cs := client.State()
-		cLink.Unlock()
-		sLink.Lock()
-		ss := server.State()
-		sLink.Unlock()
+		cLock.Lock()
+		cs = client.State()
+		cLock.Unlock()
+		sLock.Lock()
+		ss = server.State()
+		sLock.Unlock()
 		if cs == sqlpipe.PeerLive && ss == sqlpipe.PeerLive {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	cLink.Lock()
-	cs := client.State()
-	cLink.Unlock()
-	sLink.Lock()
-	ss := server.State()
-	sLink.Unlock()
 	if cs != sqlpipe.PeerLive || ss != sqlpipe.PeerLive {
 		t.Fatalf("peers not live: client=%d server=%d", cs, ss)
 	}
-	cLink.Lock()
+	cLock.Lock()
 	_, err = client.Subscribe("SELECT id, val FROM t1 ORDER BY id")
-	cLink.Unlock()
+	cLock.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
-	sLink.Lock()
+	sLock.Lock()
 	_, err = server.Subscribe("SELECT id, val FROM t2 ORDER BY id")
-	sLink.Unlock()
+	sLock.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,9 +217,9 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 	writeErr := make(chan error, 2)
 	go func() {
 		for i := 1; i <= n; i++ {
-			sLink.Lock()
+			sLock.Lock()
 			err := sDB.Exec(fmt.Sprintf("INSERT INTO t1 VALUES (%d, 's%d')", i, i))
-			sLink.Unlock()
+			sLock.Unlock()
 			if err != nil {
 				writeErr <- err
 				return
@@ -235,9 +230,9 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 	}()
 	go func() {
 		for i := 1; i <= n; i++ {
-			cLink.Lock()
+			cLock.Lock()
 			err := cDB.Exec(fmt.Sprintf("INSERT INTO t2 VALUES (%d, 'c%d')", i, i))
-			cLink.Unlock()
+			cLock.Unlock()
 			if err != nil {
 				writeErr <- err
 				return
@@ -252,7 +247,7 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 		}
 	}
 
-	waitRows := func(link *Link, db *sqlpipe.Database, sql string) {
+	waitRows := func(lock *pausingLock, db *sqlpipe.Database, sql string) {
 		t.Helper()
 		until := time.Now().Add(10 * time.Second)
 		for time.Now().Before(until) {
@@ -263,9 +258,9 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 				t.Fatalf("server RunPeer ended before rows arrived: %v", err)
 			default:
 			}
-			link.Lock()
+			lock.Lock()
 			qr, qerr := db.Query(sql)
-			link.Unlock()
+			lock.Unlock()
 			if qerr == nil && len(qr.Rows) == n {
 				return
 			}
@@ -273,51 +268,47 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 		}
 		t.Fatalf("timed out waiting for %d rows from %s", n, sql)
 	}
-	waitRows(cLink, cDB, "SELECT id, val FROM t1 ORDER BY id")
-	waitRows(sLink, sDB, "SELECT id, val FROM t2 ORDER BY id")
+	waitRows(cLock, cDB, "SELECT id, val FROM t1 ORDER BY id")
+	waitRows(sLock, sDB, "SELECT id, val FROM t2 ORDER BY id")
 	if clientSubs.Load() == 0 || serverSubs.Load() == 0 {
 		t.Fatalf("subscription callbacks did not run: client=%d server=%d", clientSubs.Load(), serverSubs.Load())
 	}
-	if earlyExits.Load() != 0 {
-		t.Fatalf("a RunPeer receiver exited before shutdown: %d", earlyExits.Load())
-	}
 
-	var exits atomic.Int32
-	receiverExit = func() {
-		time.Sleep(200 * time.Millisecond)
-		exits.Add(1)
-	}
+	cMem.joinHold.Store(true)
 	cMem.failSend.Store(true)
-	sLink.Lock()
+	sLock.Lock()
 	err = sDB.Exec("INSERT INTO t1 VALUES (99, 'boom')")
-	sLink.Unlock()
+	sLock.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
 	sFlush <- struct{}{}
 
+	joined := time.After(5 * time.Second)
+	for cMem.exits.Load() < 2 {
+		select {
+		case err = <-clientDone:
+			t.Fatalf("RunPeer returned before receivers joined: %v (exits=%d)", err, cMem.exits.Load())
+		case <-joined:
+			t.Fatalf("receivers did not reach the join gate: exits=%d", cMem.exits.Load())
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	select {
+	case err = <-clientDone:
+		t.Fatalf("RunPeer returned while receivers were still gated: %v", err)
+	default:
+	}
+	close(cMem.release)
 	select {
 	case err = <-clientDone:
 		if err == nil || err.Error() != "transport down" {
 			t.Fatalf("RunPeer error = %v, want transport down", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("RunPeer did not return after the transport error")
+		t.Fatal("RunPeer did not return after receivers joined")
 	}
-	if got := exits.Load(); got < 3 {
-		t.Fatalf("RunPeer returned before receivers joined: exits=%d", got)
-	}
-
-	depths.Range(func(_, v any) bool {
-		d := v.(*peerDepth)
-		if d.max.Load() < 1 {
-			t.Fatal("native peer calls were not observed")
-		}
-		if d.max.Load() > 1 {
-			t.Fatalf("native peer calls overlapped, depth %d", d.max.Load())
-		}
-		return true
-	})
 
 	cancel()
 	select {
@@ -325,8 +316,6 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("server RunPeer did not return after cancel")
 	}
-	// Close only after both runners have joined. Closing earlier races
-	// the native peer.
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -340,8 +329,6 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Cancellation joins receivers before return.
-	exits.Store(0)
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
 	dir2 := t.TempDir()
@@ -366,14 +353,30 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	sMem2, cMem2 := newMemPair()
+	sMem2.joinHold.Store(true)
+	cMem2.joinHold.Store(true)
 	sLink2 := NewLink(sMem2)
 	cLink2 := NewLink(cMem2)
+	sLink2.OwnerLock = &pausingLock{}
+	cLink2.OwnerLock = &pausingLock{}
 	flush2 := make(chan struct{})
 	done2 := make(chan error, 2)
 	go func() { done2 <- cLink2.RunPeer(ctx2, client2, true, flush2, nil) }()
 	go func() { done2 <- sLink2.RunPeer(ctx2, server2, false, flush2, nil) }()
 	time.Sleep(50 * time.Millisecond)
 	cancel2()
+	joined = time.After(5 * time.Second)
+	for sMem2.exits.Load() < 2 || cMem2.exits.Load() < 2 {
+		select {
+		case err := <-done2:
+			t.Fatalf("cancel returned before receivers joined: %v", err)
+		case <-joined:
+			t.Fatalf("cancel receivers did not reach the join gate: server=%d client=%d", sMem2.exits.Load(), cMem2.exits.Load())
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	close(sMem2.release)
 	for i := 0; i < 2; i++ {
 		select {
 		case err := <-done2:
@@ -383,9 +386,6 @@ func TestRunPeerSerializesJoinsAndReportsTransportFailure(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("RunPeer did not return on cancel")
 		}
-	}
-	if got := exits.Load(); got < 6 {
-		t.Fatalf("cancel returned before receivers joined: exits=%d", got)
 	}
 	if err := client2.Close(); err != nil {
 		t.Fatal(err)

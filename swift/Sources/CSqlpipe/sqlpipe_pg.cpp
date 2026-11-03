@@ -733,8 +733,8 @@ struct PgMasterState {
     struct Queued { Seq seq; Changeset data; };
     std::deque<Queued> changeset_queue;
 
-    explicit PgMasterState(PGconn* c, MasterConfig cfg)
-        : pg(c), config(std::move(cfg)) {
+    explicit PgMasterState(PGconn* c, const MasterConfig& cfg)
+        : pg(c), config(cfg) {
         pg_ensure_catalog(pg);
         seq = pg_read_seq(pg, config.seq_key);
         rescan();

@@ -2,4 +2,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Compile the sqlpipe C++ implementation as part of the Go package.
+// QueryWatch includes nested dependencies and preserves errors across retries.
 #include "internal/c/sqlpipe.cpp"
