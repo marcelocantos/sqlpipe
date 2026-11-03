@@ -78,7 +78,21 @@ lost and recovered by the next convergence round.
 - **Schema fingerprinting** via structural hashing (sqlift) to detect mismatches
 - **Single header + source** (`sqlpipe.h` / `sqlpipe.cpp`) for easy integration
 - **Convergence model** — the abstract convergence loop is specified in
-  [TLA+](formal/Convergence.tla). TLC is not run in CI.
+  [TLA+](formal/Convergence.tla). TLC is not run in the owner gate.
+
+## Optional Postgres backend
+
+Place `dist/sqlpipe_pg.cpp` beside `dist/sqlpipe.cpp` (which includes it), define
+`SQLPIPE_HAVE_POSTGRES`, and provide libpq headers and linkage. Use
+`Database::postgres(conninfo)` or pass a borrowed `PGconn*` to `Master`,
+`Replica`, or `Peer`. Postgres uses protocol v8; SQLite retains v7.
+SQLite-to-Postgres replication is not supported.
+
+The Go backend requires libpq discoverable through `pkg-config` and the
+`postgres` build tag. `OpenPostgres`, `NewMasterPG`, `NewReplicaPG`, and
+`NewPeerPG` operate on a libpq connection. This backend is experimental;
+Swift and Wasm do not expose it. `make gate` exercises live C++ Postgres
+replication, but the SQLite fault matrix does not cover Postgres.
 
 ## Language bindings
 
@@ -86,10 +100,10 @@ lost and recovered by the next convergence round.
 |---|---|---|---|
 | C++ | `dist/sqlpipe.h` + `dist/sqlpipe.cpp` | Copy two files (includes sqlpipe + sqlift + sqldeep) | Full API, including Relay and prediction |
 | Go | `go/sqlpipe/` | `go get github.com/marcelocantos/sqlpipe/go/sqlpipe` | C-API + a Go wire codec; prediction present |
-| Swift | `swift/` | SPM package (`CSqlpipe` + `Sqlpipe`) | Prediction via `TruthReplica`; CI is `swift build` only |
+| Swift | `swift/` | SPM package (`CSqlpipe` + `Sqlpipe`) | Prediction via `TruthReplica`; `make gate` runs `swift build` only |
 | TypeScript/Wasm | `web/` | `cv wasm` then `npx tsc` in `web/` | **Reduced:** no prediction API; HandleResult omits the delivery byte |
 
-`scripts/bundle-deps.sh` copies `dist/` into the Go and Swift trees. That copy is not a CI lockstep check. Relay has no C ABI.
+`scripts/bundle-deps.sh` copies `dist/` into the Go and Swift trees. That copy is not a gate lockstep check. Relay has no C ABI.
 
 ## Requirements
 
@@ -193,7 +207,7 @@ for (auto& om : msgs) {
 `BestEffort`). `serialize` / `handle_message` take the inner `Message`.
 Working in-process patterns live in `tests/test_integration.cpp` (the
 doctest suite is the shipped C++ path). `examples/loopback.cpp` is not
-kept in lockstep with `OutMessage` and is not built by CI.
+kept in lockstep with `OutMessage` and is not built by the owner gate.
 
 ## Building
 
@@ -208,7 +222,8 @@ cv wasm     # Wasm module (requires emscripten); reduced TS surface, see above
 `cv example` (`examples/loopback.cpp`) does not currently compile:
 `Master::flush()` returns `std::vector<OutMessage>`, while the example still
 passes that vector to a `deliver` that takes `const std::vector<Message>&`.
-CI runs `cv test`, Go tests, `swift build`, and Wasm+TS smoke — not
+`make gate` runs `cv test`, Go tests (including the live Postgres binding),
+`swift build`, and Wasm+TS smoke — not
 `cv example`.
 
 If you use an agentic coding tool (Claude Code, Cursor, Copilot, etc.), include
@@ -333,7 +348,7 @@ struct MasterConfig {
 
 class Master {
 public:
-    explicit Master(sqlite3* db, MasterConfig config = {});
+    explicit Master(sqlite3* db, const MasterConfig& config = {});
     void exec(const std::string& sql);                     // auto-flushes if on_flush set
     std::vector<OutMessage> flush();                       // manual flush
     std::vector<OutMessage> handle_message(const Message& msg);

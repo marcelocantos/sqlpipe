@@ -43,15 +43,15 @@ Eligible: 2026-10-06.
 
 ## Interaction surface catalogue
 
-Snapshot as of v0.34.0. Items annotated with stability assessments.
+Snapshot as of v0.35.0. Items annotated with stability assessments.
 
 ### Version macros
 
 | Macro | Value | Stability |
 |---|---|---|
-| `SQLPIPE_VERSION` | `"0.34.0"` | **Stable** |
+| `SQLPIPE_VERSION` | `"0.35.0"` | **Stable** |
 | `SQLPIPE_VERSION_MAJOR` | `0` | **Stable** |
-| `SQLPIPE_VERSION_MINOR` | `33` | **Stable** |
+| `SQLPIPE_VERSION_MINOR` | `35` | **Stable** |
 | `SQLPIPE_VERSION_PATCH` | `0` | **Stable** |
 | `SQLDEEP_VERSION` | `"0.23.0"` | **Stable** (bundled) |
 | `SQLIFT_VERSION` | `"0.18.0"` | **Stable** (bundled) |
@@ -156,7 +156,7 @@ class Error : public std::runtime_error {
 
 ```cpp
 class Master {
-    explicit Master(sqlite3* db, MasterConfig config = {});
+    explicit Master(sqlite3* db, const MasterConfig& config = {});
     ~Master();
     Master(Master&&) noexcept;
     Master& operator=(Master&&) noexcept;
@@ -385,12 +385,12 @@ not a second stability contract:
 | Surface | vs C++ HEAD |
 |---|---|
 | Go (`go/sqlpipe`) | C-API encodes HandleResult as `[u32 count][[serialized msg][u8 delivery]]…`. Go also has its own `Serialize`/`Deserialize`. Prediction is present. |
-| Swift (`swift/`) | SPM `CSqlpipe` + `Sqlpipe`. Prediction via `TruthReplica`. CI is `swift build` only — no in-package test target. |
+| Swift (`swift/`) | SPM `CSqlpipe` + `Sqlpipe`. Prediction via `TruthReplica`. the owner gate runs `swift build` only — no in-package test target. |
 | Wasm/TS (`web/`) | **Reduced surface:** no prediction API (`begin_prediction` / `queue_while_predicting` are absent from `sqlpipe_wapi.cpp`). HandleResult encoding is `[u32 count][serialized msg]…` with **no** delivery byte (deliberate fork from the Go C-API). |
 | Relay | C++ only; no C ABI. |
 
 `scripts/bundle-deps.sh` copies `dist/sqlpipe.{h,cpp}` into Go and Swift.
-That copy is not a CI job.
+That copy is not a gate lockstep check.
 
 ## Gaps
 

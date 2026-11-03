@@ -59,6 +59,11 @@ fi
 HOST_PORT=$(docker port "$NAME" 5432/tcp | head -1)
 HOST_PORT=${HOST_PORT##*:}
 
+# Match cv's existing libpq fallback for the optional Go binding.
+if ! pkg-config --exists libpq && [ -d /opt/homebrew/opt/libpq/lib/pkgconfig ]; then
+    export PKG_CONFIG_PATH="/opt/homebrew/opt/libpq/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+fi
+
 export PGHOST=127.0.0.1
 export PGPORT="$HOST_PORT"
 export PGUSER=postgres

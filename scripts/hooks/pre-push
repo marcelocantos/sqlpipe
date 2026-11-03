@@ -1,5 +1,24 @@
 #!/bin/sh
-# Pre-push: hermetic owner gate. Agents must not pass --no-verify.
+# Pre-push: verify the exact pushed tree passed the owner gate.
 set -e
 cd "$(git rev-parse --show-toplevel)"
-make gate
+attestation=$(git rev-parse --git-path gate-attestation)
+if [ ! -r "$attestation" ]; then
+    echo "Run make gate on a clean tree before pushing." >&2
+    exit 1
+fi
+read -r measured_tree dirty_count measured_at < "$attestation"
+if [ "$dirty_count" != 0 ] || [ -z "$measured_at" ]; then
+    echo "The gate did not attest a clean tree; commit and run make gate." >&2
+    exit 1
+fi
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$local_sha" in
+        *[!0]*) ;;
+        *) continue ;; # Deleting a ref has no tree to check.
+    esac
+    if [ "$(git rev-parse "$local_sha^{tree}")" != "$measured_tree" ]; then
+        echo "The pushed tree differs from the gate attestation; run make gate." >&2
+        exit 1
+    fi
+done

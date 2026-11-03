@@ -5,7 +5,7 @@
 .PHONY: gate gate-linux gate-windows bullseye cv-test go-test check-dirty
 
 gate:
-	./scripts/with-postgres.sh ./scripts/gate.sh
+	/bin/bash ./scripts/with-postgres.sh /bin/bash ./scripts/gate.sh
 
 gate-linux:
 	./scripts/gate-linux.sh

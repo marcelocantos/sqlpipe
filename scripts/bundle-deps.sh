@@ -49,6 +49,8 @@ else
     exit 1
 fi
 
+patch --batch --forward -p0 < vendor/patches/sqlift-postgres.patch
+
 # ── 1b. Sync sqlift C API block into dist/sqlpipe.h ─────────────
 # Mirrors version macros, error enum, allow flags, apply_options, and
 # function prototypes from vendor/include/sqlift.h so a submodule bump
@@ -253,6 +255,7 @@ if [ -d "$DEEPPARSER_SUB/src" ]; then
     # lp_lempar.c from compilation via Package.swift — it is a lemon template.)
     for dest in go/sqlpipe/internal/c/deepparser swift/Sources/CSqlpipe/deepparser; do
         mkdir -p "$dest"
+        cp "$DEEPPARSER_SUB/LICENSE" "$dest/LICENSE"
         for f in "${dp_files[@]}"; do
             cp "$DEEPPARSER_SUB/src/$f" "$dest/"
         done

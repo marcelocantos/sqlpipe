@@ -108,6 +108,34 @@ replica.reset();              // return to Init; subscriptions preserved
 - `queue_while_predicting` — `bool`, default `false`. See **Optimistic
   prediction** below.
 
+### Recovery, health, and query failure
+
+Reconnect the transport, call `reset()`, then `hello()` or `converge()`
+for a Replica, or `start()` for a Peer. Replica reset preserves query
+subscriptions. Peer reset destroys its internal Replica and subscriptions;
+subscribe again after `start()`.
+
+`Replica::sync_status()` and `Peer::sync_status()` return `SyncStatus`:
+`Unsynchronized`, `Synchronizing`, `Live`, or `Failed`. `Live` means the
+handshake completed, not that the data is fresh. Compare the Replica's
+`current_seq()` with the writer's sequence. `observed_remote_seq()` is
+unknown until a remote message supplies progress. The caller detects
+transport disconnects and stalls; the core has no timeout.
+
+`subscription_count()` reports active registrations on Database,
+QueryWatch, Replica, and Peer. Delivery is synchronous and may coalesce
+intermediate results into the latest state. QueryWatch evaluation errors
+throw `QueryFailed`, publish nothing, and preserve retry state. Repair the
+query/data and notify again; an empty result vector means unchanged.
+
+### Optional Postgres integration
+
+Place `sqlpipe_pg.cpp` beside `sqlpipe.cpp` (which includes it), define `SQLPIPE_HAVE_POSTGRES`, and supply libpq headers
+and linkage. Use `Database::postgres(conninfo)` or the `PGconn*` overloads.
+Postgres protocol v8 cannot replicate with SQLite protocol v7. The Go
+constructors require the `postgres` build tag and libpq via `pkg-config`.
+This experimental surface has no Swift or Wasm wrapper.
+
 ### Optimistic prediction (low-latency UI over server-owned truth)
 
 sqlpipe is dual uni-directional ownership: a client cannot master tables the
@@ -350,12 +378,13 @@ for (auto& om : peer_msgs) {
 ### Error codes
 
 `SqliteError`, `ProtocolError`, `SchemaMismatch`, `InvalidState`,
-`OwnershipRejected`, `WithoutRowidTable`.
+`OwnershipRejected`, `WithoutRowidTable`, `PostgresError`,
+`UnsupportedTable`, `QueryFailed`.
 
 ### Go wrapper (`go/sqlpipe`)
 
 ```
-go get github.com/marcelocantos/sqlpipe/go/sqlpipe@v0.34.0
+go get github.com/marcelocantos/sqlpipe/go/sqlpipe@v0.35.0
 ```
 
 Self-contained CGo module (vendored SQLite with session/preupdate + FTS5).
@@ -378,7 +407,7 @@ Also: `Master` / `Replica` / `Peer` with the same wire protocol as C++.
 Use `go/sqlpipe/vX.Y.0` path-prefixed tags (created alongside root tags).
 Go encodes HandleResult with a delivery byte; Wasm/TS does **not**, and
 Wasm has no prediction API (reduced surface). Swift `TruthReplica` wraps
-the C-API prediction symbols; CI is `swift build` only.
+the C-API prediction symbols; the owner gate runs `swift build` only.
 
 ## Gotchas
 

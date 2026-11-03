@@ -1,0 +1,1159 @@
+--- vendor/src/sqlift.cpp
++++ vendor/src/sqlift.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <cstdint>
+ #include <map>
++#include <memory>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+@@ -63,6 +64,7 @@
+ public:
+     explicit Database(const std::string& path,
+                       int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
++    explicit Database(sqlite3* borrowed);
+     ~Database();
+ 
+     Database(Database&& other) noexcept;
+@@ -77,6 +79,7 @@
+ 
+ private:
+     sqlite3* db_ = nullptr;
++    bool owns_ = true;
+ };
+ 
+ // RAII wrapper for sqlite3_stmt*.
+@@ -217,6 +220,8 @@
+     std::map<std::string, View>          views;
+     std::map<std::string, Trigger>       triggers;
+     std::map<std::string, VirtualTable>  virtual_tables;
++    std::string dialect = "sqlite"; // "sqlite" | "postgres"
++    std::string schema_name;        // postgres search-path schema (v1: public)
+ 
+     bool operator==(const Schema&) const = default;
+ 
+@@ -258,6 +263,14 @@
+     DropTrigger,
+     CreateVirtualTable,
+     DropVirtualTable,
++    DropColumn,
++    AlterColumnType,
++    SetNotNull,
++    DropNotNull,
++    SetDefault,
++    DropDefault,
++    AddConstraint,
++    DropConstraint,
+ };
+ 
+ struct Operation {
+@@ -309,6 +322,12 @@
+ 
+ int64_t migration_version(sqlite3* db);
+ 
++Schema extract_exec(const sqlift_exec& ex, const std::string& schema_name);
++Schema parse_on_exec(const sqlift_exec& ex, const std::string& ddl);
++void apply_exec(const sqlift_exec& ex, const MigrationPlan& plan,
++                const ApplyOptions& opts);
++int64_t migration_version_exec(const sqlift_exec& ex);
++
+ // --- json.h ---
+ 
+ std::string to_string(OpType type);
+@@ -322,6 +341,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cctype>
+ #include <cstdlib>
+ #include <cstring>
+ #include <iomanip>
+@@ -350,19 +370,27 @@
+     }
+ }
+ 
++Database::Database(sqlite3* borrowed) : db_(borrowed), owns_(false) {
++    if (!db_) throw Error("sqlift_db_wrap_sqlite: null handle");
++}
++
+ Database::~Database() {
+-    if (db_) sqlite3_close(db_);
+-}
+-
+-Database::Database(Database&& other) noexcept : db_(other.db_) {
++    if (owns_ && db_) sqlite3_close(db_);
++}
++
++Database::Database(Database&& other) noexcept
++    : db_(other.db_), owns_(other.owns_) {
+     other.db_ = nullptr;
++    other.owns_ = false;
+ }
+ 
+ Database& Database::operator=(Database&& other) noexcept {
+     if (this != &other) {
+-        if (db_) sqlite3_close(db_);
++        if (owns_ && db_) sqlite3_close(db_);
+         db_ = other.db_;
++        owns_ = other.owns_;
+         other.db_ = nullptr;
++        other.owns_ = false;
+     }
+     return *this;
+ }
+@@ -528,6 +556,8 @@
+ 
+ std::string Schema::hash() const {
+     std::ostringstream oss;
++    if (dialect == "postgres")
++        oss << "DIALECT postgres\n";
+ 
+     for (const auto& [name, table] : tables) {
+         oss << "TABLE " << name << '\n';
+@@ -611,6 +641,16 @@
+ }
+ 
+ // Quote an identifier for use in SQL.
++std::string quote_lit(const std::string& s) {
++    std::string result = "'";
++    for (char c : s) {
++        if (c == '\'') result += "''";
++        else result += c;
++    }
++    result += "'";
++    return result;
++}
++
+ std::string quote_id(const std::string& name) {
+     // Use double quotes, escaping embedded double quotes.
+     std::string result = "\"";
+@@ -1342,6 +1382,250 @@
+     return oss.str();
+ }
+ 
++bool schema_empty(const Schema& s) {
++    return s.tables.empty() && s.indexes.empty() && s.views.empty()
++        && s.triggers.empty() && s.virtual_tables.empty();
++}
++
++std::string create_table_sql_from_ir(const Table& table) {
++    if (!table.raw_sql.empty()) return table.raw_sql;
++    std::ostringstream oss;
++    oss << "CREATE TABLE " << quote_id(table.name) << " (";
++    for (size_t i = 0; i < table.columns.size(); ++i) {
++        if (i) oss << ", ";
++        const auto& col = table.columns[i];
++        oss << quote_id(col.name);
++        if (!col.type.empty()) oss << ' ' << col.type;
++        if (col.notnull) oss << " NOT NULL";
++        if (!col.default_value.empty()) oss << " DEFAULT " << col.default_value;
++    }
++    std::vector<std::string> pk;
++    for (const auto& col : table.columns)
++        if (col.pk > 0) pk.push_back(col.name);
++    if (!pk.empty()) {
++        oss << ", PRIMARY KEY (";
++        for (size_t i = 0; i < pk.size(); ++i) {
++            if (i) oss << ", ";
++            oss << quote_id(pk[i]);
++        }
++        oss << ")";
++    }
++    for (const auto& fk : table.foreign_keys) {
++        oss << ", ";
++        if (!fk.constraint_name.empty())
++            oss << "CONSTRAINT " << quote_id(fk.constraint_name) << ' ';
++        oss << "FOREIGN KEY (";
++        for (size_t i = 0; i < fk.from_columns.size(); ++i) {
++            if (i) oss << ", ";
++            oss << quote_id(fk.from_columns[i]);
++        }
++        oss << ") REFERENCES " << quote_id(fk.to_table) << " (";
++        for (size_t i = 0; i < fk.to_columns.size(); ++i) {
++            if (i) oss << ", ";
++            oss << quote_id(fk.to_columns[i]);
++        }
++        oss << ")";
++        if (!fk.on_update.empty() && fk.on_update != "NO ACTION")
++            oss << " ON UPDATE " << fk.on_update;
++        if (!fk.on_delete.empty() && fk.on_delete != "NO ACTION")
++            oss << " ON DELETE " << fk.on_delete;
++    }
++    for (const auto& chk : table.check_constraints) {
++        oss << ", ";
++        if (!chk.name.empty())
++            oss << "CONSTRAINT " << quote_id(chk.name) << ' ';
++        oss << "CHECK (" << chk.expression << ")";
++    }
++    oss << ")";
++    return oss.str();
++}
++
++std::vector<Operation> emit_pg_table_ops(const Table& current,
++                       const Table& desired,
++                       const std::vector<std::string>& violations) {
++    std::vector<Operation> ops;
++    const std::string& name = desired.name;
++    bool data_dependent = !violations.empty();
++    auto annotate = [&](std::string desc) {
++        if (!data_dependent) return desc;
++        desc += " [data-dependent:";
++        for (const auto& v : violations) desc += " " + v + ";";
++        desc += "]";
++        return desc;
++    };
++
++    std::map<std::string, const Column*> cur_cols, des_cols;
++    for (const auto& c : current.columns) cur_cols[c.name] = &c;
++    for (const auto& c : desired.columns) des_cols[c.name] = &c;
++
++    for (const auto& [cname, col] : cur_cols) {
++        if (des_cols.count(cname)) continue;
++        ops.push_back({
++            .type = OpType::DropColumn,
++            .object_name = name,
++            .description = annotate("Drop column " + cname + " from " + name),
++            .sql = {"ALTER TABLE " + quote_id(name) +
++                    " DROP COLUMN " + quote_id(cname)},
++            .destructive = true,
++        });
++    }
++
++    for (const auto& col : desired.columns) {
++        if (cur_cols.count(col.name)) continue;
++        bool dd = col.notnull && col.default_value.empty() && col.pk == 0;
++        ops.push_back({
++            .type = OpType::AddColumn,
++            .object_name = name,
++            .description = annotate("Add column " + col.name + " to " + name),
++            .sql = {add_column_sql(name, col)},
++            .data_dependent = dd || data_dependent,
++        });
++    }
++
++    for (const auto& col : desired.columns) {
++        auto it = cur_cols.find(col.name);
++        if (it == cur_cols.end()) continue;
++        const Column& cur = *it->second;
++        if (cur == col) continue;
++        if (cur.type != col.type) {
++            ops.push_back({
++                .type = OpType::AlterColumnType,
++                .object_name = name,
++                .description = annotate("Alter column " + col.name +
++                                        " type on " + name),
++                .sql = {"ALTER TABLE " + quote_id(name) + " ALTER COLUMN " +
++                        quote_id(col.name) + " TYPE " + col.type},
++                .requires_rebuild = true,
++            });
++        }
++        if (cur.notnull && !col.notnull) {
++            ops.push_back({
++                .type = OpType::DropNotNull,
++                .object_name = name,
++                .description = annotate("Drop NOT NULL on " + name + "." +
++                                        col.name),
++                .sql = {"ALTER TABLE " + quote_id(name) + " ALTER COLUMN " +
++                        quote_id(col.name) + " DROP NOT NULL"},
++                .loosens_only = true,
++            });
++        }
++        if (!cur.notnull && col.notnull) {
++            ops.push_back({
++                .type = OpType::SetNotNull,
++                .object_name = name,
++                .description = annotate("Set NOT NULL on " + name + "." +
++                                        col.name),
++                .sql = {"ALTER TABLE " + quote_id(name) + " ALTER COLUMN " +
++                        quote_id(col.name) + " SET NOT NULL"},
++                .data_dependent = true,
++            });
++        }
++        if (cur.default_value != col.default_value) {
++            if (col.default_value.empty()) {
++                ops.push_back({
++                    .type = OpType::DropDefault,
++                    .object_name = name,
++                    .description = annotate("Drop default on " + name + "." +
++                                            col.name),
++                    .sql = {"ALTER TABLE " + quote_id(name) + " ALTER COLUMN " +
++                            quote_id(col.name) + " DROP DEFAULT"},
++                });
++            } else {
++                ops.push_back({
++                    .type = OpType::SetDefault,
++                    .object_name = name,
++                    .description = annotate("Set default on " + name + "." +
++                                            col.name),
++                    .sql = {"ALTER TABLE " + quote_id(name) + " ALTER COLUMN " +
++                            quote_id(col.name) + " SET DEFAULT " +
++                            col.default_value},
++                });
++            }
++        }
++    }
++
++    for (const auto& fk : current.foreign_keys) {
++        bool found = false;
++        for (const auto& d : desired.foreign_keys)
++            if (d == fk) { found = true; break; }
++        if (found) continue;
++        std::string cname = fk.constraint_name.empty()
++            ? (name + "_" + fk.from_columns[0] + "_fkey")
++            : fk.constraint_name;
++        ops.push_back({
++            .type = OpType::DropConstraint,
++            .object_name = name,
++            .description = annotate("Drop foreign key on " + name),
++            .sql = {"ALTER TABLE " + quote_id(name) +
++                    " DROP CONSTRAINT " + quote_id(cname)},
++            .destructive = false,
++            .loosens_only = true,
++        });
++    }
++    for (const auto& fk : desired.foreign_keys) {
++        bool found = false;
++        for (const auto& c : current.foreign_keys)
++            if (c == fk) { found = true; break; }
++        if (found) continue;
++        std::ostringstream oss;
++        oss << "ALTER TABLE " << quote_id(name) << " ADD";
++        if (!fk.constraint_name.empty())
++            oss << " CONSTRAINT " << quote_id(fk.constraint_name);
++        oss << " FOREIGN KEY (";
++        for (size_t i = 0; i < fk.from_columns.size(); ++i) {
++            if (i) oss << ", ";
++            oss << quote_id(fk.from_columns[i]);
++        }
++        oss << ") REFERENCES " << quote_id(fk.to_table) << " (";
++        for (size_t i = 0; i < fk.to_columns.size(); ++i) {
++            if (i) oss << ", ";
++            oss << quote_id(fk.to_columns[i]);
++        }
++        oss << ")";
++        ops.push_back({
++            .type = OpType::AddConstraint,
++            .object_name = name,
++            .description = annotate("Add foreign key on " + name),
++            .sql = {oss.str()},
++            .data_dependent = true,
++        });
++    }
++
++    for (const auto& chk : current.check_constraints) {
++        bool found = false;
++        for (const auto& d : desired.check_constraints)
++            if (d == chk) { found = true; break; }
++        if (found || chk.name.empty()) continue;
++        ops.push_back({
++            .type = OpType::DropConstraint,
++            .object_name = name,
++            .description = annotate("Drop CHECK on " + name),
++            .sql = {"ALTER TABLE " + quote_id(name) +
++                    " DROP CONSTRAINT " + quote_id(chk.name)},
++            .loosens_only = true,
++        });
++    }
++    for (const auto& chk : desired.check_constraints) {
++        bool found = false;
++        for (const auto& c : current.check_constraints)
++            if (c == chk) { found = true; break; }
++        if (found) continue;
++        std::ostringstream oss;
++        oss << "ALTER TABLE " << quote_id(name) << " ADD";
++        if (!chk.name.empty())
++            oss << " CONSTRAINT " << quote_id(chk.name);
++        oss << " CHECK (" << chk.expression << ")";
++        ops.push_back({
++            .type = OpType::AddConstraint,
++            .object_name = name,
++            .description = annotate("Add CHECK on " + name),
++            .sql = {oss.str()},
++            .data_dependent = true,
++        });
++    }
++    return ops;
++}
++
+ // Build the SQL for a 12-step table rebuild.
+ std::vector<std::string> rebuild_table_sql(
+     const Table& current, const Table& desired,
+@@ -1550,6 +1834,14 @@
+ MigrationPlan diff(const Schema& current, const Schema& desired) {
+     MigrationPlan plan;
+ 
++    if (current.dialect != desired.dialect &&
++        !schema_empty(current) && !schema_empty(desired)) {
++        throw DiffError("cannot diff " + current.dialect +
++                        " schema against " + desired.dialect + " schema");
++    }
++    const bool is_pg = current.dialect == "postgres" ||
++                       desired.dialect == "postgres";
++
+     // Build known names for dependency analysis
+     std::set<std::string> known_names;
+     for (const auto& [n, _] : current.tables) known_names.insert(n);
+@@ -1583,11 +1875,15 @@
+         }
+         auto sorted = topo_sort(to_drop, deps, true);
+         for (const auto& name : sorted) {
++            std::string drop_sql = "DROP TRIGGER IF EXISTS " + quote_id(name);
++            if (is_pg)
++                drop_sql += " ON " +
++                    quote_id(current.triggers.at(name).table_name);
+             plan.ops_.push_back({
+                 .type = OpType::DropTrigger,
+                 .object_name = name,
+                 .description = "Drop trigger " + name,
+-                .sql = {"DROP TRIGGER IF EXISTS " + quote_id(name)},
++                .sql = {std::move(drop_sql)},
+                 .destructive = drop_destructive[name],
+             });
+         }
+@@ -1630,7 +1926,7 @@
+     for (const auto& [name, table] : desired.tables) {
+         auto it = current.tables.find(name);
+         if (it != current.tables.end() && !(it->second == table)) {
+-            if (!is_append_only(it->second, table)) {
++            if (!is_pg && !is_append_only(it->second, table)) {
+                 tables_to_rebuild.insert(name);
+             }
+         }
+@@ -1669,7 +1965,7 @@
+                 .type = OpType::CreateTable,
+                 .object_name = name,
+                 .description = "Create table " + name,
+-                .sql = {table.raw_sql},
++                .sql = {create_table_sql_from_ir(table)},
+                 .destructive = false,
+             });
+         }
+@@ -1775,6 +2071,14 @@
+                     .destructive = false,
+                 });
+             }
++        } else if (is_pg) {
++            auto vit = data_dependent_violations.find(name);
++            std::vector<std::string> violations;
++            if (vit != data_dependent_violations.end())
++                violations = vit->second;
++            for (auto& op : emit_pg_table_ops(current_table, desired_table,
++                                              violations))
++                plan.ops_.push_back(std::move(op));
+         } else {
+             // Full rebuild
+             auto vit = data_dependent_violations.find(name);
+@@ -2298,6 +2602,14 @@
+     {OpType::DropTrigger,        "DropTrigger"},
+     {OpType::CreateVirtualTable, "CreateVirtualTable"},
+     {OpType::DropVirtualTable,   "DropVirtualTable"},
++    {OpType::DropColumn,         "DropColumn"},
++    {OpType::AlterColumnType,    "AlterColumnType"},
++    {OpType::SetNotNull,         "SetNotNull"},
++    {OpType::DropNotNull,        "DropNotNull"},
++    {OpType::SetDefault,         "SetDefault"},
++    {OpType::DropDefault,        "DropDefault"},
++    {OpType::AddConstraint,      "AddConstraint"},
++    {OpType::DropConstraint,     "DropConstraint"},
+ };
+ 
+ } // namespace
+@@ -2447,6 +2759,15 @@
+                 case OpType::DropTrigger:   expected_prefix = "DROP TRIGGER"; break;
+                 case OpType::CreateVirtualTable: expected_prefix = "CREATE VIRTUAL TABLE"; break;
+                 case OpType::DropVirtualTable:   expected_prefix = "DROP TABLE"; break;
++                case OpType::DropColumn:
++                case OpType::AlterColumnType:
++                case OpType::SetNotNull:
++                case OpType::DropNotNull:
++                case OpType::SetDefault:
++                case OpType::DropDefault:
++                case OpType::AddConstraint:
++                case OpType::DropConstraint:
++                    expected_prefix = "ALTER TABLE"; break;
+             }
+             if (!starts_with(first_sql, expected_prefix)) {
+                 throw JsonError(
+@@ -2484,6 +2805,10 @@
+ 
+ std::string schema_to_json(const Schema& schema) {
+     nlohmann::json j;
++    if (schema.dialect != "sqlite")
++        j["dialect"] = schema.dialect;
++    if (!schema.schema_name.empty())
++        j["schema"] = schema.schema_name;
+ 
+     // Tables
+     auto& jt = j["tables"];
+@@ -2602,6 +2927,8 @@
+         throw JsonError("Expected top-level JSON object");
+ 
+     Schema schema;
++    schema.dialect = j.value("dialect", "sqlite");
++    schema.schema_name = j.value("schema", "");
+ 
+     // Tables
+     if (j.contains("tables") && j["tables"].is_object()) {
+@@ -2706,6 +3033,414 @@
+ }
+ 
+ 
++// --- postgres extract / apply / parse_on ---
++
++namespace {
++
++struct RowSink {
++    std::vector<std::vector<std::string>> rows;
++};
++
++void row_cb(void* ctx, int ncols, const char* const* cols) {
++    auto* sink = static_cast<RowSink*>(ctx);
++    std::vector<std::string> row;
++    row.reserve(static_cast<size_t>(ncols));
++    for (int i = 0; i < ncols; ++i)
++        row.emplace_back(cols[i] ? cols[i] : "");
++    sink->rows.push_back(std::move(row));
++}
++
++void exec_via(const sqlift_exec& ex, const std::string& sql) {
++    if (!ex.exec) throw Error("sqlift_exec.exec is null");
++    char* err = nullptr;
++    int rc = ex.exec(ex.ctx, sql.c_str(), &err);
++    if (rc != 0) {
++        std::string msg = err ? err : "exec failed";
++        std::free(err);
++        throw Error(msg + "; SQL: " + sql);
++    }
++}
++
++std::vector<std::vector<std::string>>
++query_via(const sqlift_exec& ex, const std::string& sql) {
++    if (!ex.query) throw Error("sqlift_exec.query is null");
++    RowSink sink;
++    char* err = nullptr;
++    int rc = ex.query(ex.ctx, sql.c_str(), row_cb, &sink, &err);
++    if (rc != 0) {
++        std::string msg = err ? err : "query failed";
++        std::free(err);
++        throw Error(msg + "; SQL: " + sql);
++    }
++    return sink.rows;
++}
++
++std::string normalize_pg_type(std::string t) {
++    t = trim(t);
++    std::string lower;
++    lower.reserve(t.size());
++    for (char c : t) lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
++    if (lower == "int8") return "bigint";
++    if (lower == "int4" || lower == "int") return "integer";
++    if (lower == "int2") return "smallint";
++    if (lower == "float8") return "double precision";
++    if (lower == "float4") return "real";
++    if (lower == "bool") return "boolean";
++    if (lower == "timestamptz") return "timestamp with time zone";
++    if (lower == "timestamp") return "timestamp without time zone";
++    if (lower.rfind("character varying", 0) == 0) {
++        if (lower.size() == 17) return "varchar";
++        return "varchar" + t.substr(17);
++    }
++    if (lower.rfind("character(", 0) == 0 || lower.rfind("character (", 0) == 0)
++        return t;
++    return lower;
++}
++
++std::string strip_check_def(const std::string& def) {
++    // "CHECK (expr)" or "CONSTRAINT name CHECK (expr)"
++    auto pos = to_upper(def).find("CHECK");
++    if (pos == std::string::npos) return def;
++    auto open = def.find('(', pos);
++    if (open == std::string::npos) return def;
++    int depth = 0;
++    for (size_t i = open; i < def.size(); ++i) {
++        if (def[i] == '(') ++depth;
++        else if (def[i] == ')') {
++            --depth;
++            if (depth == 0)
++                return trim(def.substr(open + 1, i - open - 1));
++        }
++    }
++    return def;
++}
++
++} // namespace
++
++Schema extract_exec(const sqlift_exec& ex, const std::string& schema_name) {
++    Schema schema;
++    schema.dialect = "postgres";
++    schema.schema_name = schema_name.empty() ? "public" : schema_name;
++    const std::string nsp = quote_lit(schema.schema_name);
++
++    auto tables = query_via(ex,
++        "SELECT c.relname FROM pg_class c "
++        "JOIN pg_namespace n ON n.oid = c.relnamespace "
++        "WHERE n.nspname = " + nsp + " AND c.relkind = 'r' "
++        "AND c.relname <> '_sqlift_state' "
++        "ORDER BY c.relname");
++
++    for (const auto& tr : tables) {
++        if (tr.empty() || tr[0].empty()) continue;
++        Table table;
++        table.name = tr[0];
++        const std::string tlit = quote_lit(table.name);
++
++        auto cols = query_via(ex,
++            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), "
++            "a.attnotnull, "
++            "pg_get_expr(ad.adbin, ad.adrelid), "
++            "COALESCE((SELECT a2.attnum FROM pg_index i "
++            " JOIN pg_attribute a2 ON a2.attrelid = i.indrelid "
++            "  AND a2.attnum = ANY (i.indkey) "
++            " WHERE i.indrelid = c.oid AND i.indisprimary "
++            "  AND a2.attnum = a.attnum), 0) "
++            "FROM pg_class c "
++            "JOIN pg_namespace n ON n.oid = c.relnamespace "
++            "JOIN pg_attribute a ON a.attrelid = c.oid "
++            "LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum "
++            "WHERE n.nspname = " + nsp + " AND c.relname = " + tlit + " "
++            "AND a.attnum > 0 AND NOT a.attisdropped "
++            "ORDER BY a.attnum");
++        int pk_ord = 0;
++        for (const auto& row : cols) {
++            Column col;
++            col.name = row[0];
++            col.type = normalize_pg_type(row[1]);
++            col.notnull = (row[2] == "t" || row[2] == "true" || row[2] == "1");
++            col.default_value = row.size() > 3 ? row[3] : "";
++            bool is_pk = row.size() > 4 && row[4] != "0" && !row[4].empty();
++            if (is_pk) col.pk = ++pk_ord;
++            table.columns.push_back(std::move(col));
++        }
++
++        auto fks = query_via(ex,
++            "SELECT con.conname, "
++            "pg_get_constraintdef(con.oid, true) "
++            "FROM pg_constraint con "
++            "JOIN pg_class c ON c.oid = con.conrelid "
++            "JOIN pg_namespace n ON n.oid = c.relnamespace "
++            "WHERE n.nspname = " + nsp + " AND c.relname = " + tlit + " "
++            "AND con.contype = 'f' ORDER BY con.conname");
++        for (const auto& row : fks) {
++            ForeignKey fk;
++            fk.constraint_name = row[0];
++            // FOREIGN KEY (a, b) REFERENCES tbl(c, d) [ON DELETE ...] [ON UPDATE ...]
++            const std::string& def = row[1];
++            auto fk_pos = to_upper(def).find("FOREIGN KEY");
++            auto ref_pos = to_upper(def).find("REFERENCES");
++            if (fk_pos == std::string::npos || ref_pos == std::string::npos)
++                continue;
++            auto from_open = def.find('(', fk_pos);
++            auto from_close = def.find(')', from_open);
++            auto to_name_start = ref_pos + 10;
++            while (to_name_start < def.size() &&
++                   std::isspace(static_cast<unsigned char>(def[to_name_start])))
++                ++to_name_start;
++            auto to_open = def.find('(', to_name_start);
++            std::string to_table = trim(def.substr(to_name_start,
++                                                   to_open - to_name_start));
++            to_table = strip_quotes(to_table);
++            auto to_close = def.find(')', to_open);
++            auto split_cols = [](const std::string& inner) {
++                std::vector<std::string> out;
++                std::string cur;
++                for (char ch : inner) {
++                    if (ch == ',') {
++                        out.push_back(strip_quotes(trim(cur)));
++                        cur.clear();
++                    } else cur += ch;
++                }
++                if (!trim(cur).empty())
++                    out.push_back(strip_quotes(trim(cur)));
++                return out;
++            };
++            fk.from_columns = split_cols(def.substr(from_open + 1,
++                                                    from_close - from_open - 1));
++            fk.to_table = to_table;
++            fk.to_columns = split_cols(def.substr(to_open + 1,
++                                                  to_close - to_open - 1));
++            auto upd = to_upper(def).rfind("ON UPDATE ");
++            auto del = to_upper(def).rfind("ON DELETE ");
++            auto action = [&](size_t pos) {
++                if (pos == std::string::npos) return std::string("NO ACTION");
++                std::string rest = trim(def.substr(pos + 10));
++                if (to_upper(rest).rfind("CASCADE", 0) == 0) return std::string("CASCADE");
++                if (to_upper(rest).rfind("SET NULL", 0) == 0) return std::string("SET NULL");
++                if (to_upper(rest).rfind("SET DEFAULT", 0) == 0) return std::string("SET DEFAULT");
++                if (to_upper(rest).rfind("RESTRICT", 0) == 0) return std::string("RESTRICT");
++                return std::string("NO ACTION");
++            };
++            fk.on_update = action(upd);
++            fk.on_delete = action(del);
++            table.foreign_keys.push_back(std::move(fk));
++        }
++
++        auto checks = query_via(ex,
++            "SELECT con.conname, pg_get_constraintdef(con.oid, true) "
++            "FROM pg_constraint con "
++            "JOIN pg_class c ON c.oid = con.conrelid "
++            "JOIN pg_namespace n ON n.oid = c.relnamespace "
++            "WHERE n.nspname = " + nsp + " AND c.relname = " + tlit + " "
++            "AND con.contype = 'c' ORDER BY con.conname");
++        for (const auto& row : checks) {
++            CheckConstraint chk;
++            chk.name = row[0];
++            chk.expression = strip_check_def(row[1]);
++            table.check_constraints.push_back(std::move(chk));
++        }
++
++        auto pkn = query_via(ex,
++            "SELECT con.conname FROM pg_constraint con "
++            "JOIN pg_class c ON c.oid = con.conrelid "
++            "JOIN pg_namespace n ON n.oid = c.relnamespace "
++            "WHERE n.nspname = " + nsp + " AND c.relname = " + tlit + " "
++            "AND con.contype = 'p'");
++        if (!pkn.empty() && !pkn[0].empty())
++            table.pk_constraint_name = pkn[0][0];
++
++        table.raw_sql = create_table_sql_from_ir(table);
++        schema.tables[table.name] = std::move(table);
++    }
++
++    auto indexes = query_via(ex,
++        "SELECT i.relname, t.relname, ix.indisunique, "
++        "pg_get_indexdef(ix.indexrelid) "
++        "FROM pg_index ix "
++        "JOIN pg_class i ON i.oid = ix.indexrelid "
++        "JOIN pg_class t ON t.oid = ix.indrelid "
++        "JOIN pg_namespace n ON n.oid = t.relnamespace "
++        "WHERE n.nspname = " + nsp + " "
++        "AND NOT ix.indisprimary "
++        "AND NOT EXISTS (SELECT 1 FROM pg_constraint co "
++        " WHERE co.conindid = ix.indexrelid) "
++        "ORDER BY i.relname");
++    for (const auto& row : indexes) {
++        Index idx;
++        idx.name = row[0];
++        idx.table_name = row[1];
++        idx.unique = (row[2] == "t" || row[2] == "true" || row[2] == "1");
++        idx.raw_sql = row[3];
++        auto cols = query_via(ex,
++            "SELECT a.attname FROM pg_index ix "
++            "JOIN pg_class i ON i.oid = ix.indexrelid "
++            "JOIN pg_attribute a ON a.attrelid = ix.indrelid "
++            " AND a.attnum = ANY (ix.indkey) "
++            "WHERE i.relname = " + quote_lit(idx.name) + " "
++            "ORDER BY array_position(ix.indkey, a.attnum)");
++        for (const auto& c : cols)
++            if (!c.empty()) idx.columns.push_back(c[0]);
++        auto upper = to_upper(idx.raw_sql);
++        auto w = upper.rfind(" WHERE ");
++        if (w != std::string::npos)
++            idx.where_clause = trim(idx.raw_sql.substr(w + 7));
++        schema.indexes[idx.name] = std::move(idx);
++    }
++
++    auto views = query_via(ex,
++        "SELECT c.relname, pg_get_viewdef(c.oid, true) "
++        "FROM pg_class c "
++        "JOIN pg_namespace n ON n.oid = c.relnamespace "
++        "WHERE n.nspname = " + nsp + " AND c.relkind = 'v' "
++        "ORDER BY c.relname");
++    for (const auto& row : views) {
++        View view;
++        view.name = row[0];
++        std::string def = trim(row[1]);
++        if (!def.empty() && def.back() == ';') def.pop_back();
++        view.sql = "CREATE VIEW " + quote_id(view.name) + " AS " + def;
++        schema.views[view.name] = std::move(view);
++    }
++
++    auto trigs = query_via(ex,
++        "SELECT t.tgname, c.relname, pg_get_triggerdef(t.oid, true) "
++        "FROM pg_trigger t "
++        "JOIN pg_class c ON c.oid = t.tgrelid "
++        "JOIN pg_namespace n ON n.oid = c.relnamespace "
++        "WHERE n.nspname = " + nsp + " AND NOT t.tgisinternal "
++        "ORDER BY t.tgname");
++    for (const auto& row : trigs) {
++        Trigger trig;
++        trig.name = row[0];
++        trig.table_name = row[1];
++        trig.sql = row[2];
++        schema.triggers[trig.name] = std::move(trig);
++    }
++
++    return schema;
++}
++
++void apply_exec(const sqlift_exec& ex, const MigrationPlan& plan,
++                const ApplyOptions& opts) {
++    if (plan.empty()) return;
++
++    for (const auto& op : plan.operations()) {
++        if (op.requires_rebuild) {
++            bool rebuild_ok = opts.allow_rebuild ||
++                              (opts.allow_loosen && op.loosens_only);
++            if (!rebuild_ok) {
++                throw RebuildError(
++                    "Migration plan requires ALTER TYPE / rebuild for '" +
++                    op.object_name + "': " + op.description +
++                    ". Set SQLIFT_ALLOW_REBUILD in opts.allow to proceed.");
++            }
++        }
++        if (op.data_dependent && !opts.allow_data_dependent) {
++            throw BreakingChangeError(
++                "Migration plan contains data-dependent change on '" +
++                op.object_name + "': " + op.description +
++                ". Set SQLIFT_ALLOW_DATA_DEPENDENT in opts.allow to proceed "
++                "(success depends on existing data).");
++        }
++        if (op.destructive && !opts.allow_destructive) {
++            throw DestructiveError(
++                "Migration plan contains destructive operation on '" +
++                op.object_name + "': " + op.description +
++                ". Set SQLIFT_ALLOW_DESTRUCTIVE in opts.allow to proceed.");
++        }
++    }
++
++    Schema current = extract_exec(ex, "public");
++    std::string stored_hash;
++    try {
++        auto rows = query_via(ex,
++            "SELECT 1 FROM information_schema.tables "
++            "WHERE table_schema = 'sqlpipe' AND table_name = '_sqlift_state'");
++        if (!rows.empty()) {
++            auto hv = query_via(ex,
++                "SELECT value FROM sqlpipe._sqlift_state WHERE key = 'schema_hash'");
++            if (!hv.empty() && !hv[0].empty())
++                stored_hash = hv[0][0];
++        }
++    } catch (...) {
++        stored_hash.clear();
++    }
++    if (!stored_hash.empty()) {
++        std::string actual = current.hash();
++        if (stored_hash != actual) {
++            throw DriftError(
++                "Schema drift detected: the database schema has been modified "
++                "outside of sqlift. Stored hash: " + stored_hash +
++                ", actual hash: " + actual);
++        }
++    }
++
++    try {
++        exec_via(ex, "BEGIN");
++        for (const auto& op : plan.operations()) {
++            for (const auto& sql : op.sql) {
++                try {
++                    exec_via(ex, sql);
++                } catch (const std::exception& e) {
++                    throw ApplyError(
++                        std::string("Failed applying '") + op.object_name +
++                        "' (" + op.description + "): " + e.what() +
++                        "; SQL: " + sql);
++                }
++            }
++        }
++        exec_via(ex, "COMMIT");
++    } catch (...) {
++        try { exec_via(ex, "ROLLBACK"); } catch (...) {}
++        throw;
++    }
++
++    Schema after = extract_exec(ex, "public");
++    exec_via(ex, "CREATE SCHEMA IF NOT EXISTS sqlpipe");
++    exec_via(ex,
++        "CREATE TABLE IF NOT EXISTS sqlpipe._sqlift_state ("
++        "key TEXT PRIMARY KEY, value TEXT NOT NULL)");
++    exec_via(ex,
++        "INSERT INTO sqlpipe._sqlift_state (key, value) VALUES "
++        "('schema_hash', " + quote_lit(after.hash()) + ") "
++        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value");
++    exec_via(ex,
++        "INSERT INTO sqlpipe._sqlift_state (key, value) "
++        "VALUES ('migration_version', '1') "
++        "ON CONFLICT (key) DO UPDATE SET "
++        "value = (EXCLUDED.value::integer + "
++        "sqlpipe._sqlift_state.value::integer)::text");
++}
++
++Schema parse_on_exec(const sqlift_exec& ex, const std::string& ddl) {
++    try {
++        exec_via(ex, "BEGIN");
++        exec_via(ex, "DROP SCHEMA IF EXISTS sqlift_parse_tmp CASCADE");
++        exec_via(ex, "CREATE SCHEMA sqlift_parse_tmp");
++        exec_via(ex, "SET LOCAL search_path TO sqlift_parse_tmp");
++        exec_via(ex, ddl);
++        Schema schema = extract_exec(ex, "sqlift_parse_tmp");
++        exec_via(ex, "DROP SCHEMA sqlift_parse_tmp CASCADE");
++        exec_via(ex, "COMMIT");
++        schema.schema_name = "public";
++        return schema;
++    } catch (...) {
++        try { exec_via(ex, "ROLLBACK"); } catch (...) {}
++        throw;
++    }
++}
++
++int64_t migration_version_exec(const sqlift_exec& ex) {
++    try {
++        auto rows = query_via(ex,
++            "SELECT value FROM sqlpipe._sqlift_state WHERE key = 'migration_version'");
++        if (rows.empty() || rows[0].empty()) return 0;
++        return std::stoll(rows[0][0]);
++    } catch (...) {
++        return 0;
++    }
++}
++
+ } // namespace sqlift
+ 
+ 
+@@ -2770,9 +3505,13 @@
+ // --- opaque handle -----------------------------------------------------------
+ 
+ struct sqlift_db {
+-    sqlift::Database db;
+-    explicit sqlift_db(const std::string& path, int flags)
+-        : db(path, flags ? flags : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)) {}
++    int engine = SQLIFT_ENGINE_SQLITE;
++    std::unique_ptr<sqlift::Database> sqlite;
++    sqlift_exec exec{};
++
++    sqlite3* sqlite_handle() const {
++        return sqlite ? sqlite->get() : nullptr;
++    }
+ };
+ 
+ // --- C API -------------------------------------------------------------------
+@@ -2783,13 +3522,49 @@
+                           int* err_type, char** err_msg) {
+     clear_error(err_type, err_msg);
+     try {
+-        return new sqlift_db(path, flags);
++        auto* h = new sqlift_db;
++        h->engine = SQLIFT_ENGINE_SQLITE;
++        h->sqlite = std::make_unique<sqlift::Database>(
++            path, flags ? flags : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE));
++        return h;
+     } catch (const std::exception& e) {
+         set_error(err_type, err_msg, classify_exception(e), e.what());
+         return nullptr;
+     }
+ }
+ 
++sqlift_db* sqlift_db_wrap_sqlite(sqlite3* handle,
++                                 int* err_type, char** err_msg) {
++    clear_error(err_type, err_msg);
++    try {
++        auto* h = new sqlift_db;
++        h->engine = SQLIFT_ENGINE_SQLITE;
++        h->sqlite = std::make_unique<sqlift::Database>(handle);
++        return h;
++    } catch (const std::exception& e) {
++        set_error(err_type, err_msg, classify_exception(e), e.what());
++        return nullptr;
++    }
++}
++
++sqlift_db* sqlift_db_wrap_exec(int engine, sqlift_exec exec,
++                               int* err_type, char** err_msg) {
++    clear_error(err_type, err_msg);
++    if (engine != SQLIFT_ENGINE_SQLITE && engine != SQLIFT_ENGINE_POSTGRES) {
++        set_error(err_type, err_msg, SQLIFT_ERROR, "unknown sqlift_engine");
++        return nullptr;
++    }
++    if (!exec.exec || !exec.query) {
++        set_error(err_type, err_msg, SQLIFT_ERROR,
++                  "sqlift_exec requires exec and query");
++        return nullptr;
++    }
++    auto* h = new sqlift_db;
++    h->engine = engine;
++    h->exec = exec;
++    return h;
++}
++
+ void sqlift_db_close(sqlift_db* db) {
+     delete db;
+ }
+@@ -2797,7 +3572,16 @@
+ int sqlift_db_exec(sqlift_db* db, const char* sql, char** err_msg) {
+     if (err_msg) *err_msg = nullptr;
+     try {
+-        db->db.exec(sql);
++        if (db->engine == SQLIFT_ENGINE_SQLITE) {
++            db->sqlite->exec(sql);
++        } else {
++            char* e = nullptr;
++            if (db->exec.exec(db->exec.ctx, sql, &e) != 0) {
++                if (err_msg) *err_msg = e;
++                else std::free(e);
++                return 1;
++            }
++        }
+         return 0;
+     } catch (const std::exception& e) {
+         if (err_msg) *err_msg = dup_str(e.what());
+@@ -2819,7 +3603,26 @@
+ char* sqlift_extract(sqlift_db* db, int* err_type, char** err_msg) {
+     clear_error(err_type, err_msg);
+     try {
+-        auto schema = sqlift::extract(db->db);
++        sqlift::Schema schema = (db->engine == SQLIFT_ENGINE_SQLITE)
++            ? sqlift::extract(db->sqlite_handle())
++            : sqlift::extract_exec(db->exec, "public");
++        return dup_str(sqlift::schema_to_json(schema));
++    } catch (const std::exception& e) {
++        set_error(err_type, err_msg, classify_exception(e), e.what());
++        return nullptr;
++    }
++}
++
++char* sqlift_parse_on(sqlift_db* db, const char* ddl,
++                      int* err_type, char** err_msg) {
++    clear_error(err_type, err_msg);
++    try {
++        if (db->engine == SQLIFT_ENGINE_SQLITE) {
++            db->sqlite->exec(ddl);
++            auto schema = sqlift::extract(db->sqlite_handle());
++            return dup_str(sqlift::schema_to_json(schema));
++        }
++        auto schema = sqlift::parse_on_exec(db->exec, ddl);
+         return dup_str(sqlift::schema_to_json(schema));
+     } catch (const std::exception& e) {
+         set_error(err_type, err_msg, classify_exception(e), e.what());
+@@ -2853,7 +3656,10 @@
+         opts.allow_rebuild = (c_opts.allow & SQLIFT_ALLOW_REBUILD) != 0;
+         opts.allow_loosen = (c_opts.allow & SQLIFT_ALLOW_LOOSEN) != 0;
+         opts.allow_data_dependent = (c_opts.allow & SQLIFT_ALLOW_DATA_DEPENDENT) != 0;
+-        sqlift::apply(db->db, plan, opts);
++        if (db->engine == SQLIFT_ENGINE_SQLITE)
++            sqlift::apply(db->sqlite_handle(), plan, opts);
++        else
++            sqlift::apply_exec(db->exec, plan, opts);
+         return 0;
+     } catch (const std::exception& e) {
+         set_error(err_type, err_msg, classify_exception(e), e.what());
+@@ -2864,7 +3670,9 @@
+ int64_t sqlift_migration_version(sqlift_db* db, int* err_type, char** err_msg) {
+     clear_error(err_type, err_msg);
+     try {
+-        return sqlift::migration_version(db->db);
++        if (db->engine == SQLIFT_ENGINE_SQLITE)
++            return sqlift::migration_version(db->sqlite_handle());
++        return sqlift::migration_version_exec(db->exec);
+     } catch (const std::exception& e) {
+         set_error(err_type, err_msg, classify_exception(e), e.what());
+         return -1;
+@@ -2900,10 +3708,28 @@
+                           int64_t* result, char** err_msg) {
+     if (err_msg) *err_msg = nullptr;
+     try {
++        if (db->engine != SQLIFT_ENGINE_SQLITE) {
++            char* e = nullptr;
++            auto take = [](void* ctx, int ncols, const char* const* cols) {
++                auto* out = static_cast<std::pair<int64_t, bool>*>(ctx);
++                if (ncols > 0 && cols[0] && !out->second) {
++                    out->first = std::stoll(cols[0]);
++                    out->second = true;
++                }
++            };
++            std::pair<int64_t, bool> box{0, false};
++            if (db->exec.query(db->exec.ctx, sql, take, &box, &e) != 0) {
++                if (err_msg) *err_msg = e;
++                else std::free(e);
++                return 1;
++            }
++            if (result) *result = box.first;
++            return 0;
++        }
+         sqlite3_stmt* stmt = nullptr;
+-        int rc = sqlite3_prepare_v2(db->db.get(), sql, -1, &stmt, nullptr);
++        int rc = sqlite3_prepare_v2(db->sqlite_handle(), sql, -1, &stmt, nullptr);
+         if (rc != SQLITE_OK) {
+-            if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->db.get()));
++            if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->sqlite_handle()));
+             return 1;
+         }
+         rc = sqlite3_step(stmt);
+@@ -2918,7 +3744,7 @@
+             if (result) *result = 0;
+             return 0;
+         }
+-        if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->db.get()));
++        if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->sqlite_handle()));
+         return 1;
+     } catch (const std::exception& e) {
+         if (err_msg) *err_msg = dup_str(e.what());
+@@ -2929,10 +3755,25 @@
+ char* sqlift_db_query_text(sqlift_db* db, const char* sql, char** err_msg) {
+     if (err_msg) *err_msg = nullptr;
+     try {
++        if (db->engine != SQLIFT_ENGINE_SQLITE) {
++            char* e = nullptr;
++            std::string text;
++            auto take = [](void* ctx, int ncols, const char* const* cols) {
++                auto* out = static_cast<std::string*>(ctx);
++                if (out->empty() && ncols > 0 && cols[0])
++                    *out = cols[0];
++            };
++            if (db->exec.query(db->exec.ctx, sql, take, &text, &e) != 0) {
++                if (err_msg) *err_msg = e;
++                else std::free(e);
++                return nullptr;
++            }
++            return dup_str(text);
++        }
+         sqlite3_stmt* stmt = nullptr;
+-        int rc = sqlite3_prepare_v2(db->db.get(), sql, -1, &stmt, nullptr);
++        int rc = sqlite3_prepare_v2(db->sqlite_handle(), sql, -1, &stmt, nullptr);
+         if (rc != SQLITE_OK) {
+-            if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->db.get()));
++            if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->sqlite_handle()));
+             return nullptr;
+         }
+         rc = sqlite3_step(stmt);
+@@ -2947,7 +3788,7 @@
+             // No rows -- return empty string.
+             return dup_str("");
+         }
+-        if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->db.get()));
++        if (err_msg) *err_msg = dup_str(sqlite3_errmsg(db->sqlite_handle()));
+         return nullptr;
+     } catch (const std::exception& e) {
+         if (err_msg) *err_msg = dup_str(e.what());
+--- vendor/include/sqlift.h
++++ vendor/include/sqlift.h
+@@ -78,11 +78,30 @@
+ // Opaque database handle.
+ typedef struct sqlift_db sqlift_db;
+ 
++enum sqlift_engine {
++    SQLIFT_ENGINE_SQLITE   = 0,
++    SQLIFT_ENGINE_POSTGRES = 1,
++};
++typedef struct sqlift_exec {
++    void* ctx;
++    int (*exec)(void* ctx, const char* sql, char** err_msg);
++    int (*query)(void* ctx, const char* sql,
++                 void (*row)(void* row_ctx, int ncols, const char* const* cols),
++                 void* row_ctx, char** err_msg);
++} sqlift_exec;
++
+ // Open a database. Returns NULL on error with err_type/err_msg set.
+ // flags: SQLite open flags (0 = default READWRITE|CREATE).
+ sqlift_db* sqlift_db_open(const char* path, int flags,
+                           int* err_type, char** err_msg);
+ 
++typedef struct sqlite3 sqlite3;
++sqlift_db* sqlift_db_wrap_sqlite(sqlite3* handle,
++                                 int* err_type, char** err_msg);
++sqlift_db* sqlift_db_wrap_exec(int engine, sqlift_exec exec,
++                               int* err_type, char** err_msg);
++char* sqlift_parse_on(sqlift_db* db, const char* ddl,
++                      int* err_type, char** err_msg);
+ // Close a database handle. Safe to call with NULL.
+ void sqlift_db_close(sqlift_db* db);
+ 

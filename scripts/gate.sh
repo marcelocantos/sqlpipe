@@ -7,6 +7,16 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+gate_tree=$(git rev-parse 'HEAD^{tree}')
+gate_dirty=$(git status --porcelain)
+
+if [ "$(uname -s)" = Darwin ]; then
+    /bin/bash -c 'test "${BASH_VERSINFO[0]}" = 3'
+    for script in scripts/*.sh scripts/hooks/pre-push; do
+        /bin/bash -n "$script"
+    done
+fi
+
 echo "→ cv test (SQLite + live Postgres, includes fault-suite:*)"
 cv test
 echo "✓ cv test"
@@ -20,6 +30,8 @@ echo "→ go test"
 (
     cd go/sqlpipe
     GOWORK=off go test -count=1 ./...
+    echo "→ Go Postgres binding (live)"
+    SQLPIPE_TEST_POSTGRES=1 GOWORK=off go test -tags postgres -count=1 ./...
 )
 echo "✓ go test"
 
@@ -44,3 +56,17 @@ if command -v emcc >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
 else
     echo "· wasm skipped (need emcc + node)"
 fi
+
+# The hook checks this record instead of keeping an idle git transport open
+# while Docker and the language suites run. Bind it to the measured tree.
+[ "$(git rev-parse 'HEAD^{tree}')" = "$gate_tree" ]
+[ "$(git status --porcelain)" = "$gate_dirty" ]
+attestation=$(git rev-parse --git-path gate-attestation)
+record=$(mktemp "${attestation}.XXXXXX")
+trap 'rm -f "$record"' EXIT
+dirty_count=0
+if [ -n "$gate_dirty" ]; then
+    dirty_count=$(printf '%s\n' "$gate_dirty" | wc -l | tr -d ' ')
+fi
+printf '%s %s %s\n' "$gate_tree" "$dirty_count" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$record"
+mv "$record" "$attestation"

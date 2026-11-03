@@ -78,11 +78,30 @@ typedef struct sqlift_apply_options {
 // Opaque database handle.
 typedef struct sqlift_db sqlift_db;
 
+enum sqlift_engine {
+    SQLIFT_ENGINE_SQLITE   = 0,
+    SQLIFT_ENGINE_POSTGRES = 1,
+};
+typedef struct sqlift_exec {
+    void* ctx;
+    int (*exec)(void* ctx, const char* sql, char** err_msg);
+    int (*query)(void* ctx, const char* sql,
+                 void (*row)(void* row_ctx, int ncols, const char* const* cols),
+                 void* row_ctx, char** err_msg);
+} sqlift_exec;
+
 // Open a database. Returns NULL on error with err_type/err_msg set.
 // flags: SQLite open flags (0 = default READWRITE|CREATE).
 sqlift_db* sqlift_db_open(const char* path, int flags,
                           int* err_type, char** err_msg);
 
+typedef struct sqlite3 sqlite3;
+sqlift_db* sqlift_db_wrap_sqlite(sqlite3* handle,
+                                 int* err_type, char** err_msg);
+sqlift_db* sqlift_db_wrap_exec(int engine, sqlift_exec exec,
+                               int* err_type, char** err_msg);
+char* sqlift_parse_on(sqlift_db* db, const char* ddl,
+                      int* err_type, char** err_msg);
 // Close a database handle. Safe to call with NULL.
 void sqlift_db_close(sqlift_db* db);
 
