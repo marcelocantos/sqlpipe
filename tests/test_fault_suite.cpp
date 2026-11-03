@@ -11,6 +11,7 @@
 #include <sqlite3.h>
 
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <optional>
 #include <sstream>
@@ -103,10 +104,14 @@ struct WriteLog {
     }
 
     std::string replay(const char* schema) const {
+        return replay_query(schema, "SELECT id, v FROM t ORDER BY id");
+    }
+
+    std::string replay_query(const char* schema, const char* query_sql) const {
         FileDB fresh("replay");
         fresh.exec(schema);
         for (const auto& sql : sqls) fresh.exec(sql);
-        return dump(fresh.db, "SELECT id, v FROM t ORDER BY id");
+        return dump(fresh.db, query_sql);
     }
 };
 
@@ -510,12 +515,40 @@ TEST_CASE("fault-suite: query failure is not an unchanged result, and repair del
     CHECK(deliveries == 0);
     CHECK(watch.subscription_count() == 1);
 
+    // The failed evaluation must not move the last successful hash. Restoring
+    // the previous rows is an unchanged result, so notify publishes nothing.
+    db.exec("UPDATE t SET v = 1 WHERE id = 2");
+    auto restored = watch.notify({"t"});
+    CHECK(restored.empty());
+
     db.exec("UPDATE t SET v = 2 WHERE id = 2");
     auto repaired = watch.notify({"t"});
     REQUIRE(repaired.size() == 1);
     CHECK(repaired[0].id == id);
     expect_query(repaired[0], db.db, sql);
     CHECK(std::get<std::int64_t>(repaired[0].rows[1][1]) == 2);
+
+    // Initial sqlite3_step failure. The subscription stays registered, and
+    // the failed attempt does not drop the pending initial delivery: a
+    // later notify that names no table still publishes the repaired rows.
+    QueryWatch initial(db.db);
+    db.exec("INSERT INTO t VALUES (3, 0)");
+    const char* initial_sql = "SELECT id, boom(v) FROM t WHERE id = 3";
+    auto initial_id = initial.subscribe(initial_sql);
+    try {
+        auto ignored = initial.notify({"t"});
+        (void)ignored;
+        FAIL("initial evaluation must not succeed");
+    } catch (const Error& e) {
+        CHECK(e.code() == ErrorCode::QueryFailed);
+    }
+    CHECK(initial.subscription_count() == 1);
+    db.exec("UPDATE t SET v = 3 WHERE id = 3");
+    auto initial_ok = initial.notify({});
+    REQUIRE(initial_ok.size() == 1);
+    CHECK(initial_ok[0].id == initial_id);
+    expect_query(initial_ok[0], db.db, initial_sql);
+    CHECK(std::get<std::int64_t>(initial_ok[0].rows[0][1]) == 3);
 }
 
 TEST_CASE("fault-suite: slow consumer gets the latest result and registrations stay bounded") {
@@ -700,4 +733,197 @@ TEST_CASE("fault-suite: protocol failure is distinct from unsynchronized and liv
     CHECK(replica.state() == Replica::State::Error);
     CHECK(replica.sync_status() == SyncStatus::Failed);
     CHECK(replica.sync_status() != SyncStatus::Live);
+}
+
+// Deliver every reliable message before any best-effort message still
+// queued for either peer. NeedBuckets is best-effort and DiffReady is
+// reliable, so a paired empty NeedBuckets arrives after DiffReady.
+struct DelayedDatagramExchange {
+    Peer* peers[2] = {};
+    std::deque<PeerOutMessage> reliable[2];
+    std::deque<PeerOutMessage> best_effort[2];
+    bool awaiting_delayed_need[2] = {};
+    int reorders = 0;
+    int live_invalid_state = 0;
+    std::vector<QueryResult> subscriptions[2];
+
+    void enqueue(int dest, const std::vector<PeerOutMessage>& msgs) {
+        for (const auto& msg : msgs) {
+            if (msg.delivery == Delivery::BestEffort) best_effort[dest].push_back(msg);
+            else reliable[dest].push_back(msg);
+        }
+    }
+
+    // Returns false when the step budget is exhausted with messages left.
+    bool pump() {
+        for (int guard = 0; guard < 10000; ++guard) {
+            int dest = -1;
+            bool datagram = false;
+            if (!reliable[0].empty()) dest = 0;
+            else if (!reliable[1].empty()) dest = 1;
+            else if (!best_effort[0].empty()) { dest = 0; datagram = true; }
+            else if (!best_effort[1].empty()) { dest = 1; datagram = true; }
+            else return true;
+
+            auto& queue = datagram ? best_effort[dest] : reliable[dest];
+            auto msg = std::move(queue.front());
+            queue.pop_front();
+            if (std::holds_alternative<DiffReadyMsg>(msg.msg.payload)) {
+                awaiting_delayed_need[dest] = true;
+            }
+            if (std::holds_alternative<NeedBucketsMsg>(msg.msg.payload) &&
+                awaiting_delayed_need[dest]) {
+                ++reorders;
+                awaiting_delayed_need[dest] = false;
+            }
+
+            auto state_before = peers[dest]->state();
+            auto hr = peers[dest]->handle_message(msg.msg);
+            if (state_before == Peer::State::Live) {
+                for (const auto& out : hr.messages) {
+                    if (auto* err = std::get_if<ErrorMsg>(&out.msg.payload)) {
+                        if (err->code == ErrorCode::InvalidState) ++live_invalid_state;
+                    }
+                }
+            }
+            subscriptions[dest].insert(subscriptions[dest].end(),
+                                       hr.subscriptions.begin(),
+                                       hr.subscriptions.end());
+            enqueue(1 - dest, hr.messages);
+        }
+        return reliable[0].empty() && reliable[1].empty() &&
+               best_effort[0].empty() && best_effort[1].empty();
+    }
+};
+
+const QueryResult* last_sub(const std::vector<QueryResult>& subs, SubscriptionId id) {
+    const QueryResult* found = nullptr;
+    for (const auto& sub : subs) {
+        if (sub.id == id) found = &sub;
+    }
+    return found;
+}
+
+TEST_CASE("fault-suite: delayed NeedBuckets after DiffReady still converges") {
+    FileDB client_db("c"), server_db("s"), client_shadow("cs"), server_shadow("ss");
+    const char* schema =
+        "CREATE TABLE client_t (id INTEGER PRIMARY KEY, v TEXT);"
+        "CREATE TABLE server_t (id INTEGER PRIMARY KEY, v TEXT)";
+    client_db.exec(schema);
+    server_db.exec(schema);
+    client_shadow.exec(schema);
+    server_shadow.exec(schema);
+
+    PeerConfig client_cfg;
+    client_cfg.owned_tables = {"client_t"};
+    Peer client(client_db.db, client_cfg);
+    PeerConfig server_cfg;
+    server_cfg.role = PeerRole::Server;
+    Peer server(server_db.db, server_cfg);
+
+    DelayedDatagramExchange wire;
+    wire.peers[0] = &client;
+    wire.peers[1] = &server;
+    wire.enqueue(1, client.start());
+    REQUIRE(wire.pump());
+    REQUIRE(wire.reorders >= 1);
+    REQUIRE(client.state() == Peer::State::Live);
+    REQUIRE(server.state() == Peer::State::Live);
+    CHECK(wire.live_invalid_state == 0);
+
+    auto client_sub = client.subscribe("SELECT id, v FROM server_t ORDER BY id");
+    auto server_sub = server.subscribe("SELECT id, v FROM client_t ORDER BY id");
+
+    WriteLog client_log;
+    WriteLog server_log;
+    client_log.commit(client_db, client_shadow, "INSERT INTO client_t VALUES (1, 'c1')");
+    client_log.commit(client_db, client_shadow, "UPDATE client_t SET v = 'c1b' WHERE id = 1");
+    client_log.commit(client_db, client_shadow, "INSERT INTO client_t VALUES (2, 'c2')");
+    server_log.commit(server_db, server_shadow, "INSERT INTO server_t VALUES (1, 's1')");
+    server_log.commit(server_db, server_shadow, "DELETE FROM server_t WHERE id = 1");
+    server_log.commit(server_db, server_shadow, "INSERT INTO server_t VALUES (2, 's2')");
+
+    wire.enqueue(1, client.flush());
+    wire.enqueue(0, server.flush());
+    REQUIRE(wire.pump());
+    CHECK(wire.live_invalid_state == 0);
+    CHECK(client.state() == Peer::State::Live);
+    CHECK(server.state() == Peer::State::Live);
+
+    const char* client_sql = "SELECT id, v FROM client_t ORDER BY id";
+    const char* server_sql = "SELECT id, v FROM server_t ORDER BY id";
+    CHECK(dump(server_db.db, client_sql) == client_log.replay_query(schema, client_sql));
+    CHECK(dump(client_db.db, server_sql) == server_log.replay_query(schema, server_sql));
+    CHECK(dump(server_db.db, client_sql) == dump(client_shadow.db, client_sql));
+    CHECK(dump(client_db.db, server_sql) == dump(server_shadow.db, server_sql));
+
+    auto* client_payload = last_sub(wire.subscriptions[0], client_sub);
+    auto* server_payload = last_sub(wire.subscriptions[1], server_sub);
+    REQUIRE(client_payload != nullptr);
+    REQUIRE(server_payload != nullptr);
+    expect_query(*client_payload, client_db.db, server_sql);
+    expect_query(*server_payload, server_db.db, client_sql);
+
+    client_log.commit(client_db, client_shadow, "INSERT INTO client_t VALUES (3, 'live')");
+    wire.enqueue(1, client.flush());
+    REQUIRE(wire.pump());
+    CHECK(wire.live_invalid_state == 0);
+    CHECK(dump(server_db.db, client_sql) == client_log.replay_query(schema, client_sql));
+    CHECK(client.state() == Peer::State::Live);
+    CHECK(server.state() == Peer::State::Live);
+}
+
+TEST_CASE("fault-suite: scalar override after peer closure matches a direct query") {
+    auto path = make_path("scalar-local");
+    auto remote_path = make_path("scalar-remote");
+    const char* schema =
+        "CREATE TABLE providers (id INTEGER PRIMARY KEY, provider TEXT, status TEXT);"
+        "CREATE TABLE overrides (id INTEGER PRIMARY KEY, label TEXT)";
+    Database db(path, schema);
+    Database remote(remote_path, schema);
+    db.exec("INSERT INTO providers VALUES (1, 'claude', 'available')");
+    db.exec("INSERT INTO overrides VALUES (1, 'first')");
+    remote.exec("INSERT INTO providers VALUES (1, 'claude', 'available')");
+    remote.exec("INSERT INTO overrides VALUES (1, 'first')");
+
+    {
+        PeerConfig client_cfg;
+        client_cfg.owned_tables = {"providers"};
+        Peer client(db.handle(), client_cfg);
+        PeerConfig server_cfg;
+        server_cfg.role = PeerRole::Server;
+        Peer server(remote.handle(), server_cfg);
+        sync_handshake(client, server);
+        REQUIRE(client.state() == Peer::State::Live);
+        REQUIRE(server.state() == Peer::State::Live);
+    }
+
+    const char* projection =
+        "SELECT {status, label: (SELECT label FROM overrides WHERE id = 1)} "
+        "FROM providers WHERE provider = 'claude'";
+    std::vector<QueryResult> seen;
+    auto sub = db.subscribe(projection, [&](const QueryResult& result) {
+        seen.push_back(result);
+    });
+    REQUIRE_FALSE(seen.empty());
+    auto direct = db.query(projection);
+    CHECK(seen.back().rows == direct.rows);
+    auto before = seen.size();
+
+    // Inner scalar table only. providers is not written in this statement.
+    db.exec("UPDATE overrides SET label = 'second' WHERE id = 1");
+    REQUIRE(seen.size() > before);
+    direct = db.query(projection);
+    CHECK(seen.back().columns == direct.columns);
+    CHECK(seen.back().rows == direct.rows);
+    REQUIRE_FALSE(direct.rows.empty());
+    bool saw_second = false;
+    for (const auto& value : direct.rows[0]) {
+        if (value_text(value).find("second") != std::string::npos) saw_second = true;
+    }
+    CHECK(saw_second);
+    CHECK(db.subscription_count() == 1);
+    (void)sub;
+    std::remove(path.c_str());
+    std::remove(remote_path.c_str());
 }

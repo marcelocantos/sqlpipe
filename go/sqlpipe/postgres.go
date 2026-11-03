@@ -108,27 +108,27 @@ func NewPeerPG(conn *PGConn, config PeerConfig) (*Peer, error) {
 	if config.ApproveOwnership != nil {
 		h := p.handles.add(config.ApproveOwnership)
 		cfg.approve_ownership = C.sqlpipe_approve_ownership_fn(C.cApproveOwnershipTrampoline)
-		cfg.approve_ownership_ctx = unsafe.Pointer(uintptr(h))
+		cfg.approve_ownership_ctx = cgoHandlePtr(h)
 	}
 	if config.OnConflict != nil {
 		h := p.handles.add(config.OnConflict)
 		cfg.on_conflict = C.sqlpipe_conflict_fn(C.cConflictTrampoline)
-		cfg.conflict_ctx = unsafe.Pointer(uintptr(h))
+		cfg.conflict_ctx = cgoHandlePtr(h)
 	}
 	if config.OnProgress != nil {
 		h := p.handles.add(config.OnProgress)
 		cfg.on_progress = C.sqlpipe_progress_fn(C.cProgressTrampoline)
-		cfg.progress_ctx = unsafe.Pointer(uintptr(h))
+		cfg.progress_ctx = cgoHandlePtr(h)
 	}
 	if config.OnSchemaMismatch != nil {
 		h := p.handles.add(config.OnSchemaMismatch)
 		cfg.on_schema_mismatch = C.sqlpipe_schema_mismatch_fn(C.cSchemaMismatchTrampoline)
-		cfg.schema_mismatch_ctx = unsafe.Pointer(uintptr(h))
+		cfg.schema_mismatch_ctx = cgoHandlePtr(h)
 	}
 	if config.OnLog != nil {
 		h := p.handles.add(config.OnLog)
 		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
-		cfg.log_ctx = unsafe.Pointer(uintptr(h))
+		cfg.log_ctx = cgoHandlePtr(h)
 	}
 
 	if err := convertError(C.sqlpipe_peer_new_pg(conn.conn, cfg, &p.ptr)); err != nil {

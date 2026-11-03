@@ -369,11 +369,13 @@ exactly-once events lives in `README.md` ("Recovery, health, and
 subscriptions"). `SyncStatus::Live` is not source freshness. Subscription
 delivery is synchronous backpressure with no result queue;
 `handle_messages` coalesces a burst to the latest result and may omit
-intermediates. The C++ fault suite claims are listed there. Go `RunPeer`
-(T36), dual-channel ordering (T37), T39 and T40 outside C++ SQLite
-`QueryWatch` (including a scalar override after peer closure, and
-one-shot `Query`), Swift, Wasm, and Postgres fault injection are not
-claimed by that suite.
+intermediates. The C++ fault suite claims are listed there. They include
+delayed NeedBuckets after an earlier DiffReady, a scalar override after
+peer closure, and `QueryFailed` leaving the result hash and the pending
+initial delivery unchanged. Go `RunPeer` serializes native peer calls and
+joins its receivers before return; that runner has no stall timer. Swift,
+Wasm, Postgres fault injection, one-shot `Query`, provider auth, and a
+separate OS process per endpoint remain outside that evidence.
 
 ## Gaps
 

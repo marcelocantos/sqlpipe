@@ -595,27 +595,44 @@ changeset apply (no partial commit, sequence not advanced), one-way
 blackhole visible as sequence lag and as `reset()` → `Unsynchronized`,
 loss of best-effort bucket hashes recovered by `converge()`, reliable
 changeset reorder rejected without applying, nested-subquery and
-scalar-subquery invalidation, query error and repair, slow-consumer
+scalar-subquery invalidation, a scalar override after the replication
+peer objects are destroyed (`fault-suite: scalar override after peer
+closure matches a direct query`), query prepare and `sqlite3_step`
+failure (`ErrorCode::QueryFailed`, no partial result, result hash and
+pending initial delivery left in place, repair delivers), slow-consumer
 coalescing, cancellation, database close, and explicit peer resubscribe.
 Expected rows come from a replay of the committed write log. Expected
 payloads come from a direct query.
 
-Not claimed, and not evidence:
+`fault-suite: delayed NeedBuckets after DiffReady still converges`
+delivers every reliable message before any queued best-effort message.
+It requires at least one NeedBuckets-after-DiffReady reorder, then checks
+that both peers stay `Live`, apply changesets in both directions, and
+emit no `InvalidState` while `Live`. An ordered loopback is a different
+test and is not this proof.
 
-- Go `RunPeer` transport lifetime (T36), including any stalled-link policy
-  inside that runner. The Go `ErrorCode` integer matches `QueryFailed` (9)
-  but the Go, Swift, and Wasm wrappers are not in this suite.
-- Dual-channel ordering (T37). An ordered loopback does not prove it.
-- T39 and T40 on any surface other than C++ SQLite `QueryWatch`. This suite
-  does cover nested `IN (SELECT …)` and scalar-subquery invalidation, and
-  it does cover `QueryFailed` without a partial result or a moved result
-  hash. It does not cover T39's scalar override after a replication peer
-  is closed, and it does not cover one-shot `Query` outside `QueryWatch`.
-- Postgres fault injection. `make gate` still runs the existing live
-  Postgres tests; this suite does not.
-- Provider authentication, provider polling, or time-based invalidation.
-- A separate OS process per endpoint. Restart is a new `Master` / `Replica`
-  on the same file after the previous objects are destroyed.
+Go `RunPeer` (`TestRunPeerSerializesJoinsAndReportsTransportFailure`)
+serializes native `Start`, `HandleMessage`, and `Flush` on one owner
+lock, including a flush queued during the handshake. Subscription
+handlers run outside that lock and may take it. On transport error and
+on cancel, `RunPeer` cancels and joins its receiver goroutines before
+return. The unfiltered `go test -race ./...` check covers that package.
+`RunPeer` has no stall timer: the caller cancels, or `Transport` returns
+an error.
+
+Limits of this evidence:
+
+- Swift and Wasm have no copy of this suite.
+- Postgres fault injection is absent. `make gate` still runs the existing
+  live Postgres tests.
+- Provider authentication, provider polling, and time-based invalidation
+  are absent.
+- One-shot `Query` outside `QueryWatch` notification is absent.
+- A separate OS process per endpoint is absent. Restart is a new
+  `Master` / `Replica` on the same file after the previous objects are
+  destroyed.
+- The Go race test is the `RunPeer` lifetime check. It is not the C++
+  fault matrix, and it is not the delayed-NeedBuckets proof.
 
 ## Error handling
 

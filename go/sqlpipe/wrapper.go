@@ -1035,6 +1035,17 @@ func (h *callbackHandles) add(v any) cgo.Handle {
 	return handle
 }
 
+// cgoHandlePtr turns a cgo.Handle into the void* stored on the C config.
+// Handle values are integer tokens, not Go pointers. The race detector's
+// checkptr rejects unsafe.Pointer(uintptr(token)) unless the conversion
+// opts out.
+//
+//go:nocheckptr
+//go:noinline
+func cgoHandlePtr(h cgo.Handle) unsafe.Pointer {
+	return unsafe.Pointer(uintptr(h))
+}
+
 func (h *callbackHandles) free() {
 	for _, handle := range *h {
 		handle.Delete()
@@ -1105,22 +1116,22 @@ func NewMaster(db *Database, config MasterConfig) (*Master, error) {
 	if config.OnProgress != nil {
 		h := m.handles.add(config.OnProgress)
 		cfg.on_progress = C.sqlpipe_progress_fn(C.cProgressTrampoline)
-		cfg.progress_ctx = unsafe.Pointer(uintptr(h))
+		cfg.progress_ctx = cgoHandlePtr(h)
 	}
 	if config.OnSchemaMismatch != nil {
 		h := m.handles.add(config.OnSchemaMismatch)
 		cfg.on_schema_mismatch = C.sqlpipe_schema_mismatch_fn(C.cSchemaMismatchTrampoline)
-		cfg.schema_mismatch_ctx = unsafe.Pointer(uintptr(h))
+		cfg.schema_mismatch_ctx = cgoHandlePtr(h)
 	}
 	if config.OnLog != nil {
 		h := m.handles.add(config.OnLog)
 		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
-		cfg.log_ctx = unsafe.Pointer(uintptr(h))
+		cfg.log_ctx = cgoHandlePtr(h)
 	}
 	if config.OnFlush != nil {
 		h := m.handles.add(config.OnFlush)
 		cfg.on_flush = C.sqlpipe_flush_fn(C.cFlushTrampoline)
-		cfg.flush_ctx = unsafe.Pointer(uintptr(h))
+		cfg.flush_ctx = cgoHandlePtr(h)
 	}
 
 	if err := convertError(C.sqlpipe_master_new(db.db, cfg, &m.ptr)); err != nil {
@@ -1200,7 +1211,7 @@ func NewReplica(db *Database, config ReplicaConfig) (*Replica, error) {
 	if config.OnConflict != nil {
 		h := r.handles.add(config.OnConflict)
 		cfg.on_conflict = C.sqlpipe_conflict_fn(C.cConflictTrampoline)
-		cfg.conflict_ctx = unsafe.Pointer(uintptr(h))
+		cfg.conflict_ctx = cgoHandlePtr(h)
 	}
 
 	tfPtrs, tfCount := tableFilterToCStrings(config.TableFilter)
@@ -1218,17 +1229,17 @@ func NewReplica(db *Database, config ReplicaConfig) (*Replica, error) {
 	if config.OnProgress != nil {
 		h := r.handles.add(config.OnProgress)
 		cfg.on_progress = C.sqlpipe_progress_fn(C.cProgressTrampoline)
-		cfg.progress_ctx = unsafe.Pointer(uintptr(h))
+		cfg.progress_ctx = cgoHandlePtr(h)
 	}
 	if config.OnSchemaMismatch != nil {
 		h := r.handles.add(config.OnSchemaMismatch)
 		cfg.on_schema_mismatch = C.sqlpipe_schema_mismatch_fn(C.cSchemaMismatchTrampoline)
-		cfg.schema_mismatch_ctx = unsafe.Pointer(uintptr(h))
+		cfg.schema_mismatch_ctx = cgoHandlePtr(h)
 	}
 	if config.OnLog != nil {
 		h := r.handles.add(config.OnLog)
 		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
-		cfg.log_ctx = unsafe.Pointer(uintptr(h))
+		cfg.log_ctx = cgoHandlePtr(h)
 	}
 	if config.QueueWhilePredicting {
 		cfg.queue_while_predicting = 1
@@ -1440,27 +1451,27 @@ func NewPeer(db *Database, config PeerConfig) (*Peer, error) {
 	if config.ApproveOwnership != nil {
 		h := p.handles.add(config.ApproveOwnership)
 		cfg.approve_ownership = C.sqlpipe_approve_ownership_fn(C.cApproveOwnershipTrampoline)
-		cfg.approve_ownership_ctx = unsafe.Pointer(uintptr(h))
+		cfg.approve_ownership_ctx = cgoHandlePtr(h)
 	}
 	if config.OnConflict != nil {
 		h := p.handles.add(config.OnConflict)
 		cfg.on_conflict = C.sqlpipe_conflict_fn(C.cConflictTrampoline)
-		cfg.conflict_ctx = unsafe.Pointer(uintptr(h))
+		cfg.conflict_ctx = cgoHandlePtr(h)
 	}
 	if config.OnProgress != nil {
 		h := p.handles.add(config.OnProgress)
 		cfg.on_progress = C.sqlpipe_progress_fn(C.cProgressTrampoline)
-		cfg.progress_ctx = unsafe.Pointer(uintptr(h))
+		cfg.progress_ctx = cgoHandlePtr(h)
 	}
 	if config.OnSchemaMismatch != nil {
 		h := p.handles.add(config.OnSchemaMismatch)
 		cfg.on_schema_mismatch = C.sqlpipe_schema_mismatch_fn(C.cSchemaMismatchTrampoline)
-		cfg.schema_mismatch_ctx = unsafe.Pointer(uintptr(h))
+		cfg.schema_mismatch_ctx = cgoHandlePtr(h)
 	}
 	if config.OnLog != nil {
 		h := p.handles.add(config.OnLog)
 		cfg.on_log = C.sqlpipe_log_fn(C.cLogTrampoline)
-		cfg.log_ctx = unsafe.Pointer(uintptr(h))
+		cfg.log_ctx = cgoHandlePtr(h)
 	}
 
 	if err := convertError(C.sqlpipe_peer_new(db.db, cfg, &p.ptr)); err != nil {

@@ -59,6 +59,37 @@ type Link struct {
 	// ReConvergeInterval controls how often the replica re-probes while
 	// not Live. Zero means DefaultReConvergeInterval.
 	ReConvergeInterval time.Duration
+
+	// mu serializes native peer calls made by RunPeer (stream, datagram,
+	// and flush). Callers share it around local writes and subscription
+	// registration. RunPeer handlers are called without mu held.
+	mu sync.Mutex
+}
+
+// Lock takes the owner lock shared with RunPeer.
+func (l *Link) Lock() { l.mu.Lock() }
+
+// Unlock releases the owner lock.
+func (l *Link) Unlock() { l.mu.Unlock() }
+
+// nativeEnter and nativeLeave bracket each native peer call inside RunPeer.
+// The default functions are empty. Tests replace them to observe overlap
+// on a single peer.
+var nativeEnter = func(*sqlpipe.Peer) {}
+var nativeLeave = func(*sqlpipe.Peer) {}
+
+// receiverExit runs at the end of each RunPeer goroutine, before the
+// runner's wait group is released.
+var receiverExit = func() {}
+
+func (l *Link) withNative(p *sqlpipe.Peer, fn func()) {
+	l.mu.Lock()
+	nativeEnter(p)
+	defer func() {
+		nativeLeave(p)
+		l.mu.Unlock()
+	}()
+	fn()
 }
 
 // NewLink creates a Link over the given Transport.
@@ -303,21 +334,33 @@ type PeerHandler func(hr sqlpipe.PeerHandleResult) error
 // handler is called for each PeerHandleResult with changes or subscriptions.
 // Cancel ctx to stop the link.
 func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flushCh <-chan struct{}, handler PeerHandler) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	if isClient {
-		msgs, err := p.Start()
+		var msgs []sqlpipe.PeerOutMessage
+		var err error
+		l.withNative(p, func() {
+			msgs, err = p.Start()
+		})
 		if err != nil {
 			return err
 		}
 		for _, pom := range msgs {
-			if err := l.sendPeer(ctx, pom); err != nil {
+			if err := l.sendPeer(runCtx, pom); err != nil {
 				return err
 			}
 		}
 	}
 
-	errc := make(chan error, 3)
+	errc := make(chan error, 1)
 	var once sync.Once
-	fail := func(err error) { once.Do(func() { errc <- err }) }
+	fail := func(err error) {
+		once.Do(func() {
+			cancel()
+			errc <- err
+		})
+	}
 
 	dispatch := func(data []byte, bestEffort bool) {
 		msg, err := sqlpipe.DeserializePeer(data)
@@ -328,7 +371,10 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 			fail(err)
 			return
 		}
-		hr, err := p.HandleMessage(msg)
+		var hr sqlpipe.PeerHandleResult
+		l.withNative(p, func() {
+			hr, err = p.HandleMessage(msg)
+		})
 		if err != nil {
 			if bestEffort {
 				return
@@ -337,11 +383,12 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 			return
 		}
 		for _, pom := range hr.Messages {
-			if err := l.sendPeer(ctx, pom); err != nil {
+			if err := l.sendPeer(runCtx, pom); err != nil {
 				fail(err)
 				return
 			}
 		}
+		// Handler runs outside the owner lock so it can take that lock.
 		if handler != nil && (len(hr.Changes) > 0 || len(hr.Subscriptions) > 0) {
 			if err := handler(hr); err != nil {
 				fail(err)
@@ -350,10 +397,16 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 		}
 	}
 
-	// Stream receiver.
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// Stream receiver. The exit hook is called through a closure so tests
+	// can replace receiverExit after the goroutines have started.
 	go func() {
+		defer wg.Done()
+		defer func() { receiverExit() }()
 		for {
-			data, err := l.t.Recv(ctx)
+			data, err := l.t.Recv(runCtx)
 			if err != nil {
 				fail(err)
 				return
@@ -364,11 +417,14 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 
 	// Datagram receiver.
 	go func() {
+		defer wg.Done()
+		defer func() { receiverExit() }()
 		for {
-			data, err := l.t.RecvDatagram(ctx)
+			data, err := l.t.RecvDatagram(runCtx)
 			if err != nil {
-				if errors.Is(err, ctx.Err()) {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					fail(err)
+					return
 				}
 				continue
 			}
@@ -378,19 +434,25 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 
 	// Flush forwarder.
 	go func() {
+		defer wg.Done()
+		defer func() { receiverExit() }()
 		for {
 			select {
-			case <-ctx.Done():
-				fail(ctx.Err())
+			case <-runCtx.Done():
+				fail(runCtx.Err())
 				return
 			case <-flushCh:
-				msgs, err := p.Flush()
+				var msgs []sqlpipe.PeerOutMessage
+				var err error
+				l.withNative(p, func() {
+					msgs, err = p.Flush()
+				})
 				if err != nil {
 					fail(err)
 					return
 				}
 				for _, pom := range msgs {
-					if err := l.sendPeer(ctx, pom); err != nil {
+					if err := l.sendPeer(runCtx, pom); err != nil {
 						fail(err)
 						return
 					}
@@ -399,5 +461,8 @@ func (l *Link) RunPeer(ctx context.Context, p *sqlpipe.Peer, isClient bool, flus
 		}
 	}()
 
-	return <-errc
+	err := <-errc
+	cancel()
+	wg.Wait()
+	return err
 }

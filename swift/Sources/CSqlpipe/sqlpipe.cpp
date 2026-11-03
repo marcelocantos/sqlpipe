@@ -4529,7 +4529,6 @@ struct QueryWatch::Impl {
         // Also include any newly registered subscriptions that haven't
         // been evaluated yet (their initial result delivery).
         ids.insert(pending_new.begin(), pending_new.end());
-        pending_new.clear();
 
         std::vector<QueryResult> results;
         for (auto id : ids) {
@@ -4538,6 +4537,9 @@ struct QueryWatch::Impl {
             auto& sub = it->second;
 
             auto [result, hash] = evaluate_query(sub);
+            // A step error throws before this erase, so the initial
+            // delivery stays pending and a later notify can repair it.
+            pending_new.erase(id);
             if (hash != sub.result_hash) {
                 sub.result_hash = hash;
                 results.push_back(std::move(result));
@@ -5277,6 +5279,11 @@ struct Replica::Impl {
     ReplicaConfig  config;
     Seq            seq = 0;
     Replica::State state = Replica::State::Init;
+    // DiffReady messages applied before their paired empty NeedBuckets
+    // arrived. Best-effort NeedBuckets can be delivered after the reliable
+    // DiffReady; each such empty NeedBuckets is ignored so the replica
+    // stays Live and keeps applying changesets.
+    int unpaired_early_diff_ready = 0;
     QueryWatch     watch;
     /// Remote sequence last supplied by the master. Empty until known.
     std::optional<Seq> observed_remote_seq;
@@ -5433,6 +5440,17 @@ struct Replica::Impl {
     }
 
     HandleResult handle_need_buckets(const NeedBucketsMsg& m) {
+        // The matching DiffReady was already applied. Dropping this
+        // delayed empty NeedBuckets keeps the replica in Live; stepping
+        // to DiffRows here rejects every later changeset while Peer::state
+        // stays Live.
+        if (m.ranges.empty() && unpaired_early_diff_ready > 0) {
+            --unpaired_early_diff_ready;
+            SQLPIPE_LOG(config.on_log, LogLevel::Info,
+                        "ignoring NeedBuckets already satisfied by DiffReady");
+            return {};
+        }
+
         // Accept in DiffBuckets (normal handshake) or Live (re-convergence).
         if (state != Replica::State::DiffBuckets &&
             state != Replica::State::Live) {
@@ -5499,6 +5517,10 @@ struct Replica::Impl {
 
     HandleResult handle_diff_ready(const DiffReadyMsg& m) {
         // Accept in DiffRows, DiffBuckets (normal handshake), or Live (re-convergence).
+        // DiffRows means the NeedBuckets for this round was already consumed.
+        const bool arrived_before_need =
+            state == Replica::State::DiffBuckets ||
+            state == Replica::State::Live;
         if (state != Replica::State::DiffRows &&
             state != Replica::State::DiffBuckets &&
             state != Replica::State::Live) {
@@ -5612,6 +5634,7 @@ struct Replica::Impl {
         }
 
         state = Replica::State::Live;
+        if (arrived_before_need) ++unpaired_early_diff_ready;
         SQLPIPE_LOG(config.on_log, LogLevel::Info, "diff applied, entering live at seq={}", seq);
 
         return {{tagged(Message{AckMsg{m.seq}})}, std::move(events), {}};
@@ -6058,6 +6081,7 @@ void Replica::reset() {
     }
     // Drop deferred messages — reconnect/diff will resync truth.
     impl_->prediction_queue.clear();
+    impl_->unpaired_early_diff_ready = 0;
     impl_->state = State::Init;
     impl_->seq = detail::read_seq(impl_->db, impl_->config.seq_key);
     SQLPIPE_LOG(impl_->config.on_log, LogLevel::Info, "replica reset to Init at seq={}", impl_->seq);
