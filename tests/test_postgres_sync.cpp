@@ -354,6 +354,50 @@ TEST_CASE("postgres Database::postgres + subscribe (T34.4)") {
     (void)sub;
 }
 
+TEST_CASE("postgres Database query runs sqldeep JSON join RECURSE") {
+    if (!server_ready()) {
+        MESSAGE("no Postgres server — skipped");
+        return;
+    }
+    ensure_database("sqlpipe_m");
+    auto db = Database::postgres(conninfo_for("sqlpipe_m"),
+        "CREATE TABLE categories ("
+        "id BIGINT PRIMARY KEY, name TEXT NOT NULL, parent_id BIGINT)");
+    CHECK(db.sqlite_handle() == nullptr);
+    CHECK(db.postgres_handle() != nullptr);
+    db.exec("INSERT INTO categories (id, name, parent_id) VALUES "
+            "(1, 'root', NULL), (2, 'child', 1)");
+    db.exec("CREATE TABLE customers ("
+            "customers_id BIGINT PRIMARY KEY, name TEXT)");
+    db.exec("CREATE TABLE orders ("
+            "orders_id BIGINT PRIMARY KEY, customers_id BIGINT, total INT)");
+    db.exec("INSERT INTO customers (customers_id, name) VALUES (1, 'ada')");
+    db.exec("INSERT INTO orders (orders_id, customers_id, total) "
+            "VALUES (10, 1, 5)");
+
+    auto obj = db.query("SELECT { name } FROM customers");
+    REQUIRE(obj.rows.size() == 1);
+    auto obj_s = std::get<std::string>(obj.rows[0][0]);
+    CHECK(obj_s.find("ada") != std::string::npos);
+
+    auto joined = db.query(
+        "SELECT { name, orders: SELECT { total } FROM c->orders o } "
+        "FROM customers c");
+    REQUIRE(joined.rows.size() == 1);
+    auto joined_s = std::get<std::string>(joined.rows[0][0]);
+    CHECK(joined_s.find("ada") != std::string::npos);
+    CHECK(joined_s.find("5") != std::string::npos);
+
+    auto tree = db.query(
+        "SELECT/1 { id, name, children: * } FROM categories "
+        "RECURSE ON (parent_id) WHERE parent_id IS NULL");
+    REQUIRE(tree.rows.size() == 1);
+    auto tree_s = std::get<std::string>(tree.rows[0][0]);
+    CHECK(tree_s.find("root") != std::string::npos);
+    CHECK(tree_s.find("child") != std::string::npos);
+    CHECK(tree_s.find("children") != std::string::npos);
+}
+
 TEST_CASE("postgres prediction rejects caller txn (T34.4)") {
     if (!server_ready()) {
         MESSAGE("no Postgres server — skipped");

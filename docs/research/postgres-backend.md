@@ -5,7 +5,8 @@
 **Related:** 🎯T34 (umbrella — set this as the goal), 🎯T26 (structural schema),
 🎯T27 / `edge-projection-multiplayer.md` (parameterized SQLite slice — **out of
 scope here**), 🎯T28 (parked hub/slice; now depends on T34), sqldeep 🎯T18,
-sqlift 🎯T3. sqldeep `SQLDEEP_POSTGRES` is transpile-only until T18.
+sqlift 🎯T3. sqldeep `SQLDEEP_POSTGRES` is a live runtime for JSON, join
+paths, and `RECURSE` (sqldeep CI job `postgres`); XML stays SQLite-only.
 
 ---
 
@@ -230,11 +231,13 @@ widen `Value`; that is a C++/wrapper change, not a wire change.
 
 ### Today
 
-`SQLDEEP_POSTGRES` emits `jsonb_build_object` / `jsonb_build_array` /
-`jsonb_agg` / `jsonb_extract_path`, and `RECURSE` already branches on
-`lpad` / `ctid` / `string_agg` / `pg_typeof`. Coverage is
-`expected_postgres` string goldens. Hygiene `correctness.postgres-live` is
-planned. 🎯T11 documented this as transpile-only so 1.0 would not lie.
+`SQLDEEP_POSTGRES` is a live runtime for JSON objects and arrays, join
+paths, `SELECT/1`, FK-guided joins, JSON path, and `RECURSE`. sqldeep CI
+job `postgres` transpiles with `SQLDEEP_POSTGRES` and executes that subset
+of `testdata/sqlite.yaml` against PostgreSQL 16 (`tests/test_postgres.cpp`).
+JSON uses stock `jsonb_*`. XML, JSONML, and JSX stay SQLite-only. String
+goldens in `expected_postgres` still pin the emitter. 🎯T11's earlier
+transpile-only note was the honest claim before this oracle.
 
 ### v1 runtime
 

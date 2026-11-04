@@ -11,16 +11,40 @@
 #include "sqldeep_xml.h"
 
 #include <sqlite3.h>
+#include <limits.h>
 #include <string.h>
+#include <stdint.h>
 
 static int is_xml_blob(sqlite3_value *v) {
     return sqlite3_value_type(v) == SQLITE_BLOB;
 }
 
+/* Tag / attr-name / JSON-key slots must not crash on SQL NULL.
+   Returns 1 and sets *out on success; on NULL, reports an error and
+   returns 0. */
+static int require_text(sqlite3_context *ctx, sqlite3_value *v,
+                        const char *what, const char **out) {
+    if (sqlite3_value_type(v) == SQLITE_NULL) {
+        char buf[96];
+        sqlite3_snprintf(sizeof(buf), buf, "NULL %s", what);
+        sqlite3_result_error(ctx, buf, -1);
+        return 0;
+    }
+    const char *s = (const char *)sqlite3_value_text(v);
+    if (!s) {
+        char buf[96];
+        sqlite3_snprintf(sizeof(buf), buf, "NULL %s", what);
+        sqlite3_result_error(ctx, buf, -1);
+        return 0;
+    }
+    *out = s;
+    return 1;
+}
+
 // ── Escaping helpers ────────────────────────────────────────────────
 
 static int xml_escaped_len(const char *s) {
-    int n = 0;
+    size_t n = 0;
     for (; *s; ++s) {
         switch (*s) {
         case '<': n += 4; break;
@@ -28,8 +52,25 @@ static int xml_escaped_len(const char *s) {
         case '&': n += 5; break;
         default:  n++; break;
         }
+        if (n > (size_t)INT_MAX) return -1;
     }
-    return n;
+    return (int)n;
+}
+
+/* Attribute values also escape '"'; text content does not. */
+static int xml_attr_escaped_len(const char *s) {
+    size_t n = 0;
+    for (; *s; ++s) {
+        switch (*s) {
+        case '"': n += 6; break; /* &quot; */
+        case '<': n += 4; break;
+        case '>': n += 4; break;
+        case '&': n += 5; break;
+        default:  n++; break;
+        }
+        if (n > (size_t)INT_MAX) return -1;
+    }
+    return (int)n;
 }
 
 static void xml_escape_text_to(const char *s, char *out, int *pos) {
@@ -53,21 +94,28 @@ static void sd_xml_attrs(sqlite3_context *ctx, int argc,
         return;
     }
     for (i = 0; i < argc; i += 2) {
-        const char *val;
+        const char *name, *val;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
+        if (!require_text(ctx, argv[i], "attribute name", &name)) return;
         /* sqldeep_json('true') / sqldeep_json('false') = boolean BLOB */
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_BLOB) {
             int blen = sqlite3_value_bytes(argv[i + 1]);
             const char *b = (const char *)sqlite3_value_blob(argv[i + 1]);
             if (blen == 5 && memcmp(b, "false", 5) == 0) continue;
             /* true → bare attribute name */
-            len += 1 + (int)strlen((const char *)sqlite3_value_text(argv[i]));
+            len += 1 + (int)strlen(name);
             continue;
         }
         len += 1; /* space */
-        len += (int)strlen((const char *)sqlite3_value_text(argv[i]));
+        len += (int)strlen(name);
         val = (const char *)sqlite3_value_text(argv[i + 1]);
-        len += 2 + xml_escaped_len(val); /* ="..." */
+        if (!val) val = "";
+        /* three structural bytes for ="" plus escaped value */
+        {
+            int elen = xml_attr_escaped_len(val);
+            if (elen < 0) { sqlite3_result_error_toobig(ctx); return; }
+            len += 3 + elen;
+        }
     }
     char *out = (char *)sqlite3_malloc(len + 1);
     if (!out) { sqlite3_result_error_nomem(ctx); return; }
@@ -75,7 +123,10 @@ static void sd_xml_attrs(sqlite3_context *ctx, int argc,
     for (i = 0; i < argc; i += 2) {
         const char *name, *val;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
-        name = (const char *)sqlite3_value_text(argv[i]);
+        if (!require_text(ctx, argv[i], "attribute name", &name)) {
+            sqlite3_free(out);
+            return;
+        }
         /* sqldeep_json('true') / sqldeep_json('false') = boolean BLOB */
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_BLOB) {
             int blen = sqlite3_value_bytes(argv[i + 1]);
@@ -88,6 +139,7 @@ static void sd_xml_attrs(sqlite3_context *ctx, int argc,
             continue;
         }
         val = (const char *)sqlite3_value_text(argv[i + 1]);
+        if (!val) val = "";
         out[pos++] = ' ';
         memcpy(out + pos, name, strlen(name));
         pos += (int)strlen(name);
@@ -116,7 +168,8 @@ static void sd_xml_element(sqlite3_context *ctx, int argc,
         sqlite3_result_error(ctx, "xml_element requires at least 1 arg", -1);
         return;
     }
-    const char *tag = (const char *)sqlite3_value_text(argv[0]);
+    const char *tag;
+    if (!require_text(ctx, argv[0], "tag", &tag)) return;
     int taglen = (int)strlen(tag);
     int self_closing = (taglen > 0 && tag[taglen - 1] == '/');
     if (self_closing) taglen--; /* strip trailing '/' from tag name */
@@ -198,14 +251,19 @@ typedef struct XmlAggCtx {
     int cap;
 } XmlAggCtx;
 
-static void xml_agg_append(XmlAggCtx *p, const char *s, int n) {
+static int xml_agg_append(XmlAggCtx *p, const char *s, int n) {
+    if (n < 0) return 0;
     if (p->len + n >= p->cap) {
-        int newcap = (p->cap + n) * 2 + 64;
-        p->buf = (char *)sqlite3_realloc(p->buf, newcap);
-        p->cap = newcap;
+        sqlite3_int64 newcap = ((sqlite3_int64)p->cap + n) * 2 + 64;
+        if (newcap > (sqlite3_int64)INT_MAX) return 0;
+        char *nb = (char *)sqlite3_realloc(p->buf, (int)newcap);
+        if (!nb) return 0;
+        p->buf = nb;
+        p->cap = (int)newcap;
     }
     memcpy(p->buf + p->len, s, n);
     p->len += n;
+    return 1;
 }
 
 static void sd_xml_agg_step(sqlite3_context *ctx, int argc,
@@ -216,16 +274,22 @@ static void sd_xml_agg_step(sqlite3_context *ctx, int argc,
     if (!p) return;
     if (is_xml_blob(argv[0])) {
         int blen = sqlite3_value_bytes(argv[0]);
-        xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen);
+        if (!xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen)) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
     } else {
         const char *v = (const char *)sqlite3_value_text(argv[0]);
+        if (!v) return;
         for (const char *c = v; *c; ++c) {
+            int ok = 1;
             switch (*c) {
-            case '<': xml_agg_append(p, "&lt;", 4); break;
-            case '>': xml_agg_append(p, "&gt;", 4); break;
-            case '&': xml_agg_append(p, "&amp;", 5); break;
-            default: xml_agg_append(p, c, 1); break;
+            case '<': ok = xml_agg_append(p, "&lt;", 4); break;
+            case '>': ok = xml_agg_append(p, "&gt;", 4); break;
+            case '&': ok = xml_agg_append(p, "&amp;", 5); break;
+            default:  ok = xml_agg_append(p, c, 1); break;
             }
+            if (!ok) { sqlite3_result_error_nomem(ctx); return; }
         }
     }
 }
@@ -242,7 +306,7 @@ static void sd_xml_agg_final(sqlite3_context *ctx) {
 // ── JSON string escaping helper ──────────────────────────────────────
 
 static int json_escaped_len(const char *s, int n) {
-    int len = 0;
+    size_t len = 0;
     for (int i = 0; i < n; ++i) {
         unsigned char c = (unsigned char)s[i];
         switch (c) {
@@ -253,8 +317,9 @@ static int json_escaped_len(const char *s, int n) {
             else len++;
             break;
         }
+        if (len > (size_t)INT_MAX) return -1;
     }
-    return len;
+    return (int)len;
 }
 
 static void json_escape_to(const char *s, int n, char *out, int *pos) {
@@ -304,10 +369,11 @@ static void sd_xml_attrs_jsonml(sqlite3_context *ctx, int argc,
         const char *name, *val;
         int namelen, vallen;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
+        if (!require_text(ctx, argv[i], "attribute name", &name)) return;
         nattrs++;
-        name = (const char *)sqlite3_value_text(argv[i]);
         namelen = (int)strlen(name);
         val = (const char *)sqlite3_value_text(argv[i + 1]);
+        if (!val) val = "";
         vallen = (int)strlen(val);
         len += 2 + json_escaped_len(name, namelen); /* "name" */
         len += 1; /* : */
@@ -324,9 +390,13 @@ static void sd_xml_attrs_jsonml(sqlite3_context *ctx, int argc,
         int namelen, vallen;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
         if (written++ > 0) out[pos++] = ',';
-        name = (const char *)sqlite3_value_text(argv[i]);
+        if (!require_text(ctx, argv[i], "attribute name", &name)) {
+            sqlite3_free(out);
+            return;
+        }
         namelen = (int)strlen(name);
         val = (const char *)sqlite3_value_text(argv[i + 1]);
+        if (!val) val = "";
         vallen = (int)strlen(val);
         out[pos++] = '"';
         json_escape_to(name, namelen, out, &pos);
@@ -349,7 +419,8 @@ static void sd_xml_element_jsonml(sqlite3_context *ctx, int argc,
         sqlite3_result_error(ctx, "xml_element_jsonml requires at least 1 arg", -1);
         return;
     }
-    const char *tag = (const char *)sqlite3_value_text(argv[0]);
+    const char *tag;
+    if (!require_text(ctx, argv[0], "tag", &tag)) return;
     int taglen = (int)strlen(tag);
     if (taglen > 0 && tag[taglen - 1] == '/') taglen--; /* strip void marker */
     int child_start = 1;
@@ -431,20 +502,40 @@ static void sd_jsonml_agg_step(sqlite3_context *ctx, int argc,
     if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return;
     XmlAggCtx *p = (XmlAggCtx *)sqlite3_aggregate_context(ctx, sizeof(*p));
     if (!p) return;
-    if (p->len > 0) xml_agg_append(p, ",", 1);
+    if (p->len > 0) {
+        if (!xml_agg_append(p, ",", 1)) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
+    }
     if (is_xml_blob(argv[0])) {
         int blen = sqlite3_value_bytes(argv[0]);
-        xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen);
+        if (!xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen)) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
     } else {
         /* Text child — emit as JSON string */
         const char *v = (const char *)sqlite3_value_text(argv[0]);
+        if (!v) return;
         int vlen = (int)strlen(v);
-        int elen = 2 + json_escaped_len(v, vlen);
+        int jel = json_escaped_len(v, vlen);
+        if (jel < 0) { sqlite3_result_error_toobig(ctx); return; }
+        int elen = 2 + jel;
         /* Ensure capacity and write directly */
         if (p->len + elen >= p->cap) {
-            int newcap = (p->cap + elen) * 2 + 64;
-            p->buf = (char *)sqlite3_realloc(p->buf, newcap);
-            p->cap = newcap;
+            sqlite3_int64 newcap = ((sqlite3_int64)p->cap + elen) * 2 + 64;
+            if (newcap > (sqlite3_int64)INT_MAX) {
+                sqlite3_result_error_nomem(ctx);
+                return;
+            }
+            char *nb = (char *)sqlite3_realloc(p->buf, (int)newcap);
+            if (!nb) {
+                sqlite3_result_error_nomem(ctx);
+                return;
+            }
+            p->buf = nb;
+            p->cap = (int)newcap;
         }
         p->buf[p->len++] = '"';
         json_escape_to(v, vlen, p->buf, &p->len);
@@ -496,15 +587,17 @@ static void sd_xml_attrs_jsx(sqlite3_context *ctx, int argc,
         int namelen, vallen;
         int raw;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
+        if (!require_text(ctx, argv[i], "attribute name", &name)) return;
         nattrs++;
         /* Check raw BEFORE sqlite3_value_text (which coerces BLOB→TEXT) */
         raw = jsx_is_raw(argv[i + 1]);
-        name = (const char *)sqlite3_value_text(argv[i]);
         namelen = (int)strlen(name);
         if (raw && sqlite3_value_type(argv[i + 1]) == SQLITE_BLOB) {
             vallen = sqlite3_value_bytes(argv[i + 1]);
         } else {
-            vallen = (int)strlen((const char *)sqlite3_value_text(argv[i + 1]));
+            const char *val = (const char *)sqlite3_value_text(argv[i + 1]);
+            if (!val) val = "";
+            vallen = (int)strlen(val);
         }
         len += 2 + json_escaped_len(name, namelen); /* "name" */
         len += 1; /* : */
@@ -512,6 +605,7 @@ static void sd_xml_attrs_jsx(sqlite3_context *ctx, int argc,
             len += vallen; /* raw JSON/number */
         } else {
             const char *val = (const char *)sqlite3_value_text(argv[i + 1]);
+            if (!val) val = "";
             len += 2 + json_escaped_len(val, vallen); /* "val" */
         }
     }
@@ -529,7 +623,10 @@ static void sd_xml_attrs_jsx(sqlite3_context *ctx, int argc,
         if (written++ > 0) out[pos++] = ',';
         /* Check raw BEFORE sqlite3_value_text (which coerces BLOB→TEXT) */
         raw = jsx_is_raw(argv[i + 1]);
-        name = (const char *)sqlite3_value_text(argv[i]);
+        if (!require_text(ctx, argv[i], "attribute name", &name)) {
+            sqlite3_free(out);
+            return;
+        }
         namelen = (int)strlen(name);
         out[pos++] = '"';
         json_escape_to(name, namelen, out, &pos);
@@ -543,6 +640,7 @@ static void sd_xml_attrs_jsx(sqlite3_context *ctx, int argc,
                 vallen = sqlite3_value_bytes(argv[i + 1]);
             } else {
                 val = (const char *)sqlite3_value_text(argv[i + 1]);
+                if (!val) val = "";
                 vallen = (int)strlen(val);
             }
             memcpy(out + pos, val, vallen);
@@ -550,6 +648,7 @@ static void sd_xml_attrs_jsx(sqlite3_context *ctx, int argc,
         } else {
             /* Plain text value — emit as JSON string */
             const char *val = (const char *)sqlite3_value_text(argv[i + 1]);
+            if (!val) val = "";
             vallen = (int)strlen(val);
             out[pos++] = '"';
             json_escape_to(val, vallen, out, &pos);
@@ -636,7 +735,8 @@ static void sd_json_object(sqlite3_context *ctx, int argc,
     int len = 2; /* {} */
     int nfields = 0;
     for (int i = 0; i < argc; i += 2) {
-        const char *key = (const char *)sqlite3_value_text(argv[i]);
+        const char *key;
+        if (!require_text(ctx, argv[i], "object key", &key)) return;
         int klen = (int)strlen(key);
         nfields++;
         len += 2 + json_escaped_len(key, klen); /* "key" */
@@ -651,7 +751,11 @@ static void sd_json_object(sqlite3_context *ctx, int argc,
     out[pos++] = '{';
     for (int i = 0; i < argc; i += 2) {
         if (i > 0) out[pos++] = ',';
-        const char *key = (const char *)sqlite3_value_text(argv[i]);
+        const char *key;
+        if (!require_text(ctx, argv[i], "object key", &key)) {
+            sqlite3_free(out);
+            return;
+        }
         int klen = (int)strlen(key);
         out[pos++] = '"';
         json_escape_to(key, klen, out, &pos);
@@ -694,15 +798,30 @@ static void sd_json_group_array_step(sqlite3_context *ctx, int argc,
     if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return;
     XmlAggCtx *p = (XmlAggCtx *)sqlite3_aggregate_context(ctx, sizeof(*p));
     if (!p) return;
-    if (p->len > 0) xml_agg_append(p, ",", 1);
+    if (p->len > 0) {
+        if (!xml_agg_append(p, ",", 1)) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
+    }
 
     /* Compute the JSON representation and append it. */
     int vlen = json_value_len(argv[0]);
+    if (vlen < 0) { sqlite3_result_error_toobig(ctx); return; }
     /* Ensure capacity */
     if (p->len + vlen >= p->cap) {
-        int newcap = (p->cap + vlen) * 2 + 64;
-        p->buf = (char *)sqlite3_realloc(p->buf, newcap);
-        p->cap = newcap;
+        sqlite3_int64 newcap = ((sqlite3_int64)p->cap + vlen) * 2 + 64;
+        if (newcap > (sqlite3_int64)INT_MAX) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
+        char *nb = (char *)sqlite3_realloc(p->buf, (int)newcap);
+        if (!nb) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
+        p->buf = nb;
+        p->cap = (int)newcap;
     }
     json_append_value(argv[0], p->buf, &p->len);
 }

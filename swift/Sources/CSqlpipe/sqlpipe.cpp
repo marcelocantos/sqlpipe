@@ -10667,11 +10667,13 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cctype>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -10975,6 +10977,7 @@ public:
 
     // Mutate the AST in place. Returns the (possibly new) root node.
     LpNode *transform(LpNode *node) {
+        alias_map_.clear();
         build_alias_map(node);
         return walk(node, /*depth=*/0, XmlMode::Xml);
     }
@@ -11123,6 +11126,24 @@ private:
             case Backend::sqlite_vanilla: return "json_group_array";
             default:                      return "sqldeep_json_group_array";
         }
+    }
+
+    // Wrap a nested-object/array projection in the dialect aggregator.
+    // Postgres: jsonb_agg(expr [ORDER BY ...]) plus COALESCE to '[]'
+    // because jsonb_agg of zero rows is NULL, and SELECT jsonb_agg(...)
+    // ORDER BY col is illegal (ORDER BY must be inside the aggregate).
+    LpNode *wrap_group_array(LpNode *select_node, LpNode *elem) {
+        auto *agg = make_function(arena_, fn_group_array(), {elem});
+        if (backend_ == Backend::postgres && select_node) {
+            if (select_node->u.select.order_by.count > 0) {
+                agg->u.function.order_by = select_node->u.select.order_by;
+                select_node->u.select.order_by.count = 0;
+                select_node->u.select.order_by.items = nullptr;
+            }
+            auto *empty = make_cast(arena_, make_string_lit(arena_, "[]"), "jsonb");
+            return make_function(arena_, "coalesce", {agg, empty});
+        }
+        return agg;
     }
     // BLOB-protocol wrapper used to inject a typed JSON value into a
     // JSON-building call so booleans (and only booleans, currently)
@@ -11697,6 +11718,63 @@ private:
     // standard SQL AST. The transformer then returns the new AST in
     // place of the original SELECT.
 
+    // Helper: escape single quotes in a string for a SQL string literal.
+    static std::string sql_escape_lit(const std::string& s) {
+        std::string out;
+        for (char c : s) {
+            if (c == '\'') out += "''";
+            else out += c;
+        }
+        return out;
+    }
+
+    // Quote an identifier the same way deepparser's unparser does
+    // (lp_unparse.c needs_quoting / sql_ident). Prevents dequoted
+    // names with spaces, keywords, or SQL metacharacters from
+    // reshaping the re-parsed RECURSE CTE (T7.2 / F1).
+    static bool is_sql_keyword(const std::string& s) {
+        // Mirrors deepparser's reserved set — words SQLite truly
+        // reserves, so unquoted splicing would change parse structure.
+        static const char* const reserved[] = {
+            "ALL","AND","AS","BETWEEN","CASE","CHECK","COLLATE","COMMIT",
+            "CONSTRAINT","CREATE","DEFAULT","DEFERRABLE","DELETE","DISTINCT",
+            "DROP","ELSE","ESCAPE","EXCEPT","EXISTS","FOREIGN","FROM","GROUP",
+            "HAVING","IN","INDEX","INSERT","INTERSECT","INTO","IS","ISNULL",
+            "JOIN","LIMIT","NOT","NOTNULL","NULL","ON","OR","ORDER","PRIMARY",
+            "REFERENCES","SELECT","SET","TABLE","THEN","TRANSACTION","UNION",
+            "UNIQUE","UPDATE","USING","VALUES","WHEN","WHERE",
+        };
+        for (const char* kw : reserved) {
+            if (strcasecmp(s.c_str(), kw) == 0) return true;
+        }
+        return false;
+    }
+
+    static bool ident_needs_quotes(const std::string& s) {
+        if (s.empty()) return true;
+        unsigned char c0 = static_cast<unsigned char>(s[0]);
+        if (!(std::isalpha(c0) || s[0] == '_')) return true;
+        for (char ch : s) {
+            unsigned char c = static_cast<unsigned char>(ch);
+            if (!(std::isalnum(c) || ch == '_')) return true;
+        }
+        // Match deepparser: true/false stay unquoted; other keywords quote.
+        if (strcasecmp(s.c_str(), "true") == 0
+            || strcasecmp(s.c_str(), "false") == 0) return false;
+        return is_sql_keyword(s);
+    }
+
+    static std::string sql_quote_ident(const std::string& s) {
+        if (!ident_needs_quotes(s)) return s;
+        std::string out = "\"";
+        for (char c : s) {
+            if (c == '"') out += "\"\"";
+            else out += c;
+        }
+        out += '"';
+        return out;
+    }
+
     LpNode *rewrite_recursive_select(LpNode *node) {
         const auto& sel = node->u.select;
         LpNode *recurse = sel.sqldeep_recurse;
@@ -11743,7 +11821,8 @@ private:
             // in the DFS CTE column list".
             std::string col = sf.key_text ? sf.key_text : "";
             field_keys.push_back(col);
-            obj_pairs.push_back("'" + sql_escape_lit(col) + "', " + col);
+            obj_pairs.push_back("'" + sql_escape_lit(col) + "', "
+                                + sql_quote_ident(col));
         }
         if (children_field.empty()) {
             throw Error("RECURSE requires a `children: *` field in the "
@@ -11762,6 +11841,10 @@ private:
         bool singular = !!sel.sqldeep_singular;
         bool is_pg = (backend_ == Backend::postgres);
 
+        const std::string q_table = sql_quote_ident(table);
+        const std::string q_fk = sql_quote_ident(fk_col);
+        const std::string q_pk = sql_quote_ident(pk_col);
+
         // Build column list. The CTE always includes fk_col; pk_col
         // is added separately when it differs from fk_col and isn't
         // already in the field list.
@@ -11769,30 +11852,55 @@ private:
         std::string col_select;  // "c.col1, c.col2, ..." for recursive step
         for (size_t i = 0; i < field_keys.size(); i++) {
             if (i > 0) { col_list += ", "; col_select += ", "; }
-            col_list += field_keys[i];
-            col_select += "c." + field_keys[i];
+            col_list += sql_quote_ident(field_keys[i]);
+            col_select += "c." + sql_quote_ident(field_keys[i]);
         }
         if (!field_keys.empty()) { col_list += ", "; col_select += ", "; }
-        col_list += fk_col;
-        col_select += "c." + fk_col;
+        col_list += q_fk;
+        col_select += "c." + q_fk;
         bool pk_in_fields = false;
         for (const auto& f : field_keys)
             if (f == pk_col) { pk_in_fields = true; break; }
         if (pk_col != fk_col && !pk_in_fields) {
-            col_list += ", " + pk_col;
-            col_select += ", c." + pk_col;
+            col_list += ", " + q_pk;
+            col_select += ", c." + q_pk;
         }
 
-        std::string pad   = is_pg
-            ? "lpad(CAST(" + pk_col + " AS text), 10, '0')"
-            : "printf('%010d', " + pk_col + ")";
+        // Path segments use sibling rank (not the raw PK) so ordering
+        // agrees with ROW_NUMBER comma placement for negative and
+        // wide integer PKs (T7.4 / F4).
+        // Anchor: window rank among roots. Recursive: count of siblings
+        // with (pk, rowid) <= current, matching ROW_NUMBER ORDER BY pk, rowid.
+        std::string anchor_pad = is_pg
+            ? "lpad(CAST(ROW_NUMBER() OVER (ORDER BY " + q_pk + ") AS text), 19, '0')"
+            : "printf('%019d', ROW_NUMBER() OVER (ORDER BY " + q_pk
+              + ", rowid))";
+        std::string sibling_rank = is_pg
+            ? "(SELECT COUNT(*) FROM " + q_table + " x WHERE x." + q_fk
+              + " = c." + q_fk + " AND (x." + q_pk + " < c." + q_pk
+              + " OR (x." + q_pk + " = c." + q_pk + " AND x.ctid <= c.ctid)))"
+            : "(SELECT COUNT(*) FROM " + q_table + " x WHERE x." + q_fk
+              + " = c." + q_fk + " AND (x." + q_pk + " < c." + q_pk
+              + " OR (x." + q_pk + " = c." + q_pk
+              + " AND x.rowid <= c.rowid)))";
         std::string c_pad = is_pg
-            ? "lpad(CAST(c." + pk_col + " AS text), 10, '0')"
-            : "printf('%010d', c." + pk_col + ")";
+            ? "lpad(CAST(" + sibling_rank + " AS text), 19, '0')"
+            : "printf('%019d', " + sibling_rank + ")";
+
+        // Byte-order sort: Unicode collations ignore '/' so close
+        // events (path || chr(127)) sort before children.
         std::string concat_fn = is_pg
-            ? "string_agg(_fragment, '' ORDER BY _sort_key)"
+            ? "string_agg(_fragment, '' ORDER BY CAST(_sort_key AS bytea))"
             : "group_concat(_fragment, '')";
         std::string high_char = is_pg ? "chr(127)" : "char(127)";
+        // Ranked CTE reads from _sdq_dfs which has no rowid; order by PK only.
+        std::string order_pk = q_pk;
+        // Postgres cannot CAST a non-JSON string to json even in a CASE
+        // branch that is not taken (the planner type-checks both arms).
+        // Emit a text diagnostic; the live oracle treats it as a failure.
+        std::string bad_pk_error = is_pg
+            ? "'RECURSE requires integer primary key'"
+            : "json('RECURSE requires integer primary key')";
 
         // Build the obj_args for fn_object call.
         std::string obj_args;
@@ -11801,15 +11909,33 @@ private:
             obj_args += obj_pairs[i];
         }
 
+        // Non-integer PK guard: when any PK is non-integer, force a
+        // runtime error via json() on a non-JSON diagnostic string
+        // rather than silently corrupting the tree (T7.4 / F4).
+        std::string int_guard_exists = is_pg
+            ? "(SELECT 1 FROM _sdq_dfs WHERE CAST(pg_typeof(" + q_pk
+              + ") AS text) NOT IN ('integer', 'bigint', 'smallint'))"
+            : "(SELECT 1 FROM _sdq_dfs WHERE typeof(" + q_pk
+              + ") != 'integer')";
+
+        std::string result_expr;
+        if (!singular) result_expr += "'[' || ";
+        result_expr += concat_fn;
+        if (!singular) result_expr += " || ']'";
+
+        // Omit the CTE column-name list: deepparser's eidlist builder
+        // (lp_make_id_node) stores quoted tokens via lp_token_str, so a
+        // re-parse of `"my name"` would unparse as `"""my name"""`.
+        // Column names come from the anchor SELECT (with AS aliases for
+        // synthetic _depth/_path); identifiers still go through
+        // sql_quote_ident in the SELECT lists.
         std::string out;
-        out += "WITH RECURSIVE _sdq_dfs(";
+        out += "WITH RECURSIVE _sdq_dfs AS (SELECT ";
         out += col_list;
-        out += ", _depth, _path) AS (SELECT ";
-        out += col_list;
-        out += ", 0, ";
-        out += pad;
-        out += " FROM ";
-        out += table;
+        out += ", 0 AS _depth, ";
+        out += anchor_pad;
+        out += " AS _path FROM ";
+        out += q_table;
         if (!root_where.empty()) {
             out += " WHERE ";
             out += root_where;
@@ -11819,31 +11945,43 @@ private:
         out += ", d._depth + 1, d._path || '/' || ";
         out += c_pad;
         out += " FROM ";
-        out += table;
+        out += q_table;
         out += " c JOIN _sdq_dfs d ON c.";
-        out += fk_col;
+        out += q_fk;
         out += " = d.";
-        out += pk_col;
+        out += q_pk;
         out += "), _sdq_ranked AS (SELECT *, ";
         out += fn_object();
         out += "(";
         out += obj_args;
         out += ") AS _obj, ROW_NUMBER() OVER (PARTITION BY ";
-        out += fk_col;
+        out += q_fk;
         out += " ORDER BY ";
-        out += pk_col;
+        out += order_pk;
         out += ") AS _child_rank FROM _sdq_dfs), ";
-        out += "_sdq_events(_sort_key, _fragment) AS (SELECT _path, ";
+        out += "_sdq_events AS (SELECT _path AS _sort_key, ";
         out += "CASE WHEN _child_rank > 1 THEN ',' ELSE '' END || ";
-        out += "substr(_obj, 1, length(_obj) - 1) || ',\"";
+        if (is_pg) {
+            out += "substr(CAST(_obj AS text), 1, length(CAST(_obj AS text)) - 1) || ',\"";
+        } else {
+            out += "substr(_obj, 1, length(_obj) - 1) || ',\"";
+        }
         out += sql_escape_lit(children_field);
-        out += "\":[' FROM _sdq_ranked UNION ALL SELECT _path || ";
+        out += "\":[' AS _fragment FROM _sdq_ranked UNION ALL SELECT _path || ";
         out += high_char;
-        out += ", ']}' FROM _sdq_ranked) SELECT ";
-        if (!singular) out += "'[' || ";
-        out += concat_fn;
-        if (!singular) out += " || ']'";
-        out += " FROM (SELECT _fragment FROM _sdq_events ORDER BY _sort_key)";
+        out += ", ']}' FROM _sdq_ranked) SELECT CASE WHEN EXISTS ";
+        out += int_guard_exists;
+        out += " THEN ";
+        out += bad_pk_error;
+        out += " ELSE (SELECT ";
+        out += result_expr;
+        // Postgres string_agg ORDER BY needs _sort_key in the FROM
+        // list; the SQLite subquery only projects _fragment because
+        // group_concat relies on the inner ORDER BY.
+        if (is_pg)
+            out += " FROM _sdq_events) END";
+        else
+            out += " FROM (SELECT _fragment FROM _sdq_events ORDER BY _sort_key)) END";
 
         // Re-parse the constructed SQL via deepparser so we hand back
         // a standard SQL AST. (Re-using deepparser this way costs one
@@ -11855,16 +11993,6 @@ private:
             throw Error(msg, 0, 0);
         }
         return new_ast;
-    }
-
-    // Helper: escape single quotes in a string for a SQL string literal.
-    static std::string sql_escape_lit(const std::string& s) {
-        std::string out;
-        for (char c : s) {
-            if (c == '\'') out += "''";
-            else out += c;
-        }
-        return out;
     }
 
     // The recursive-SELECT rewrite needs to emit the existing WHERE
@@ -12227,19 +12355,46 @@ private:
                 }
             }
             if (!wrap) return node;
-            replace_projection(make_function(arena_, fn_group_array(), {proj}));
+            replace_projection(wrap_group_array(node, proj));
             return node;
         }
 
         // Array projection: unwrap single-element; wrap in group_array.
         LpNode *inner = (proj->u.function.args.count == 1)
                           ? proj->u.function.args.items[0] : proj;
-        replace_projection(make_function(arena_, fn_group_array(), {inner}));
+        replace_projection(wrap_group_array(node, inner));
         return node;
     }
 };
 
 // ── End-to-end pipeline ──────────────────────────────────────────────
+
+// True when a SELECT is exactly one projection expression with no
+// clauses — the shape produced by wrapping a bare expression as
+// `SELECT <input>`. Anything richer means the wrap absorbed a
+// statement-shaped fragment and must not be treated as success.
+// Compounds are LP_COMPOUND_SELECT (not LP_STMT_SELECT), so they
+// fail the kind check and are never unwrapped.
+static bool is_bare_expr_select(const LpNode *sel) {
+    if (!sel || sel->kind != LP_STMT_SELECT) return false;
+    const auto& s = sel->u.select;
+    if (s.result_columns.count != 1) return false;
+    if (s.from || s.where || s.having || s.limit || s.with
+        || s.sqldeep_recurse)
+        return false;
+    if (s.group_by.count || s.order_by.count || s.window_defs.count)
+        return false;
+    if (s.distinct || s.sqldeep_singular || s.sqldeep_from_first)
+        return false;
+    return true;
+}
+
+static Error make_parse_error(const char *msg) {
+    std::string m = msg ? msg : "parse error";
+    int line = 0, col = 0;
+    (void)std::sscanf(m.c_str(), "%d:%d", &line, &col);
+    return Error(m, line, col);
+}
 
 std::string transpile_impl(const std::string& input,
                             const std::vector<ForeignKey>* fks,
@@ -12255,19 +12410,16 @@ std::string transpile_impl(const std::string& input,
     const char *parse_err = nullptr;
     LpNodeList *stmts = lp_parse_all(input.c_str(), arena, &parse_err);
     bool bare_expr = false;
+    std::string bare_parse_err; // copy — arena may hold the original
     if (!stmts) {
+        bare_parse_err = parse_err ? parse_err : "parse error";
         std::string wrapped = "SELECT " + input;
         const char *err2 = nullptr;
         stmts = lp_parse_all(wrapped.c_str(), arena, &err2);
         if (!stmts) {
-            std::string msg = parse_err ? parse_err
-                              : (err2 ? err2 : "parse error");
-            // Deepparser formats errors as "LINE:COL: message"; parse
-            // out the position so callers can highlight the source.
-            int line = 0, col = 0;
-            (void)std::sscanf(msg.c_str(), "%d:%d", &line, &col);
             arena_destroy(arena);
-            throw Error(msg, line, col);
+            throw make_parse_error(
+                parse_err ? parse_err : (err2 ? err2 : "parse error"));
         }
         bare_expr = true;
     }
@@ -12292,25 +12444,37 @@ std::string transpile_impl(const std::string& input,
     }
 
     std::string out;
-    if (bare_expr && stmts->count == 1) {
-        // Extract just the single result-column expression so the
-        // caller sees the bare transformed form.
-        LpNode *sel = stmts->items[0];
-        if (sel && sel->kind == LP_STMT_SELECT
-            && sel->u.select.result_columns.count == 1) {
+    if (bare_expr) {
+        // Only unwrap a pure single-expression SELECT. Multi-column,
+        // FROM/WHERE/compound, etc. mean the wrap absorbed a
+        // statement-shaped fragment — fail closed with the original
+        // parse error rather than returning empty or clause-stripped SQL.
+        LpNode *sel = (stmts->count == 1) ? stmts->items[0] : nullptr;
+        LpNode *expr = nullptr;
+        if (is_bare_expr_select(sel)) {
             LpNode *rc = sel->u.select.result_columns.items[0];
-            LpNode *expr = (rc && rc->kind == LP_RESULT_COLUMN)
-                              ? rc->u.result_column.expr : rc;
-            if (expr) {
-                char *sql = lp_ast_to_sql(expr, arena);
-                if (sql) out = sql;
-            }
+            expr = (rc && rc->kind == LP_RESULT_COLUMN)
+                       ? rc->u.result_column.expr : rc;
         }
+        if (!expr) {
+            arena_destroy(arena);
+            throw make_parse_error(bare_parse_err.c_str());
+        }
+        char *sql = lp_ast_to_sql(expr, arena);
+        if (!sql) {
+            arena_destroy(arena);
+            throw Error("internal: unparse failed", 0, 0);
+        }
+        out = sql;
     } else {
         for (int i = 0; i < stmts->count; i++) {
             if (i > 0) out += "; ";
             char *sql = lp_ast_to_sql(stmts->items[i], arena);
-            if (sql) out += sql;
+            if (!sql) {
+                arena_destroy(arena);
+                throw Error("internal: unparse failed", 0, 0);
+            }
+            out += sql;
         }
     }
 
@@ -12320,6 +12484,12 @@ std::string transpile_impl(const std::string& input,
     // (throws if a rewrite reordered them). The arena is already gone;
     // this works purely on the output string.
     restore_positional_params(out, pos_param_count);
+
+    // Bare-expression wrap must never succeed with empty SQL
+    // (ENT-003 / T7.3). Comment-only inputs legitimately unparse to ""
+    // on the normal statement path and are excluded here.
+    if (bare_expr && out.empty())
+        throw Error("internal: empty transpile output", 0, 0);
     return out;
 }
 
@@ -12363,6 +12533,13 @@ void sqldeep_set_error(char** err_msg, int* err_line, int* err_col,
     if (err_msg)  *err_msg = sqldeep_dup_str(e.what());
     if (err_line) *err_line = e.line();
     if (err_col)  *err_col = e.col();
+}
+
+void set_error_msg(char** err_msg, int* err_line, int* err_col,
+                   const char* msg) {
+    if (err_msg)  *err_msg = sqldeep_dup_str(msg);
+    if (err_line) *err_line = 0;
+    if (err_col)  *err_col = 0;
 }
 
 void sqldeep_clear_error(char** err_msg, int* err_line, int* err_col) {
@@ -12420,10 +12597,20 @@ char* sqldeep_transpile_backend(const char* input,
                                 sqldeep_backend backend,
                                 char** err_msg, int* err_line, int* err_col) {
     sqldeep_clear_error(err_msg, err_line, err_col);
+    if (!input) {
+        set_error_msg(err_msg, err_line, err_col, "NULL input");
+        return nullptr;
+    }
     try {
         return sqldeep_dup_str(sqldeep::transpile(input, to_backend(backend)));
     } catch (const sqldeep::Error& e) {
         sqldeep_set_error(err_msg, err_line, err_col, e);
+        return nullptr;
+    } catch (const std::exception& e) {
+        set_error_msg(err_msg, err_line, err_col, e.what());
+        return nullptr;
+    } catch (...) {
+        set_error_msg(err_msg, err_line, err_col, "unknown error");
         return nullptr;
     }
 }
@@ -12433,11 +12620,21 @@ char* sqldeep_transpile_fk_backend(const char* input,
                                    const sqldeep_foreign_key* fks, int fk_count,
                                    char** err_msg, int* err_line, int* err_col) {
     sqldeep_clear_error(err_msg, err_line, err_col);
+    if (!input) {
+        set_error_msg(err_msg, err_line, err_col, "NULL input");
+        return nullptr;
+    }
     try {
         auto cpp_fks = to_cpp_fks(fks, fk_count);
         return sqldeep_dup_str(sqldeep::transpile(input, cpp_fks, to_backend(backend)));
     } catch (const sqldeep::Error& e) {
         sqldeep_set_error(err_msg, err_line, err_col, e);
+        return nullptr;
+    } catch (const std::exception& e) {
+        set_error_msg(err_msg, err_line, err_col, e.what());
+        return nullptr;
+    } catch (...) {
+        set_error_msg(err_msg, err_line, err_col, "unknown error");
         return nullptr;
     }
 }
@@ -12467,16 +12664,40 @@ extern "C" {
 // convert the final result back to a string.
 
 
+#include <limits.h>
 #include <string.h>
+#include <stdint.h>
 
 static int is_xml_blob(sqlite3_value *v) {
     return sqlite3_value_type(v) == SQLITE_BLOB;
 }
 
+/* Tag / attr-name / JSON-key slots must not crash on SQL NULL.
+   Returns 1 and sets *out on success; on NULL, reports an error and
+   returns 0. */
+static int require_text(sqlite3_context *ctx, sqlite3_value *v,
+                        const char *what, const char **out) {
+    if (sqlite3_value_type(v) == SQLITE_NULL) {
+        char buf[96];
+        sqlite3_snprintf(sizeof(buf), buf, "NULL %s", what);
+        sqlite3_result_error(ctx, buf, -1);
+        return 0;
+    }
+    const char *s = (const char *)sqlite3_value_text(v);
+    if (!s) {
+        char buf[96];
+        sqlite3_snprintf(sizeof(buf), buf, "NULL %s", what);
+        sqlite3_result_error(ctx, buf, -1);
+        return 0;
+    }
+    *out = s;
+    return 1;
+}
+
 // ── Escaping helpers ────────────────────────────────────────────────
 
 static int xml_escaped_len(const char *s) {
-    int n = 0;
+    size_t n = 0;
     for (; *s; ++s) {
         switch (*s) {
         case '<': n += 4; break;
@@ -12484,8 +12705,25 @@ static int xml_escaped_len(const char *s) {
         case '&': n += 5; break;
         default:  n++; break;
         }
+        if (n > (size_t)INT_MAX) return -1;
     }
-    return n;
+    return (int)n;
+}
+
+/* Attribute values also escape '"'; text content does not. */
+static int xml_attr_escaped_len(const char *s) {
+    size_t n = 0;
+    for (; *s; ++s) {
+        switch (*s) {
+        case '"': n += 6; break; /* &quot; */
+        case '<': n += 4; break;
+        case '>': n += 4; break;
+        case '&': n += 5; break;
+        default:  n++; break;
+        }
+        if (n > (size_t)INT_MAX) return -1;
+    }
+    return (int)n;
 }
 
 static void xml_escape_text_to(const char *s, char *out, int *pos) {
@@ -12509,21 +12747,28 @@ static void sd_xml_attrs(sqlite3_context *ctx, int argc,
         return;
     }
     for (i = 0; i < argc; i += 2) {
-        const char *val;
+        const char *name, *val;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
+        if (!require_text(ctx, argv[i], "attribute name", &name)) return;
         /* sqldeep_json('true') / sqldeep_json('false') = boolean BLOB */
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_BLOB) {
             int blen = sqlite3_value_bytes(argv[i + 1]);
             const char *b = (const char *)sqlite3_value_blob(argv[i + 1]);
             if (blen == 5 && memcmp(b, "false", 5) == 0) continue;
             /* true → bare attribute name */
-            len += 1 + (int)strlen((const char *)sqlite3_value_text(argv[i]));
+            len += 1 + (int)strlen(name);
             continue;
         }
         len += 1; /* space */
-        len += (int)strlen((const char *)sqlite3_value_text(argv[i]));
+        len += (int)strlen(name);
         val = (const char *)sqlite3_value_text(argv[i + 1]);
-        len += 2 + xml_escaped_len(val); /* ="..." */
+        if (!val) val = "";
+        /* three structural bytes for ="" plus escaped value */
+        {
+            int elen = xml_attr_escaped_len(val);
+            if (elen < 0) { sqlite3_result_error_toobig(ctx); return; }
+            len += 3 + elen;
+        }
     }
     char *out = (char *)sqlite3_malloc(len + 1);
     if (!out) { sqlite3_result_error_nomem(ctx); return; }
@@ -12531,7 +12776,10 @@ static void sd_xml_attrs(sqlite3_context *ctx, int argc,
     for (i = 0; i < argc; i += 2) {
         const char *name, *val;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
-        name = (const char *)sqlite3_value_text(argv[i]);
+        if (!require_text(ctx, argv[i], "attribute name", &name)) {
+            sqlite3_free(out);
+            return;
+        }
         /* sqldeep_json('true') / sqldeep_json('false') = boolean BLOB */
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_BLOB) {
             int blen = sqlite3_value_bytes(argv[i + 1]);
@@ -12544,6 +12792,7 @@ static void sd_xml_attrs(sqlite3_context *ctx, int argc,
             continue;
         }
         val = (const char *)sqlite3_value_text(argv[i + 1]);
+        if (!val) val = "";
         out[pos++] = ' ';
         memcpy(out + pos, name, strlen(name));
         pos += (int)strlen(name);
@@ -12572,7 +12821,8 @@ static void sd_xml_element(sqlite3_context *ctx, int argc,
         sqlite3_result_error(ctx, "xml_element requires at least 1 arg", -1);
         return;
     }
-    const char *tag = (const char *)sqlite3_value_text(argv[0]);
+    const char *tag;
+    if (!require_text(ctx, argv[0], "tag", &tag)) return;
     int taglen = (int)strlen(tag);
     int self_closing = (taglen > 0 && tag[taglen - 1] == '/');
     if (self_closing) taglen--; /* strip trailing '/' from tag name */
@@ -12654,14 +12904,19 @@ typedef struct XmlAggCtx {
     int cap;
 } XmlAggCtx;
 
-static void xml_agg_append(XmlAggCtx *p, const char *s, int n) {
+static int xml_agg_append(XmlAggCtx *p, const char *s, int n) {
+    if (n < 0) return 0;
     if (p->len + n >= p->cap) {
-        int newcap = (p->cap + n) * 2 + 64;
-        p->buf = (char *)sqlite3_realloc(p->buf, newcap);
-        p->cap = newcap;
+        sqlite3_int64 newcap = ((sqlite3_int64)p->cap + n) * 2 + 64;
+        if (newcap > (sqlite3_int64)INT_MAX) return 0;
+        char *nb = (char *)sqlite3_realloc(p->buf, (int)newcap);
+        if (!nb) return 0;
+        p->buf = nb;
+        p->cap = (int)newcap;
     }
     memcpy(p->buf + p->len, s, n);
     p->len += n;
+    return 1;
 }
 
 static void sd_xml_agg_step(sqlite3_context *ctx, int argc,
@@ -12672,16 +12927,22 @@ static void sd_xml_agg_step(sqlite3_context *ctx, int argc,
     if (!p) return;
     if (is_xml_blob(argv[0])) {
         int blen = sqlite3_value_bytes(argv[0]);
-        xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen);
+        if (!xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen)) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
     } else {
         const char *v = (const char *)sqlite3_value_text(argv[0]);
+        if (!v) return;
         for (const char *c = v; *c; ++c) {
+            int ok = 1;
             switch (*c) {
-            case '<': xml_agg_append(p, "&lt;", 4); break;
-            case '>': xml_agg_append(p, "&gt;", 4); break;
-            case '&': xml_agg_append(p, "&amp;", 5); break;
-            default: xml_agg_append(p, c, 1); break;
+            case '<': ok = xml_agg_append(p, "&lt;", 4); break;
+            case '>': ok = xml_agg_append(p, "&gt;", 4); break;
+            case '&': ok = xml_agg_append(p, "&amp;", 5); break;
+            default:  ok = xml_agg_append(p, c, 1); break;
             }
+            if (!ok) { sqlite3_result_error_nomem(ctx); return; }
         }
     }
 }
@@ -12698,7 +12959,7 @@ static void sd_xml_agg_final(sqlite3_context *ctx) {
 // ── JSON string escaping helper ──────────────────────────────────────
 
 static int json_escaped_len(const char *s, int n) {
-    int len = 0;
+    size_t len = 0;
     for (int i = 0; i < n; ++i) {
         unsigned char c = (unsigned char)s[i];
         switch (c) {
@@ -12709,8 +12970,9 @@ static int json_escaped_len(const char *s, int n) {
             else len++;
             break;
         }
+        if (len > (size_t)INT_MAX) return -1;
     }
-    return len;
+    return (int)len;
 }
 
 static void json_escape_to(const char *s, int n, char *out, int *pos) {
@@ -12760,10 +13022,11 @@ static void sd_xml_attrs_jsonml(sqlite3_context *ctx, int argc,
         const char *name, *val;
         int namelen, vallen;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
+        if (!require_text(ctx, argv[i], "attribute name", &name)) return;
         nattrs++;
-        name = (const char *)sqlite3_value_text(argv[i]);
         namelen = (int)strlen(name);
         val = (const char *)sqlite3_value_text(argv[i + 1]);
+        if (!val) val = "";
         vallen = (int)strlen(val);
         len += 2 + json_escaped_len(name, namelen); /* "name" */
         len += 1; /* : */
@@ -12780,9 +13043,13 @@ static void sd_xml_attrs_jsonml(sqlite3_context *ctx, int argc,
         int namelen, vallen;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
         if (written++ > 0) out[pos++] = ',';
-        name = (const char *)sqlite3_value_text(argv[i]);
+        if (!require_text(ctx, argv[i], "attribute name", &name)) {
+            sqlite3_free(out);
+            return;
+        }
         namelen = (int)strlen(name);
         val = (const char *)sqlite3_value_text(argv[i + 1]);
+        if (!val) val = "";
         vallen = (int)strlen(val);
         out[pos++] = '"';
         json_escape_to(name, namelen, out, &pos);
@@ -12805,7 +13072,8 @@ static void sd_xml_element_jsonml(sqlite3_context *ctx, int argc,
         sqlite3_result_error(ctx, "xml_element_jsonml requires at least 1 arg", -1);
         return;
     }
-    const char *tag = (const char *)sqlite3_value_text(argv[0]);
+    const char *tag;
+    if (!require_text(ctx, argv[0], "tag", &tag)) return;
     int taglen = (int)strlen(tag);
     if (taglen > 0 && tag[taglen - 1] == '/') taglen--; /* strip void marker */
     int child_start = 1;
@@ -12887,20 +13155,40 @@ static void sd_jsonml_agg_step(sqlite3_context *ctx, int argc,
     if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return;
     XmlAggCtx *p = (XmlAggCtx *)sqlite3_aggregate_context(ctx, sizeof(*p));
     if (!p) return;
-    if (p->len > 0) xml_agg_append(p, ",", 1);
+    if (p->len > 0) {
+        if (!xml_agg_append(p, ",", 1)) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
+    }
     if (is_xml_blob(argv[0])) {
         int blen = sqlite3_value_bytes(argv[0]);
-        xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen);
+        if (!xml_agg_append(p, (const char *)sqlite3_value_blob(argv[0]), blen)) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
     } else {
         /* Text child — emit as JSON string */
         const char *v = (const char *)sqlite3_value_text(argv[0]);
+        if (!v) return;
         int vlen = (int)strlen(v);
-        int elen = 2 + json_escaped_len(v, vlen);
+        int jel = json_escaped_len(v, vlen);
+        if (jel < 0) { sqlite3_result_error_toobig(ctx); return; }
+        int elen = 2 + jel;
         /* Ensure capacity and write directly */
         if (p->len + elen >= p->cap) {
-            int newcap = (p->cap + elen) * 2 + 64;
-            p->buf = (char *)sqlite3_realloc(p->buf, newcap);
-            p->cap = newcap;
+            sqlite3_int64 newcap = ((sqlite3_int64)p->cap + elen) * 2 + 64;
+            if (newcap > (sqlite3_int64)INT_MAX) {
+                sqlite3_result_error_nomem(ctx);
+                return;
+            }
+            char *nb = (char *)sqlite3_realloc(p->buf, (int)newcap);
+            if (!nb) {
+                sqlite3_result_error_nomem(ctx);
+                return;
+            }
+            p->buf = nb;
+            p->cap = (int)newcap;
         }
         p->buf[p->len++] = '"';
         json_escape_to(v, vlen, p->buf, &p->len);
@@ -12952,15 +13240,17 @@ static void sd_xml_attrs_jsx(sqlite3_context *ctx, int argc,
         int namelen, vallen;
         int raw;
         if (sqlite3_value_type(argv[i + 1]) == SQLITE_NULL) continue;
+        if (!require_text(ctx, argv[i], "attribute name", &name)) return;
         nattrs++;
         /* Check raw BEFORE sqlite3_value_text (which coerces BLOB→TEXT) */
         raw = jsx_is_raw(argv[i + 1]);
-        name = (const char *)sqlite3_value_text(argv[i]);
         namelen = (int)strlen(name);
         if (raw && sqlite3_value_type(argv[i + 1]) == SQLITE_BLOB) {
             vallen = sqlite3_value_bytes(argv[i + 1]);
         } else {
-            vallen = (int)strlen((const char *)sqlite3_value_text(argv[i + 1]));
+            const char *val = (const char *)sqlite3_value_text(argv[i + 1]);
+            if (!val) val = "";
+            vallen = (int)strlen(val);
         }
         len += 2 + json_escaped_len(name, namelen); /* "name" */
         len += 1; /* : */
@@ -12968,6 +13258,7 @@ static void sd_xml_attrs_jsx(sqlite3_context *ctx, int argc,
             len += vallen; /* raw JSON/number */
         } else {
             const char *val = (const char *)sqlite3_value_text(argv[i + 1]);
+            if (!val) val = "";
             len += 2 + json_escaped_len(val, vallen); /* "val" */
         }
     }
@@ -12985,7 +13276,10 @@ static void sd_xml_attrs_jsx(sqlite3_context *ctx, int argc,
         if (written++ > 0) out[pos++] = ',';
         /* Check raw BEFORE sqlite3_value_text (which coerces BLOB→TEXT) */
         raw = jsx_is_raw(argv[i + 1]);
-        name = (const char *)sqlite3_value_text(argv[i]);
+        if (!require_text(ctx, argv[i], "attribute name", &name)) {
+            sqlite3_free(out);
+            return;
+        }
         namelen = (int)strlen(name);
         out[pos++] = '"';
         json_escape_to(name, namelen, out, &pos);
@@ -12999,6 +13293,7 @@ static void sd_xml_attrs_jsx(sqlite3_context *ctx, int argc,
                 vallen = sqlite3_value_bytes(argv[i + 1]);
             } else {
                 val = (const char *)sqlite3_value_text(argv[i + 1]);
+                if (!val) val = "";
                 vallen = (int)strlen(val);
             }
             memcpy(out + pos, val, vallen);
@@ -13006,6 +13301,7 @@ static void sd_xml_attrs_jsx(sqlite3_context *ctx, int argc,
         } else {
             /* Plain text value — emit as JSON string */
             const char *val = (const char *)sqlite3_value_text(argv[i + 1]);
+            if (!val) val = "";
             vallen = (int)strlen(val);
             out[pos++] = '"';
             json_escape_to(val, vallen, out, &pos);
@@ -13092,7 +13388,8 @@ static void sd_json_object(sqlite3_context *ctx, int argc,
     int len = 2; /* {} */
     int nfields = 0;
     for (int i = 0; i < argc; i += 2) {
-        const char *key = (const char *)sqlite3_value_text(argv[i]);
+        const char *key;
+        if (!require_text(ctx, argv[i], "object key", &key)) return;
         int klen = (int)strlen(key);
         nfields++;
         len += 2 + json_escaped_len(key, klen); /* "key" */
@@ -13107,7 +13404,11 @@ static void sd_json_object(sqlite3_context *ctx, int argc,
     out[pos++] = '{';
     for (int i = 0; i < argc; i += 2) {
         if (i > 0) out[pos++] = ',';
-        const char *key = (const char *)sqlite3_value_text(argv[i]);
+        const char *key;
+        if (!require_text(ctx, argv[i], "object key", &key)) {
+            sqlite3_free(out);
+            return;
+        }
         int klen = (int)strlen(key);
         out[pos++] = '"';
         json_escape_to(key, klen, out, &pos);
@@ -13150,15 +13451,30 @@ static void sd_json_group_array_step(sqlite3_context *ctx, int argc,
     if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return;
     XmlAggCtx *p = (XmlAggCtx *)sqlite3_aggregate_context(ctx, sizeof(*p));
     if (!p) return;
-    if (p->len > 0) xml_agg_append(p, ",", 1);
+    if (p->len > 0) {
+        if (!xml_agg_append(p, ",", 1)) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
+    }
 
     /* Compute the JSON representation and append it. */
     int vlen = json_value_len(argv[0]);
+    if (vlen < 0) { sqlite3_result_error_toobig(ctx); return; }
     /* Ensure capacity */
     if (p->len + vlen >= p->cap) {
-        int newcap = (p->cap + vlen) * 2 + 64;
-        p->buf = (char *)sqlite3_realloc(p->buf, newcap);
-        p->cap = newcap;
+        sqlite3_int64 newcap = ((sqlite3_int64)p->cap + vlen) * 2 + 64;
+        if (newcap > (sqlite3_int64)INT_MAX) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
+        char *nb = (char *)sqlite3_realloc(p->buf, (int)newcap);
+        if (!nb) {
+            sqlite3_result_error_nomem(ctx);
+            return;
+        }
+        p->buf = nb;
+        p->cap = (int)newcap;
     }
     json_append_value(argv[0], p->buf, &p->len);
 }
