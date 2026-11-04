@@ -49,7 +49,8 @@ else
     exit 1
 fi
 
-patch --batch --forward -p0 < vendor/patches/sqlift-postgres.patch
+# Postgres extract/parse-on/diff/apply ships in sqlift itself
+# (sqlift_db_wrap_exec). Do not re-apply a local patch on top.
 
 # ── 1b. Sync sqlift C API block into dist/sqlpipe.h ─────────────
 # Mirrors version macros, error enum, allow flags, apply_options, and

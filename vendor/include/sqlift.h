@@ -37,10 +37,11 @@ enum sqlift_error_type {
 // Adding a new bit is a non-breaking change: callers that don't set it
 // inherit the safe (deny) behaviour.
 
-// Allow RebuildTable operations (SQLite's 12-step table rebuild).
-// Required for any table change beyond appending nullable / DEFAULTed
-// columns -- e.g. column type change, dropping a CHECK/FK constraint,
-// reordering columns. Rebuilds are expensive on large tables.
+// Allow RebuildTable operations (SQLite's 12-step table rebuild) or
+// Postgres ALTER COLUMN ... TYPE (may rewrite the table). Required for
+// any table change beyond appending nullable / DEFAULTed columns --
+// e.g. column type change, dropping a CHECK/FK constraint, reordering
+// columns. Rebuilds are expensive on large tables.
 #define SQLIFT_ALLOW_REBUILD     (1u << 0)
 
 // Allow operations that drop data: DropTable, DropColumn (via rebuild),
@@ -82,6 +83,9 @@ enum sqlift_engine {
     SQLIFT_ENGINE_SQLITE   = 0,
     SQLIFT_ENGINE_POSTGRES = 1,
 };
+
+// Executor vtable so Postgres (and other engines) can be wrapped without
+// putting libpq types in this header.
 typedef struct sqlift_exec {
     void* ctx;
     int (*exec)(void* ctx, const char* sql, char** err_msg);
@@ -95,13 +99,21 @@ typedef struct sqlift_exec {
 sqlift_db* sqlift_db_open(const char* path, int flags,
                           int* err_type, char** err_msg);
 
+// Borrow an existing sqlite3* (not owned; caller keeps it open).
 typedef struct sqlite3 sqlite3;
 sqlift_db* sqlift_db_wrap_sqlite(sqlite3* handle,
                                  int* err_type, char** err_msg);
+
+// Wrap an executor. `engine` is SQLIFT_ENGINE_POSTGRES (or SQLITE if the
+// executor talks to SQLite). Does not take ownership of ctx.
 sqlift_db* sqlift_db_wrap_exec(int engine, sqlift_exec exec,
                                int* err_type, char** err_msg);
+
+// Parse DDL against a live connection (temp schema + extract). Required
+// for Postgres; SQLite callers can keep using sqlift_parse().
 char* sqlift_parse_on(sqlift_db* db, const char* ddl,
                       int* err_type, char** err_msg);
+
 // Close a database handle. Safe to call with NULL.
 void sqlift_db_close(sqlift_db* db);
 
