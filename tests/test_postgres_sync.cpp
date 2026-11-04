@@ -360,6 +360,11 @@ TEST_CASE("postgres Database query runs sqldeep JSON join RECURSE") {
         return;
     }
     ensure_database("sqlpipe_m");
+    // Earlier cases leave tables in sqlpipe_m. Database::postgres migrates
+    // onto that database and refuses to drop them.
+    {
+        Pg wipe("sqlpipe_m");
+    }
     auto db = Database::postgres(conninfo_for("sqlpipe_m"),
         "CREATE TABLE categories ("
         "id BIGINT PRIMARY KEY, name TEXT NOT NULL, parent_id BIGINT)");
