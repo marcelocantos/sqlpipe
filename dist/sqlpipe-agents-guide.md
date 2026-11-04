@@ -134,7 +134,10 @@ Place `sqlpipe_pg.cpp` beside `sqlpipe.cpp` (which includes it), define `SQLPIPE
 and linkage. Use `Database::postgres(conninfo)` or the `PGconn*` overloads.
 Postgres protocol v8 cannot replicate with SQLite protocol v7. The Go
 constructors require the `postgres` build tag and libpq via `pkg-config`.
-This experimental surface has no Swift or Wasm wrapper.
+This experimental surface has no Swift or Wasm wrapper. `Database::query`
+on Postgres runs sqldeep JSON objects, join paths, and `RECURSE`. XML,
+JSONML, and JSX stay SQLite-only. Schema fingerprints use sqlift's Postgres
+extract (`SqliftPgSha256`, algorithm id `0x02`).
 
 ### Optimistic prediction (low-latency UI over server-owned truth)
 
@@ -384,7 +387,7 @@ for (auto& om : peer_msgs) {
 ### Go wrapper (`go/sqlpipe`)
 
 ```
-go get github.com/marcelocantos/sqlpipe/go/sqlpipe@v0.35.0
+go get github.com/marcelocantos/sqlpipe/go/sqlpipe@v0.36.0
 ```
 
 Self-contained CGo module (vendored SQLite with session/preupdate + FTS5).

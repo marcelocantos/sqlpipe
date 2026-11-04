@@ -91,8 +91,11 @@ SQLite-to-Postgres replication is not supported.
 The Go backend requires libpq discoverable through `pkg-config` and the
 `postgres` build tag. `OpenPostgres`, `NewMasterPG`, `NewReplicaPG`, and
 `NewPeerPG` operate on a libpq connection. This backend is experimental;
-Swift and Wasm do not expose it. `make gate` exercises live C++ Postgres
-replication, but the SQLite fault matrix does not cover Postgres.
+Swift and Wasm do not expose it. `Database::query` on Postgres runs sqldeep
+JSON objects, join paths, and `RECURSE`. XML, JSONML, and JSX stay
+SQLite-only. Schema fingerprints use sqlift's Postgres extract
+(`SqliftPgSha256`). `make gate` exercises live C++ Postgres replication,
+but the SQLite fault matrix does not cover Postgres.
 
 ## Language bindings
 
