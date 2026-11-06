@@ -10,6 +10,7 @@
 #include <map>
 #include <format>
 #include <lz4.h>
+#include <nlohmann/json.hpp>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -160,6 +161,10 @@ bool auto_migrate_schema(sqlite3* db, const std::string& remote_schema_sql,
 
 /// Check if a table uses WITHOUT ROWID.
 bool is_without_rowid(sqlite3* db, const std::string& table);
+
+/// Let a migration of an existing store through when sqlpipe's own tables
+/// are the only thing sqlift would call drift (see the definition).
+void reconcile_schema_hash(sqlite3* db);
 
 } // namespace sqlpipe::detail
 
@@ -920,6 +925,90 @@ std::string get_schema_sql(
     return sql;
 }
 
+/// sqlift records a schema hash after every migration and refuses the
+/// next one ("drift") unless the database still hashes the same. Its hash
+/// covers every table except its own state table, so sqlpipe's
+/// bookkeeping (_sqlpipe_meta, created when a Master or Replica attaches,
+/// after the app schema was first migrated) looks like drift to the next
+/// migration of every existing store. When the stored hash equals the
+/// database's hash with sqlpipe's own objects left out, those objects are
+/// the only difference: record the full hash so sqlift proceeds. Any other
+/// difference leaves the stored hash alone and sqlift still refuses it.
+void reconcile_schema_hash(sqlite3* db) {
+    std::string stored;
+    {
+        sqlite3_stmt* raw = nullptr;
+        if (sqlite3_prepare_v2(db,
+                "SELECT value FROM _sqlift_state WHERE key='schema_hash'",
+                -1, &raw, nullptr) != SQLITE_OK) {
+            sqlite3_finalize(raw);
+            return;  // never migrated by sqlift: nothing recorded to reconcile
+        }
+        StmtGuard stmt(raw);
+        if (sqlite3_step(stmt.get()) != SQLITE_ROW) return;
+        auto* text = sqlite3_column_text(stmt.get(), 0);
+        if (!text) return;
+        stored = reinterpret_cast<const char*>(text);
+    }
+    if (stored.empty()) return;
+
+    sqlift_db* sdb = sqlift_db_wrap(db);
+    if (!sdb) return;
+    int err_type = 0;
+    char* err_msg = nullptr;
+    char* schema_json = sqlift_extract(sdb, &err_type, &err_msg);
+    sqlift_db_close(sdb);
+    if (!schema_json) {
+        sqlift_free(err_msg);
+        return;  // sqlift_apply will report the same failure
+    }
+    auto hash_of = [](const char* json) -> std::string {
+        int et = 0;
+        char* em = nullptr;
+        char* hex = sqlift_schema_hash(json, &et, &em);
+        if (!hex) {
+            sqlift_free(em);
+            return {};
+        }
+        std::string out(hex);
+        sqlift_free(hex);
+        return out;
+    };
+    std::string full = hash_of(schema_json);
+    nlohmann::json schema = nlohmann::json::parse(schema_json, nullptr, false);
+    sqlift_free(schema_json);
+    if (full.empty() || full == stored || schema.is_discarded()) return;
+
+    auto own = [](const std::string& name) {
+        return name.rfind("_sqlpipe_", 0) == 0;
+    };
+    for (const char* section : {"tables", "indexes", "views", "triggers"}) {
+        if (!schema.contains(section) || !schema[section].is_object()) continue;
+        auto& entries = schema[section];
+        for (auto it = entries.begin(); it != entries.end();) {
+            bool drop = own(it.key());
+            if (!drop && it->is_object() && it->contains("table_name") &&
+                (*it)["table_name"].is_string()) {
+                drop = own((*it)["table_name"].get<std::string>());
+            }
+            it = drop ? entries.erase(it) : std::next(it);
+        }
+    }
+    if (hash_of(schema.dump().c_str()) != stored) return;
+
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE _sqlift_state SET value=? WHERE key='schema_hash'",
+            -1, &raw, nullptr) != SQLITE_OK) {
+        sqlite3_finalize(raw);
+        return;
+    }
+    StmtGuard update(raw);
+    sqlite3_bind_text(update.get(), 1, full.c_str(),
+                      static_cast<int>(full.size()), SQLITE_TRANSIENT);
+    sqlite3_step(update.get());
+}
+
 bool auto_migrate_schema(sqlite3* db, const std::string& remote_schema_sql,
                          const LogCallback& on_log) {
     int err_type = 0;
@@ -965,6 +1054,7 @@ bool auto_migrate_schema(sqlite3* db, const std::string& remote_schema_sql,
     }
 
     // Apply the migration plan (allow rebuilds + destructive — master is authoritative).
+    reconcile_schema_hash(db);
     sqlift_db* sdb = sqlift_db_wrap(db);
     int rc = sqlift_apply(sdb, plan_json, {.allow = SQLIFT_ALLOW_ALL},
                           &err_type, &err_msg);
@@ -4977,6 +5067,7 @@ Database::Database(const std::string& path, const std::string& schema_ddl)
         }
 
         // Allow rebuilds (e.g. column type changes) but not destructive drops.
+        detail::reconcile_schema_hash(db);
         rc = sqlift_apply(sdb, plan_json, {.allow = SQLIFT_ALLOW_REBUILD},
                           &err_type, &err_msg);
         if (rc != 0) {
@@ -6827,6 +6918,13 @@ void sync_handshake(Master& master, Relay& relay) {
 }
 
 } // namespace sqlpipe
+
+// C entry point for bindings that drive sqlift themselves (the Go
+// wrapper's Migrate): the same reconciliation Database applies before an
+// open-time migration.
+extern "C" void sqlpipe_reconcile_schema_hash(sqlite3* db) {
+    sqlpipe::detail::reconcile_schema_hash(db);
+}
 
 // ── BUNDLED DEPENDENCIES (auto-generated by scripts/bundle-deps.sh) ──
 // Do not edit below this line. Regenerate with: scripts/bundle-deps.sh

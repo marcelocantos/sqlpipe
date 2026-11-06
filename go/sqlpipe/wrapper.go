@@ -19,6 +19,8 @@ char* sqldeep_transpile(const char* input, char** err_msg, int* err_line, int* e
 void sqldeep_free(void* ptr);
 int sqldeep_register_sqlite(sqlite3* db);
 
+void sqlpipe_reconcile_schema_hash(sqlite3* db);
+
 typedef struct sqlift_db sqlift_db;
 typedef struct sqlift_apply_options {
 	unsigned int allow;
@@ -213,6 +215,11 @@ func (d *Database) Migrate(schemaDDL string) error {
 		return &Error{Code: ErrSqlite, Msg: formatSqliftFailure("failed to diff schemas", errType, errMsg, nil)}
 	}
 	defer C.sqlift_free(unsafe.Pointer(planJSON))
+
+	// sqlpipe's own tables (_sqlpipe_meta) appear after the first
+	// migration; without this the next migration of an existing store is
+	// refused as drift. See reconcile_schema_hash in dist/sqlpipe.cpp.
+	C.sqlpipe_reconcile_schema_hash(d.db)
 
 	errMsg = nil
 	rc := C.sqlift_apply(sdb, planJSON,

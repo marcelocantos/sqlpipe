@@ -57,6 +57,53 @@ TEST_CASE("database: reopen with same schema_ddl preserves _sqlpipe_meta") {
     std::remove(path);
 }
 
+TEST_CASE("database: a later schema change migrates despite _sqlpipe_meta") {
+    // sqlift stored its schema hash after the first migration, before
+    // _sqlpipe_meta existed. The next schema change must not read that
+    // table as drift (orthograph T38: every existing store refused a new
+    // column).
+    const char* path = "test_meta_then_migrate.db";
+    std::remove(path);
+    {
+        Database first(path, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+        first.exec("INSERT INTO t VALUES (1, 'kept')");
+    }
+    {
+        Database second(path,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, "
+            "trashed TEXT NOT NULL DEFAULT '')");
+        auto r = second.query("SELECT val, trashed FROM t WHERE id = 1");
+        REQUIRE(r.rows.size() == 1);
+        CHECK(std::get<std::string>(r.rows[0][0]) == "kept");
+    }
+    // And again: the hash recorded by that migration covers the meta table.
+    Database third(path,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, "
+        "trashed TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '')");
+    CHECK(std::get<int64_t>(third.query("SELECT count(*) FROM t").rows[0][0]) == 1);
+    std::remove(path);
+}
+
+TEST_CASE("database: a table created outside sqlift is still drift") {
+    const char* path = "test_genuine_drift.db";
+    std::remove(path);
+    {
+        Database first(path, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+        first.exec("CREATE TABLE stray (x INTEGER)");
+    }
+    try {
+        // The new schema declares stray too, so the plan is not destructive
+        // and the drift check is what must refuse it.
+        Database reopen(path,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, extra TEXT);"
+            "CREATE TABLE stray (x INTEGER)");
+        FAIL("expected a drift error");
+    } catch (const Error& e) {
+        CHECK(std::string(e.what()).find("[sqlift:DRIFT_ERROR]") != std::string::npos);
+    }
+    std::remove(path);
+}
+
 TEST_CASE("database: failed destructive migration error is diagnostic") {
     // Database apply allows rebuild but not destructive drops. Opening an
     // existing file DB with a schema that drops a column must throw a message
